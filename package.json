@@ -1,0 +1,64 @@
+{
+  "name": "sandom",
+  "version": "0.3.0",
+  "description": "Experimental in-process rendering engine: DOM-like tree in, WebAssembly layout, WebGPU rasterization, pixels out.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": "./src/scene-renderer.js",
+    "./runtime": "./src/runtime.js",
+    "./dom": "./src/dom/dom.js",
+    "./web-component": "./src/dom/renderer-element.js",
+    "./font-registry": "./src/font-registry.js",
+    "./gpu-compositor": "./src/gpu-compositor.js",
+    "./adaptive-jpeg": "./src/adaptive-jpeg.js",
+    "./png": "./src/output/png.js",
+    "./color-transform": "./src/output/color-transform.js",
+    "./jsx-runtime": "./src/dom/jsx-runtime.js",
+    "./adapters/vite": "./src/adapters/vite.js",
+    "./adapters/compiled-application": "./src/adapters/compiled-application.js",
+    "./adapters/next": "./src/adapters/next.js",
+    "./component-adapter-result": "./src/adapters/component-adapter-result.js",
+    "./component-adapter-realm-protocol": "./src/adapters/component-adapter-realm-protocol.js",
+    "./gpu": {
+      "bun": "./gpu/bun.js",
+      "node": "./gpu/node.js",
+      "default": "./gpu/default.js"
+    },
+    "./src/*.js": "./src/*.js"
+  },
+  "dependencies": {
+    "@sandom/gain-map": "0.1.0",
+    "@sandom/font-metrics": "0.1.0",
+    "@sandom/color": "0.1.0",
+    "woff-lib": "^0.0.3"
+  },
+  "peerDependencies": {
+    "es-module-lexer": "^1.7.0",
+    "webgpu": "^0.4.0",
+    "bun-webgpu": "^0.1.7",
+    "vite": ">=8.2.0 <9",
+    "next": ">=16.3.1 <17",
+    "native-gles": "^0.6.1"
+  },
+  "peerDependenciesMeta": {
+    "webgpu": {
+      "optional": true
+    },
+    "bun-webgpu": {
+      "optional": true
+    },
+    "vite": {
+      "optional": true
+    },
+    "next": {
+      "optional": true
+    },
+    "native-gles": {
+      "optional": true
+    }
+  }
+}
