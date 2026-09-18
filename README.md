@@ -31,11 +31,21 @@ import { loadFont } from "sandom/font-registry";
 import { createSandomDOM } from "sandom/dom";
 import { encodePNG } from "sandom/png";
 
-const font = await loadFont("Inter", new URL("./Inter.ttf", import.meta.url));
+const font = await loadFont(
+  "IBM Plex Mono",
+  new URL(
+    "../test-assets/IBMPlexMono-Regular.ttf",
+    import.meta.resolve("sandom"),
+  ),
+);
 const dom = createSandomDOM({ viewportW: 320, viewportH: 180 });
 const root = dom.createElement("main");
 root.style.width = "320px";
 root.style.height = "180px";
+// Declare the family that was loaded. Without this the element inherits
+// `sans-serif`, which has no system font resolver on a server, and the
+// render throws rather than picking a font nobody asked for.
+root.style.fontFamily = "IBM Plex Mono";
 root.appendChild(dom.createTextNode("DOM in. Pixels out."));
 const snapshot = await dom.renderSnapshot(root);
 const png = await encodePNG(snapshot.pixels, snapshot.width, snapshot.height);
@@ -53,21 +63,27 @@ URLs:
 import { createSandomRuntime } from "sandom/runtime";
 
 const runtime = await createSandomRuntime({
-  builtInFonts: ["inter"],
   assets: {
     harfbuzz: harfbuzzBytes,
     msdfgen: msdfgenBytes,
-    fonts: { "Inter-Variable.ttf": interFontBytes },
   },
 });
+// The runtime owns its font registry: load into that, not the module-level
+// registry, so each runtime keeps separate font and glyph state.
+await runtime.loadFont("Inter", interFontURL);
 const component = await runtime.renderComponent(componentOptions);
 ```
 
-Asset values must be `Uint8Array`, `ArrayBuffer`, or absolute URLs. Runtime
-creation preloads the engine, shaping, distance-field, and selected font
-resources. JPEG, WebP, and JPEG XL assets under `assets.codecs` remain lazy.
-Each runtime owns separate WebAssembly instances, font and glyph state, path and
-image caches, and renderer contexts.
+Asset values must be `Uint8Array`, `ArrayBuffer`, or absolute URLs. The two
+engine assets are `harfbuzz` and `msdfgen`; JPEG, PNG, WebP and JPEG XL bytes
+go under `assets.codecs` and stay lazy. Supplying `assets` at all means
+supplying every asset the document needs — the runtime stops resolving
+package-relative URLs and reports `runtime.assets.mode === "explicit"`.
+`resolveSystemFontFamily` is the only other accepted option; there are no
+built-in document fonts, so a document's families come from `loadFont` or
+`@font-face`. Each runtime owns separate WebAssembly instances, font and glyph
+state, path and image caches, and renderer contexts, and releases the last of
+those with `runtime.releaseRenderContexts()`.
 
 OpenType scalar metrics come from the exact `@sandom/font-metrics@0.1.0`
 dependency. Sandom owns font loading, collection-face selection, WASM
