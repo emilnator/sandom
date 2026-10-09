@@ -4,8 +4,9 @@
 // `validateOutputRequest` normalizes a caller's request against the closed
 // per-format contract and rejects every documented invalid combination.
 // `encodeImage` runs the central transform (src/output/color-transform.js)
-// and dispatches the still-image encoder. Stream formats (webp-animation,
-// video) validate here and encode through their own recorders.
+// and dispatches the still-image encoder. Animated GIF output has its own
+// recorder (`src/output/gif.js`); Sandom offers no video output — see
+// `plans/PLAN-native-vp9-webm-output.md`.
 
 import {
   REFERENCE_WHITE_LUMINANCE,
@@ -92,24 +93,6 @@ const CODEC_CONTRACTS = Object.freeze({
   bmp: {
   },
   ppm: {
-  },
-  "webp-animation": {
-    codecOptions: {
-      lossless: (value) => typeof value === "boolean",
-      quality: (value) =>
-        typeof value === "number" && Number.isFinite(value) &&
-        value >= 0 && value <= 100,
-      frameDuration: (value) =>
-        typeof value === "number" && Number.isFinite(value) && value > 0,
-    },
-  },
-  video: {
-    codecOptions: {
-      container: (value) => value === "mp4" || value === "mkv",
-      codec: (value) => value === "h264" || value === "hevc",
-      frameRate: (value) =>
-        typeof value === "number" && Number.isFinite(value) && value > 0,
-    },
   },
   canvas: {
     codecOptions: {

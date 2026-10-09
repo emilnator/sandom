@@ -1,6 +1,6 @@
 // Tree-to-scene serializer: a live SDElement tree (src/dom/node.js) walked
 // into a flat scene node array, the shape examples/scenes.js's hand-authored
-// scenes use, so the renderScenePixels/renderScene/sandomTreeBoxes pipeline
+// scenes use, so the renderScenePixels/sandomTreeBoxes pipeline
 // consumes a DOM-backed tree unchanged.
 //
 // The DOM core builds the box tree (scene_build): box kinds, display
@@ -15,6 +15,8 @@
 // CSS transform for the renderer's transition diff.
 
 import { animationTransitionDefinitions } from "../dom-wasm/animation.js";
+import { gradientFor, shapeBounds } from "./svg-image.js";
+import { svgShapeToPathDef } from "../svg-shape-path.js";
 import { resolvedElementFields } from "./style.js";
 
 // The scene display name of an svg shape box (scene display 22) by its
@@ -30,6 +32,72 @@ const SVG_SHAPE_DISPLAY = {
   polygon: "svg-polygon",
   polyline: "svg-polyline",
 };
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+// The element a url() fill (which 0) or stroke (which 1) names, or null:
+// a same-document fragment, looked up in the element's own tree.
+function svgPaintServerElement(core, element, which) {
+  const url = core.sceneSvgPaintServer(element._coreHandle, which);
+  if (url === null || !url.startsWith("#")) return null;
+  return core.elementById(element.getRootNode()._coreHandle, url.slice(1));
+}
+
+// The outline of a rect, circle, ellipse or line box whose record the core
+// lowered to a path, from the geometry the record resolved; "" for a shape
+// with no outline, which renders nothing. Null for a record that keeps its
+// own shape: an undashed solid stroke, no stroke, or a group.
+function loweredSvgOutline(core, element, box) {
+  const geometry = core.engineSvgShapeGeometry(box.stableId, box.sourceRevision);
+  if (geometry === null) return null;
+  const [a, b, c, d, e, f] = geometry;
+  const display = SVG_SHAPE_DISPLAY[element.localName];
+  const shape = display === "svg-rect" ? { display, x: a, y: b, width: c, height: d, rx: e, ry: f }
+    : display === "svg-circle" ? { display, cx: a, cy: b, r: c }
+    : display === "svg-ellipse" ? { display, cx: a, cy: b, rx: c, ry: d }
+    : display === "svg-line" ? { display, x1: a, y1: b, x2: c, y2: d }
+    : null;
+  if (shape === null) {
+    throw new Error(`serializeToScene: the core lowered <${element.localName}> to a path, which has no shape outline`);
+  }
+  return svgShapeToPathDef(shape) ?? "";
+}
+
+// The linearGradient or radialGradient a url() fill (which 0) or stroke
+// (which 1) names, or null when it names no element.
+function svgGradientServer(core, element, which) {
+  const server = svgPaintServerElement(core, element, which);
+  if (server === null) return null;
+  if (server.namespaceURI !== SVG_NS || (server.localName !== "linearGradient" && server.localName !== "radialGradient")) {
+    throw new Error(`serializeToScene: unsupported SVG paint server <${server.localName} id="${server.id}">`);
+  }
+  return server;
+}
+
+// An SVG shape or text whose paint names a paint server (SceneBuildBox.host
+// bits 4 and 8). The core paints the reference's fallback, or none, into
+// the record, which is what SVG 2 13.2 paints when the reference names no
+// element. A linearGradient or radialGradient fill or stroke becomes the
+// node's svgFillPaintServer or svgStrokePaintServer, read as an SVG image
+// reads it (src/dom/svg-image.js) with the shape's bounding box when its
+// geometry gives one; the renderer resolves it against the path's measured
+// box otherwise (resolveSvgPaintServers in src/scene-renderer.js). A line
+// has no fill. Every other named server, and a server on text, is refused
+// by name.
+function svgPaintServers(core, element, box, node) {
+  const fill = box.host & 4 ? svgGradientServer(core, element, 0) : null;
+  const stroke = box.host & 8 ? svgGradientServer(core, element, 1) : null;
+  if (fill === null && stroke === null) return;
+  if (box.display !== 22) {
+    const server = fill ?? stroke;
+    throw new Error(`serializeToScene: unsupported SVG ${fill ? "fill" : "stroke"} paint server <${server.localName} id="${server.id}"> on <${element.localName}>`);
+  }
+  const bounds = shapeBounds(element, node);
+  if (stroke !== null) node.svgStrokePaintServer = { gradient: gradientFor(stroke, core), bounds };
+  if (fill !== null && element.localName !== "line") {
+    node.svgFillPaintServer = { gradient: gradientFor(fill, core), bounds };
+  }
+}
 
 // css-display §2.7: outer-display blockification applied to flex and
 // grid items (and through display:contents).
@@ -87,6 +155,12 @@ const TRANSFORM_NONE = Object.freeze({
   ]),
   cssText: "none",
 });
+const TRANSLATE_NONE = Object.freeze({
+  x: Object.freeze({ pixels: 0, percentage: 0 }),
+  y: Object.freeze({ pixels: 0, percentage: 0 }),
+  cssText: "none",
+});
+
 
 // The core builds the box tree (src/dom-wasm/scene-build.watpart): which
 // flat-tree children participate, anonymous inline runs, generated content,
@@ -104,6 +178,39 @@ export function sceneNodeProvenance(node) {
   return node?._corePublication?.boxes?.[node._corePublicationIndex] ?? null;
 }
 
+// A face the cascade selected with no source the renderer can load: the
+// core names the failing build row; the error names the computed
+// font-family, the first element that needs it, and every remedy.
+const UNBOUND_FONT_FACE_MESSAGE = "Font face lacks a renderer binding";
+
+function elementPath(element) {
+  const steps = [];
+  for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+    let step = node.localName;
+    if (node.id) step += `#${node.id}`;
+    else if (node.parentElement) {
+      const siblings = [...node.parentElement.children].filter((sibling) => sibling.localName === node.localName);
+      if (siblings.length > 1) step += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+    }
+    steps.unshift(step);
+  }
+  return steps.join(" > ");
+}
+
+function unboundFontError(core, box, cause) {
+  if (!box) throw cause;
+  const node = core.wrapperFor(box.handle);
+  const element = node?.nodeType === 1 ? node : node?.parentElement;
+  const family = box.font ? core.string("font_face_css", box.font) : "";
+  return new Error(
+    `No font face for font-family: ${family || "(the initial family)"}, first needed by ` +
+      `${element ? elementPath(element) : "the document root"}. Declare an @font-face for one ` +
+      "of these families, register a font with runtime.loadFont(), give the font registry a " +
+      "system font resolver, or install the bundled system fonts (installBundledSystemFonts()).",
+    { cause },
+  );
+}
+
 export function serializeToScene(
   root,
   {
@@ -116,7 +223,10 @@ export function serializeToScene(
   const core = root._domCore;
   const styleSystem = root.ownerDocument?._styleSystem;
   core.lengthViewport(viewportWidth, viewportHeight);
-  if (styleSystem) core.mediaEnvironmentSet(styleSystem.environment);
+  if (styleSystem) {
+    core.mediaEnvironmentSet(styleSystem.environment);
+    styleSystem.answerDeclaredFontFamilies(root);
+  }
   if (generatedContent) {
     for (const { element, pseudoElement, text } of generatedContent) {
       core.sceneGeneratedOverride(
@@ -155,11 +265,18 @@ export function serializeToScene(
   // rows (engine_record_frame); the serialization owns the handle and
   // releases it when replaced or collected. Nodes reference it through one
   // shared object that never enters the renderer's JSON node signature.
-  const publication = core.engineRecordPublish(
-    root._coreHandle,
-    renderViewport?.width ?? 0,
-    renderViewport?.height ?? 0,
-  );
+  (root.nodeType === 9 ? root : root.ownerDocument)?._sandomFontRegistry?.prepareNativeFontPublication(root);
+  let publication;
+  try {
+    publication = core.engineRecordPublish(
+      root._coreHandle,
+      renderViewport?.width ?? 0,
+      renderViewport?.height ?? 0,
+    );
+  } catch (error) {
+    if (!String(error?.message).startsWith(UNBOUND_FONT_FACE_MESSAGE)) throw error;
+    throw unboundFontError(core, boxes[error.sceneRow], error);
+  }
   // Every scene node of this build holds this reference, and the
   // publication it names must outlive them: a caller keeps `nodes` and
   // drops the wrapper this function returns (`const { nodes } =
@@ -183,17 +300,18 @@ export function serializeToScene(
   const reusedRows = core.engineRecordReused(publication);
   const nodes = new Array(boxes.length);
   const indexOf = new Map();
+  // The rows of ::before and ::after boxes (kinds 14 and 15): the scene
+  // keeps the list, so a frame's layout-used pseudo-element capture reads
+  // those rows only.
+  const generatedBoxRows = [];
   let textBoxes = 0;
-  // The CSS font-family value behind each family entry a box's face names,
-  // captured now: the renderer keys and registers faces by it.
-  const familyCss = new Map();
-  const faceCssOf = (packed) => {
-    const family = packed >>> 12;
-    if (family === 0) return "";
-    let css = familyCss.get(family);
+  // Capture each face's CSS family value for scene inspection.
+  const faceCss = new Map();
+  const faceCssOf = (face) => {
+    let css = faceCss.get(face);
     if (css === undefined) {
-      css = core.fontFamilyCss(family);
-      familyCss.set(family, css);
+      css = core.string("font_face_css", face);
+      faceCss.set(face, css);
     }
     return css;
   };
@@ -321,6 +439,30 @@ export function serializeToScene(
           ...childrenOf(box),
         };
         break;
+      case 14:
+      case 15: {
+        // A ::before or ::after box: the core lays it out from the
+        // pseudo-element's record; its identity is the originating element.
+        // Its url() background layers bind under the element's handle and
+        // the pseudo-element (1 ::before, 2 ::after).
+        const node = { display: DISPLAY_CODE_NAMES[box.display] };
+        if (box.flags & BOX_BFC) node.bfc = true;
+        if (box.flags & BOX_INLINE_CONTEXT) node.inlineCtx = true;
+        if (box.children.length) node.children = box.children;
+        if (box.host & 2) {
+          const imageLayers = core.sceneResourceLayers(box.handle, box.kind - 13);
+          if (imageLayers.length) node.backgroundImages = imageLayers;
+        }
+        node.generatedOwnerIndex = box.owner;
+        generatedBoxRows.push(index);
+        node._coreBox = box.kind | (box.flags << 8) | (box.display << 24);
+        node._corePublication = publicationRef;
+        node._coreFont = box.font;
+        node._coreFontCss = faceCssOf(box.font);
+        node._coreBoxHandle = Number(box.context);
+        nodes[index] = node;
+        break;
+      }
       default:
         throw new Error(`serializeToScene: unknown box kind ${box.kind}`);
     }
@@ -332,28 +474,37 @@ export function serializeToScene(
     // An svg shape's name comes from its tag; a path, polygon, or polyline
     // carries its path definition (the box text) for the host's path
     // atlas; svg text carries its text.
+    // A rect, circle, ellipse or line whose stroke dashes or names a paint
+    // server is a path record (engine-svg.watpart $engineSvgShape): its
+    // outline is the path this box draws.
+    const outline = box.display === 22 && box.text === null
+      ? loweredSvgOutline(core, el, box)
+      : null;
     const display = box.display === 22
-      ? SVG_SHAPE_DISPLAY[el.localName]
+      ? outline === null ? SVG_SHAPE_DISPLAY[el.localName] : "svg-path"
       : DISPLAY_CODE_NAMES[box.display];
     // background-image url() layers are host resources: the renderer
     // resolves each URL to an image index and writes it into the record's
     // layer entries. Gradient and none layers stay in the core's record.
-    const imageLayers = box.host & 2
-      ? core.sceneResourceLayers(el._coreHandle)
+    // CSS backgrounds do not paint on an svg shape box, whose one record
+    // layer is its gradient stroke (src/dom-wasm/engine-paint.watpart).
+    const imageLayers = box.host & 2 && box.display !== 22
+      ? core.sceneResourceLayers(el._coreHandle, 0)
       : [];
     let pathDefinition = null;
-    if (box.display === 22 && box.text !== null) {
+    if (box.display === 22 && (box.text !== null || outline !== null)) {
+      const pathText = outline ?? box.text;
       const request = core.engineSvgRequest(
         box.stableId,
         box.sourceRevision,
-        textBytesOf(box),
+        outline === null ? textBytesOf(box) : new TextEncoder().encode(outline),
         box.stableId,
       );
       // The request's uint64 identity is carried as its decimal string:
       // every identity bit stays in the renderer's node signature, which
       // is plain JSON.
       pathDefinition = {
-        d: box.text,
+        d: pathText,
         identity: request.identity.toString(),
         resourceRevision: request.resourceRevision,
         fillRule: ["nonzero", "evenodd"][request.fillRule],
@@ -384,6 +535,7 @@ export function serializeToScene(
       );
       const fields = resolvedElementFields(el);
       node.transform = fields.transform ?? TRANSFORM_NONE;
+      node.translate = fields.translate ?? TRANSLATE_NONE;
       if (fields.transformOrigin !== undefined) {
         node.transformOrigin = fields.transformOrigin;
       }
@@ -397,6 +549,9 @@ export function serializeToScene(
     node._corePublication = publicationRef;
     node._coreFont = box.font;
     node._coreFontCss = faceCssOf(box.font);
+    // A textarea needs its face for rows/cols intrinsic sizing even when
+    // display:block gives it no inline formatting context.
+    if (el.localName === "textarea") node._coreTextarea = true;
     if (box.flags & BOX_BFC) node.bfc = true;
     if (box.flags & BOX_INLINE_CONTEXT) node.inlineCtx = true;
     if (resourceInfo !== null) {
@@ -417,6 +572,7 @@ export function serializeToScene(
       node.d = pathDefinition.d;
       node._coreSvgRequest = pathDefinition;
     }
+    if (box.host & 12) svgPaintServers(core, el, box, node);
     if (imageLayers.length) node.backgroundImages = imageLayers;
     if (scrollOwner && !el._scrollState) {
       const request = scrollRequests.get(node._coreHandle);
@@ -442,6 +598,7 @@ export function serializeToScene(
     // Text geometry (carets, glyphs) is read back from the paint artifact;
     // a scene without text boxes has none to read.
     textBoxes,
+    generatedBoxRows,
     loweredRows,
     changedRows,
     // Rows that took the previous publication's lowered bytes.

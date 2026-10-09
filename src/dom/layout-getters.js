@@ -2,10 +2,11 @@
 // getBoundingClientRect,
 // offsetWidth/offsetHeight/offsetTop/offsetLeft, clientWidth/
 // clientHeight, scrollWidth/scrollHeight/scrollTop/scrollLeft. All
-// answered by ONE mechanism — serializeToScene the live tree, run a
-// real layout pass (layoutTreeBoxesSync, examples/render-scene.js), and
-// read back the requested node's own computed box — reshaped per
-// property into the units/reference-frame each one actually uses.
+// answered by ONE mechanism — the live layout pass (live-geometry.js):
+// serializeToScene the live tree, run a real layout pass
+// (layoutTreeBoxesSync, examples/render-scene.js), and read back the
+// requested node's own computed box — reshaped per property into the
+// units/reference-frame each one actually uses.
 //
 // SYNCHRONOUS by ruling — these must match a real browser's synchronous
 // property getters exactly. Registry-backed fonts are either runtime faces
@@ -13,107 +14,12 @@
 // register synchronously. Resources that still require asynchronous work
 // (browser font fetches, images, and SVG-path module initialization) throw
 // clearly rather than blocking or returning guessed geometry.
-//
-// A second, previously-unresolved design question this module settles:
-// running layout needs a VIEWPORT SIZE, and nothing in the mothership
-// backend contract tracks one (no live createDomCapability call site exists
-// yet to confirm a convention against, and the real browser backend's
-// createBrowserDomBackend() takes no viewport argument either — it
-// implicitly reads the real window). Resolved: a viewportW/viewportH
-// pair, defaulting to 1280x720 (test/oracle/dom-oracle.js's own
-// convention), threaded through from createSandomDOM's caller.
 
-import { serializeToScene } from "./serialize.js";
-import { layoutTreeBoxesSync } from "../scene-renderer.js";
-import { scrollIntoViewCore } from "./scroll-core.js";
-import { buildGeometry, currentGeometryRevisions, geometryRect, withLiveGeometry } from "./geometry.js";
+import { elementScrollSource, scrollIntoViewCore } from "./scroll-core.js";
+import { buildGeometry, geometryClientRects, geometryRect } from "./geometry.js";
+import { DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH, withLiveGeometry } from "./live-geometry.js";
 import { hitTestSnapshot } from "./presented-frame.js";
 import { createLayoutGeometryBindings } from "./dom-bindings.generated.js";
-
-export const DEFAULT_VIEWPORT_WIDTH = 1280;
-export const DEFAULT_VIEWPORT_HEIGHT = 720;
-
-// Runs one shared layout pass over `node`'s whole tree and returns
-// { boxes, indexOf, root } — every layout-getter below is a cheap
-// re-shape of this. Exported for callers that need multiple properties
-// off the SAME layout pass without re-running it (e.g. a batch read);
-// most callers should reach for the single-property helpers below.
-export function computeLayoutBoxes(
-  node,
-  {
-    viewportW = DEFAULT_VIEWPORT_WIDTH,
-    viewportH = DEFAULT_VIEWPORT_HEIGHT,
-  } = {},
-) {
-  let root = node;
-  while (root.parentElement) root = root.parentElement;
-  const document = root.ownerDocument;
-  const core = document._domCore;
-  const runtime = document._sandomSceneRendererRuntime ?? null;
-  const runtimeLayoutTreeBoxesSync =
-    runtime?.layoutTreeBoxesSync ?? layoutTreeBoxesSync;
-  const surface = root._renderSurface ?? null;
-  const surfaceViewport = surface?.viewport;
-  // The engine holds this surface's last frame of THIS tree: the
-  // analytical layout inherits it and relayouts only what changed (and
-  // hands the claim back, so the next frame keeps its incremental node
-  // set). Without a live surface the engine holds whatever another caller
-  // last wrote, and the layout must stand alone.
-  const engineWriteOwner = surface?._persistentRenderer?.engineWriteToken ??
-    null;
-  const viewport = {
-    width: surfaceViewport?.width ?? viewportW,
-    height: surfaceViewport?.height ?? viewportH,
-    deviceScale: surfaceViewport?.deviceScale ?? 1,
-    _requestedLeft: surfaceViewport?._requestedLeft,
-    _requestedTop: surfaceViewport?._requestedTop,
-  };
-  for (;;) {
-    const style = core.status("document_style_generation", document._coreHandle) >>> 0;
-    const resource = core.status("resource_revision") >>> 0;
-    const serialized = serializeToScene(root, {
-      viewportWidth: viewport.width,
-      viewportHeight: viewport.height,
-      viewport: surfaceViewport ? viewport : undefined,
-    });
-    const revisions = currentGeometryRevisions(document);
-    // Resolving a previously unseen style or resource can invalidate records
-    // already serialized earlier in the traversal. Rebuild those records.
-    if (revisions.document !== style || revisions.resource !== resource) {
-      core.releaseSceneResources(serialized.nodes);
-      continue;
-    }
-    const scene = {
-      width: viewport.width,
-      height: viewport.height,
-      nodes: serialized.nodes,
-      imageSources: serialized.imageSources,
-    };
-    const boxes = runtimeLayoutTreeBoxesSync(
-      scene,
-      engineWriteOwner === null ? {} : { engineWriteOwner },
-    );
-    // A cold font can invalidate both resource and computed-style generations.
-    // Keep the original envelope; only fresh serialization and layout can
-    // establish that all boxes use the newly resolved metrics.
-    if (
-      revisions.document !== (core.status("document_style_generation", document._coreHandle) >>> 0) ||
-      revisions.resource !== (core.status("resource_revision") >>> 0)
-    ) {
-      core.releaseSceneResources(serialized.nodes);
-      continue;
-    }
-    const layout = { boxes, indexOf: serialized.indexOf, root, viewport,
-      viewportIndex: serialized.viewportIndex, publication: serialized.publication, serialized, ownedBySurface: false };
-    // A live surface takes the serialization: its next frame reuses it
-    // instead of serializing the same tree again (the "scrollTop =
-    // scrollHeight" pattern paid two serializations per line appended).
-    if (surfaceViewport !== undefined && root._renderSurface?._offerSyncLayout?.(layout, revisions.document, resource)) {
-      layout.ownedBySurface = true;
-    }
-    return layout;
-  }
-}
 
 // getBoundingClientRect: viewport-relative border-box, matching the
 // browser backend's own plainified shape exactly (frontend-iris.js:91-95
@@ -124,6 +30,14 @@ export function computeLayoutBoxes(
 function queryRect(node, options) {
   return withLiveGeometry(node, options, ({ core, handle }) =>
     geometryRect(core, handle, node._coreHandle));
+}
+
+// getClientRects: one viewport-relative rectangle per fragment of a box
+// broken across columns or lines (a block box around a spanner, an inline
+// box's line boxes), else the border box, each through its transforms.
+function queryClientRects(node, options) {
+  return withLiveGeometry(node, options, ({ core, handle }) =>
+    geometryClientRects(core, handle, node._coreHandle));
 }
 
 // Reuses a layout that the caller already produced. Batch renderers must use
@@ -142,16 +56,25 @@ export function getBoundingClientRectFromLayout(node, layout) {
 
 // offsetWidth/offsetHeight: border-box dimensions (content + padding +
 // border, no margin) — exactly the box buffer's own border-box fields.
+// scrollLeft (8) and scrollTop (9) read the scroller the element's scroll
+// position belongs to (elementScrollSource): the viewport's for the root
+// element, whose overflow the viewport takes, and 0 for none.
 function liveValue(node, options, field) {
+  let target = node._coreHandle;
+  if (field === 8 || field === 9) {
+    const source = elementScrollSource(node);
+    if (source === null) return 0;
+    if (source !== node) target = source._coreHandle ?? 0n;
+  }
   return withLiveGeometry(node, options, ({ core, handle }) =>
-    core.status("geometry_value", handle, node._coreHandle, field));
+    core.status("geometry_value", handle, target, field));
 }
 
 export const {
-  getBoundingClientRect, elementFromPoint, offsetWidth, offsetHeight,
+  getBoundingClientRect, getClientRects, elementFromPoint, offsetWidth, offsetHeight,
   offsetTop, offsetLeft, clientTop, clientLeft, clientWidth, clientHeight,
   scrollTop, scrollLeft, scrollWidth, scrollHeight,
-} = createLayoutGeometryBindings({ queryValue: liveValue, queryRect, queryHit });
+} = createLayoutGeometryBindings({ queryValue: liveValue, queryRect, queryClientRects, queryHit });
 
 export function scrollIntoView(node, options = {}, layoutOptions) {
   return scrollIntoViewCore(node, options, layoutOptions);
@@ -166,7 +89,8 @@ export function scrollIntoView(node, options = {}, layoutOptions) {
 // paid a whole re-layout to do it — plus every layout-side capacity guard
 // that layout can raise, which is how the call came to throw
 // `RuntimeError: unreachable` on a live document
-// (plans/bugs/BUG-element-from-point-traps-on-live-document.md). With no
+// (BUG-element-from-point-traps-on-live-document, resolved; see
+// activity/reports/REPORT-2026-10-09-resolved-bug-records.md). With no
 // surface, or before its first frame, the live layout IS the only geometry
 // and still answers.
 function queryHit(root, x, y, options) {

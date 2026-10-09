@@ -16,9 +16,9 @@ import {
   dispatchEvent as dispatchNativeEvent,
   removeEventListener as removeListener,
 } from "./events.js";
-import { scrollBindingRuntime } from "./viewport.js";
+import { SandomViewport, scrollBindingRuntime } from "./viewport.js";
 import { installElementScrollBindings } from "./dom-bindings.generated.js";
-import { scrollRead, scrollStore, scrollRequest, scrollState } from "./scroll-core.js";
+import { documentScrollingElement, elementScrollRead, elementScrollSource, scrollRead, scrollStore, scrollRequest, scrollState } from "./scroll-core.js";
 import * as layoutGetters from "./layout-getters.js";
 import { scheduleMutationObservers } from "./mutation-observer.js";
 import {
@@ -40,8 +40,9 @@ import {
   installDocumentTypeBindings, installElementBindings, installHTMLElementBindings, installNodeBindings,
   installProcessingInstructionBindings, installShadowRootBindings, installSVGElementBindings, installTemplateBindings, installTreeWalkerBindings,
   installElementAnimationBindings, installElementGeometryBindings, installDocumentGeometryBindings, installCanvasResourceBindings,
+  installDocumentAnimationBindings,
 } from "./dom-bindings.generated.js";
-import { elementAnimationHost } from "./animation.js";
+import { documentAnimations, elementAnimationHost } from "./animation.js";
 import {
   createDocumentStyleSystem,
   CSS,
@@ -59,13 +60,15 @@ import {
   withCustomElementReactions,
 } from "./custom-elements.js";
 import { queueSlotChange } from "./shadow.js";
+import { queueDetailsToggle } from "./details.js";
 import {
   SandomGPUCanvasContext,
 } from "./canvas.js";
 import { SDRange, SDSelection } from "./selection.js";
-import { runInputActivation } from "./input-activation.js";
+import { requestSubmit, runInputActivation } from "./input-activation.js";
 import { copyControlIdentities, inputControlRuntime } from "./input-controls.js";
 import {
+  installFormSubmissionBindings,
   installInputActivationBindings,
   installInputControlBindings,
   installInputControlStateBindings,
@@ -457,17 +460,24 @@ export class SDNode {
     // scoped ones to every element. Pseudo-class state and control
     // property changes are the host's to report, scoped to the element.
     const document = this.nodeType === 9 ? this : this.ownerDocument;
-    if (kind === "state" || kind === "property") this._invalidateState(detail === "focus-within");
+    if (kind === "state" || kind === "property") this._invalidateState(detail);
     else if (kind !== "selection" && kind !== "style") document?._styleSystem?.reconcileSoon();
     scheduleMutationObservers(this._domCore);
   }
 
-  // ownOnly: the element's own record (an ancestor whose :focus-within
-  // changed); otherwise its subtree and selector-reachable siblings, or
-  // the whole cascade under :has().
-  _invalidateState(ownOnly = false) {
-    this._domCore.stateInvalidate(this._coreHandle, ownOnly);
-    (this.nodeType === 9 ? this : this.ownerDocument)?._styleSystem?.reconcileSoon();
+  // detail names the state that changed. "focus-within": an ancestor whose
+  // :focus-within changed - its own record, or its subtree and
+  // selector-reachable siblings when a selector puts :focus-within left of
+  // a combinator. Any other state: its subtree and selector-reachable
+  // siblings, or the whole cascade under :has(); for "hover" and "active"
+  // only when a :has() selector names a pointer state. A state is no input
+  // of the linked sheets and font rules, so it owes no reconcile.
+  _invalidateState(detail) {
+    this._domCore.stateInvalidate(
+      this._coreHandle,
+      detail === "focus-within",
+      detail === "hover" || detail === "active",
+    );
   }
 
   _adoptSubtree(document) {
@@ -760,6 +770,13 @@ export class SDElement extends SDNode {
   set _scrollLeft(value) { scrollStore(this, 2, value); }
   get _scrollTop() { return scrollRead(this, 3); }
   set _scrollTop(value) { scrollStore(this, 3, value); }
+  // The public scroll bindings read these: the offsets of the scroller the
+  // element's scroll position belongs to (elementScrollSource), which is the
+  // viewport for the scrolling element.
+  get _cssomRequestedScrollLeft() { return elementScrollRead(this, 0); }
+  get _cssomRequestedScrollTop() { return elementScrollRead(this, 1); }
+  get _cssomScrollLeft() { return elementScrollRead(this, 2); }
+  get _cssomScrollTop() { return elementScrollRead(this, 3); }
 
   _setParsedAttribute(localName, value, namespaceURI = null, prefix = null) {
     const qualifiedName = prefix ? `${prefix}:${localName}` : String(localName);
@@ -897,6 +914,16 @@ export class SDElement extends SDNode {
 
 
   _setScrollPosition(left, top, source, behavior = "instant") {
+    const target = elementScrollSource(this);
+    if (target === null) return;
+    if (target instanceof SandomViewport) {
+      target._surface._requestViewportScroll(left, top, source, behavior);
+      return;
+    }
+    target._setOwnScrollPosition(left, top, source, behavior);
+  }
+
+  _setOwnScrollPosition(left, top, source, behavior) {
     if (this._renderSurface) {
       this._renderSurface._requestElementScroll(this, left, top, source, behavior);
       return;
@@ -940,7 +967,8 @@ export class SDElement extends SDNode {
   // viewportW/viewportH) is answered by drone-side measurement too.
   // Without the fallback every read resolved through the 1280x720
   // default while the render path laid out against the real viewport
-  // (BUG-drone-cannot-measure-its-viewport.md).
+  // (BUG-drone-cannot-measure-its-viewport, resolved; see
+  // activity/reports/REPORT-2026-10-09-resolved-bug-records.md).
   get _resolvedLayoutOptions() {
     return this._layoutOptions ?? this.ownerDocument?._layoutOptions;
   }
@@ -1063,7 +1091,7 @@ export class SDShadowRoot extends SDDocumentFragment {
   }
   _notifyMutation(kind, detail, record = null) {
     this._renderSurface?._broadcastMutation(kind, this.host, detail);
-    if (kind === "state" || kind === "property") this.host._invalidateState(detail === "focus-within");
+    if (kind === "state" || kind === "property") this.host._invalidateState(detail);
     else if (kind !== "selection" && kind !== "style") this.ownerDocument?._styleSystem?.reconcileSoon();
     scheduleMutationObservers(this._domCore);
   }
@@ -1121,6 +1149,12 @@ export class SDHTMLButtonElement extends SDHTMLElement {
     super(tag, HTML_NS, ownerDocument);
   }
 }
+export class SDHTMLFormElement extends SDHTMLElement {
+  constructor(tag = "form", ownerDocument = null) {
+    super(tag, HTML_NS, ownerDocument);
+  }
+}
+installFormSubmissionBindings({ requestSubmit, runInputActivation }, SDHTMLFormElement.prototype);
 export class SDHTMLCanvasElement extends SDHTMLElement {
   constructor(tag = "canvas", ownerDocument = null) {
     super(tag, HTML_NS, ownerDocument);
@@ -1294,7 +1328,15 @@ function wrapOwnedNode(core, nodeHandle) {
   if (ownerHandle === 0n) {
     throw new Error(`Missing document wrapper for handle ${nodeHandle}`);
   }
-  return wrapExistingNode(core, nodeHandle, core.wrapperFor(ownerHandle));
+  const node = wrapExistingNode(core, nodeHandle, core.wrapperFor(ownerHandle));
+  // A render surface connects every node of its subtree, but the link lives
+  // on the wrapper. A node without a box (an SVG `<stop>`) has no other
+  // holder, so its wrapper can be collected and recreated here. The surface
+  // root is retained by its surface, so the nearest parent (or shadow host)
+  // carries the surface this node belongs to.
+  const parent = node.parentNode ?? (node.nodeType === 11 ? node.host : null);
+  node._renderSurface = parent?._renderSurface ?? null;
+  return node;
 }
 
 export class SDDocument extends SDNode {
@@ -1319,6 +1361,7 @@ export class SDDocument extends SDNode {
     // its selection callback retains the document in that same context.
     core.wrapperFactory ??= wrapOwnedNode.bind(null, core);
     core.slotChangeHandler ??= queueSlotChange;
+    core.detailsToggleHandler ??= queueDetailsToggle;
     this._selection = new SDSelection(this, (changedNode) => {
       changedNode?._notifyMutation("selection");
       dispatchNativeEvent(this, createEvent("selectionchange"));
@@ -1333,6 +1376,9 @@ export class SDDocument extends SDNode {
         ? defaultFontRegistry
         : createFontRegistry({ core }));
     this._styleSystem = createDocumentStyleSystem(this, environment);
+    // Diagnostics of images that failed to load or decode: render surfaces
+    // record them, a prepared document gives them to the host.
+    this._brokenImageDiagnostics = new Map();
     // Background exception sink for this document's realm. A component
     // session routes lifecycle, animation-frame, and background render
     // failures here so they fail the session loudly instead of escaping
@@ -1370,17 +1416,18 @@ export class SDDocument extends SDNode {
   // (replaceSync/replace, insertRule/deleteRule, a live rule's own
   // declarations), as does an adoptedStyleSheets assignment. The cascade
   // changed for the whole document and no node carries the change, so a
-  // live render loop has nothing to wake it: report it to the document's
-  // surfaces the way a node mutation reports itself, which marks them
-  // dirty and schedules a frame. No node enters the mutated set - the
-  // core's own style invalidation above already classifies how wide the
-  // damage is, and the frame decides scene reuse from the style
-  // generation, so this costs no more than the restyle already does.
+  // live render loop has nothing to wake it: report it to every live
+  // surface over a tree of this document, attached to it or not
+  // (render-surface.js keeps the set), which marks each dirty and schedules
+  // a frame. No node enters the mutated set - the core's own style
+  // invalidation above already classifies how wide the damage is, and the
+  // frame decides scene reuse from the style generation, so this costs no
+  // more than the restyle already does.
   _invalidateStyles() {
     this._styleSystem.invalidate();
-    const surface = this._renderSurface ??
-      this.documentElement?._renderSurface ?? this._componentRenderSurface;
-    surface?._broadcastMutation("stylesheet", null, undefined);
+    for (const surface of this._liveRenderSurfaces ?? []) {
+      surface._recordMutation("stylesheet", null, undefined);
+    }
   }
   _validateInsertion(node, referenceNode = null) {
     super._validateInsertion(node, referenceNode);
@@ -1426,7 +1473,7 @@ export const DOMParser = createDOMParserClass({
 
 const elementFamily = createElementFamily({
   SDElement, SDHTMLElement, SDSVGElement, SDHTMLTemplateElement,
-  SDHTMLButtonElement, SDHTMLCanvasElement, SDHTMLInputElement,
+  SDHTMLButtonElement, SDHTMLCanvasElement, SDHTMLFormElement, SDHTMLInputElement,
   SDHTMLSelectElement, SDHTMLScriptElement, SDHTMLIFrameElement,
 });
 
@@ -1461,13 +1508,41 @@ installShadowRootBindings({
       ? enabled : disabled;
   },
 }, SDShadowRoot.prototype);
-// HTML `Document.title`: the child text content of the first title element in
-// tree order, ASCII whitespace stripped and collapsed. A document without one
-// has the empty title, never an absent property.
+// HTML `Document.title` (HTML, "The title element of a document"). When the
+// document element is an SVG `svg`, the title is its first SVG `title`
+// child, created as the first child on assignment. Otherwise it is the first
+// HTML `title` element in tree order; assignment creates one in the head,
+// and does nothing unless the document element is an HTML element. The
+// value is the title's child text content, ASCII whitespace stripped and
+// collapsed; a document without a title has the empty title.
 const TITLE_WHITESPACE_EDGES = /^[\t\n\f\r ]+|[\t\n\f\r ]+$/g;
 const TITLE_WHITESPACE_RUNS = /[\t\n\f\r ]+/g;
 
-function documentTitleText(element) {
+function isSvgRoot(element) {
+  return element !== null && element.namespaceURI === SVG_NS && element.localName === "svg";
+}
+
+function documentTitleElement(document) {
+  const root = document.documentElement;
+  if (isSvgRoot(root)) {
+    for (const child of root._childNodes) {
+      if (child.nodeType === 1 && child.namespaceURI === SVG_NS && child.localName === "title") return child;
+    }
+    return null;
+  }
+  const pending = root === null ? [] : [root];
+  while (pending.length > 0) {
+    const node = pending.pop();
+    if (node.namespaceURI === HTML_NS && node.localName === "title") return node;
+    for (let index = node._childNodes.length - 1; index >= 0; index--) {
+      if (node._childNodes[index].nodeType === 1) pending.push(node._childNodes[index]);
+    }
+  }
+  return null;
+}
+
+function documentTitleText(document) {
+  const element = documentTitleElement(document);
   if (element === null) return "";
   let text = "";
   for (const child of element._childNodes) {
@@ -1480,15 +1555,23 @@ function documentTitleText(element) {
 }
 
 // An existing title element keeps its identity and receives the value as its
-// only child; otherwise the head element gets a new one. A document with no
-// head element — no document element included — is left untouched.
-function setDocumentTitleText(document, element, value) {
-  let title = element;
+// only child.
+function setDocumentTitleText(document, value) {
+  const root = document.documentElement;
+  let title = documentTitleElement(document);
   if (title === null) {
-    const head = document.head;
-    if (head === null) return;
-    title = document.createElement("title");
-    head.appendChild(title);
+    if (isSvgRoot(root)) {
+      title = document.createElementNS(SVG_NS, "title");
+      root.insertBefore(title, root.firstChild);
+    } else {
+      if (root === null || root.namespaceURI !== HTML_NS) return;
+      const head = document.head;
+      if (head === null) return;
+      title = document.createElement("title");
+      head.appendChild(title);
+    }
+  } else if (!isSvgRoot(root) && root.namespaceURI !== HTML_NS) {
+    return;
   }
   title.replaceChildren(
     ...(value === "" ? [] : [document.createTextNode(value)]),
@@ -1508,8 +1591,10 @@ installDocumentBindings({
   },
   documentTitleText,
   setDocumentTitleText,
+  documentScrollingElement,
 }, SDDocument.prototype);
 installDocumentGeometryBindings(layoutGetters, SDDocument.prototype);
+installDocumentAnimationBindings({ documentAnimations }, SDDocument.prototype);
 installCanvasResourceBindings({}, SDHTMLCanvasElement.prototype);
 const createDOMImplementation = installMarkupBindings({
   element: SDElement.prototype,

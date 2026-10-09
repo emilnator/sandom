@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Component Studio · Sandom</title>
+  <!-- studio-import-map -->
+  <link rel="stylesheet" href="/studio.css"><script type="module" src="/studio.js"></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/studio"><span class="brand-mark" aria-hidden="true">S</span>Sandom <span class="brand-divider">/</span> Component Studio</a><span class="tag">Your components · your history</span><button id="refresh">Refresh revisions</button></header>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="Component sweep configuration"><div class="eyebrow">COMPONENT EVOLUTION</div><h1>Same props.<br>New possibilities.</h1><p class="intro">Explore your component code across Git revisions, rendered by Sandom.</p>
+      <form id="run-form"><fieldset id="configuration" disabled>
+        <label>Component<select id="component"></select></label>
+        <label>Before revision<select id="before"></select></label><label>After revision<select id="after"></select></label>
+        <div class="eyebrow range-heading">PAIRWISE VARIANTS <span>After schema</span></div>
+        <div class="field-pair"><label>Start index<input id="start" type="number" min="0" value="0" required></label><label>End index<input id="end" type="number" min="0" value="5" required></label></div>
+        <label>Maximum cases<input id="maximumCases" type="number" min="1" max="256" value="6" required></label>
+        <details><summary>Capture settings</summary><div class="field-pair"><label>Width · CSS px<input id="width" type="number" min="1" max="2048" value="460" required></label><label>Height · CSS px<input id="height" type="number" min="1" max="2048" value="300" required></label></div><label>Raster density<input id="deviceScale" type="number" min="2" step="any" value="2" required></label></details>
+        <button class="primary run-button" id="run-button" type="submit">Run pairwise sweep <span aria-hidden="true">↗</span></button>
+      </fieldset></form>
+      <section class="history-section" aria-labelledby="history-heading"><h2 class="eyebrow" id="history-heading">RUN HISTORY</h2><ul id="history" aria-label="Previous component sweeps"></ul></section>
+      <p class="sidebar-foot">Committed component sources<br>A fixed Sandom renderer</p>
+    </aside>
+    <main>
+      <div class="workspace-heading"><div><div class="eyebrow">LIVE WORKSPACE</div><h2 id="run-title">Your first component evolution</h2></div><div class="run-actions"><button id="resume" disabled>Resume sweep</button><button id="stop" disabled>Stop after case</button></div></div>
+      <div id="error" role="alert" hidden></div>
+      <section class="progress-panel" aria-label="Sweep progress"><div class="progress-top"><span class="state-pill" id="state">Preparing</span><span id="status" role="status">Loading committed component revisions…</span><strong id="count">0 / 0</strong></div><progress id="progress" max="1" value="0" aria-label="Completed component cases"></progress><div class="progress-bottom"><span id="active-case">Automatic first sweep</span><label class="check"><input id="follow" type="checkbox" checked>Follow latest case</label></div></section>
+      <div class="review-grid">
+        <section class="case-panel" aria-labelledby="cases-heading"><div class="panel-heading"><h3 id="cases-heading">Variants</h3><span class="muted" id="case-total">Pairwise</span></div><ol id="cases" aria-label="Pairwise cases"></ol></section>
+        <section class="viewer-panel" aria-labelledby="viewer-heading">
+          <div class="panel-heading"><div><h3 id="viewer-heading">Revision review</h3><p class="muted" id="selection">Captures will appear as each case completes.</p></div><div class="view-tabs" role="group" aria-label="Review mode"><button id="compare-view" aria-pressed="true">Before / After</button><button id="live-view" aria-pressed="false">Live component</button></div></div>
+          <div id="compare-panel"><div class="comparison-labels"><span id="before-label">Left: Before · Sandom</span><span id="after-label">Right: After · Sandom</span><label class="zoom-control">Zoom<select id="zoom"><option value="1">1×</option><option value="2">2×</option><option value="3">3×</option><option value="4">4×</option></select></label></div>
+            <div class="image-scroll"><div class="empty" id="empty"><span class="empty-mark" aria-hidden="true">↔</span><h4>Your component, before and after.</h4><p>The first pairwise sweep starts automatically.<br>Each pair uses the same props and Sandom renderer.</p></div><div id="comparison" hidden role="img" aria-label="Scrubbable Before and After Sandom renders"><img id="after-image" alt="After revision rendered by Sandom"><img id="before-image" alt="Before revision rendered by Sandom"><div id="divider" aria-hidden="true"></div></div></div>
+            <div class="reveal-control"><label for="reveal">Reveal</label><input id="reveal" type="range" min="0" max="100" value="50" aria-label="Before and After reveal position"><output id="reveal-value">50%</output></div>
+            <div class="transport"><button id="previous" disabled>← Previous case</button><button id="next" disabled>Next case →</button><span id="case-readout">Awaiting capture</span><label>Inspect captured side<select id="inspection-side"><option value="after">After</option><option value="before">Before</option></select></label></div>
+          </div>
+          <div id="live-panel" hidden><div class="live-toolbar"><label>Live revision<select id="live-side"><option value="after">After</option><option value="before">Before</option></select></label><label class="check"><input id="interactive" type="checkbox">Enable interaction</label><label class="check"><input id="inspect-mode" type="checkbox">Pick an element</label><button id="reset-live">Reset component</button></div>
+            <div class="live-scroll"><canvas id="live-canvas" aria-label="Sandom live component rendering" role="img"></canvas></div><div class="live-state"><span id="interaction-status" role="status">Interaction disabled · inspection available</span><span id="live-text" aria-live="polite"></span></div>
+          </div>
+        </section>
+      </div>
+      <section class="evidence-panel" aria-labelledby="evidence-heading"><div class="panel-heading"><h3 id="evidence-heading">Component inspector</h3><span id="inspection-context" class="muted">After capture</span></div><div class="inspector-grid"><div><h4 class="eyebrow">DOM TREE</h4><ul id="nodes" aria-label="Inspectable component elements"></ul></div><div><h4 class="eyebrow">SELECTED ELEMENT</h4><pre id="element-details">Select a DOM node, or pick an element in the live component.</pre></div><div><h4 class="eyebrow">VARIANT PROPS</h4><pre id="props">Awaiting capture.</pre></div></div><details class="source-details"><summary>Committed component source</summary><div class="field-pair"><label>Source revision<select id="source-side"><option value="after">After</option><option value="before">Before</option></select></label><span id="source-identity" class="muted"></span></div><pre id="source-code"></pre></details><details class="source-details"><summary>Run provenance and schema coverage</summary><pre id="provenance"></pre></details></section>
+    </main>
+  </div>
+</body>
+</html>

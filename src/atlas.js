@@ -151,11 +151,12 @@ export function createAtlasRuntime({
       // "rebuild never ran" (null atlasData / zero dims, the pre-rebuild
       // state the old JS classes also had).
       this._rebuiltEmpty = false;
-      // Bumped by every rebuildAtlas() — the ONLY thing that changes the
-      // packed atlas's dimensions or pixels (ensurePaths only adds entries;
-      // atlasData/atlasWidth/atlasHeight all read the packed result). A GPU
-      // consumer caching an uploaded texture keys on this plus the atlas's
-      // own identity, instead of re-uploading every frame.
+      // Bumped by every rebuildAtlas() that packs again — the ONLY thing
+      // that changes the packed atlas's dimensions or pixels (ensurePaths
+      // only adds entries; atlasData/atlasWidth/atlasHeight all read the
+      // packed result). A GPU consumer caching an uploaded texture keys on
+      // this plus the atlas's own identity, instead of re-uploading every
+      // frame.
       this.revision = 0;
       this._destroyListeners = new Set();
       this._webGpuTextures = new Map();
@@ -199,10 +200,17 @@ export function createAtlasRuntime({
 
     rebuildAtlas() {
       if (this.id) {
+        // An atlas no ensure changed since its last packing keeps its
+        // packed pixels, so its revision (and every texture and bind group
+        // keyed on it) holds: a frame of unchanged paths uploads nothing.
+        if (this.revision !== 0 && !wasmModule._atlas_dirty(this.id)) return 0;
         wasmModule._atlas_rebuild(this.id);
         this.revision++;
         return wasmModule._atlas_last_rebuild_milliseconds(this.id);
       }
+      // An atlas that never reached the wasm side stays the same 1x1 empty
+      // texture: only its first rebuild changes it.
+      if (this._rebuiltEmpty) return 0;
       this._rebuiltEmpty = true;
       this.revision++;
       return 0;
@@ -272,7 +280,8 @@ export function createAtlasRuntime({
     // destroyed an atlas texture per draw per frame: the landing page's
     // MOTION section paid ~1 300 writeTexture calls a second for one 568 KB
     // atlas whose revision never moved, and every frame waited on the queue
-    // (plans/bugs/BUG-motion-frames-wait-on-the-gpu.md).
+    // (BUG-motion-frames-wait-on-the-gpu, resolved; see
+    // activity/reports/REPORT-2026-10-07-resolved-bug-records.md).
     deviceTexture(device) {
       const cached = this._webGpuTextures.get(device);
       if (cached && (cached.generated || cached.revision === this.revision)) {
@@ -522,24 +531,47 @@ export function createAtlasRuntime({
   }
 
   /**
-   * Font-level glyph atlas — one wasm atlas handle per font file.
+   * Font-level glyph atlas — one wasm atlas handle per font instance: the
+   * font file and the 'wdth' coordinate (variationWidth; 0 for none) and
+   * 'slnt' coordinate (variationSlant; 0 for upright) every glyph is
+   * outlined at.
    */
   class GlyphAtlas extends WasmAtlas {
-    constructor(fontBytes) {
+    constructor(fontBytes, variationWidth = 0, variationSlant = 0, faceIndex = 0) {
       super(0);
       this.fontBytes = fontBytes;
+      this.variationWidth = variationWidth;
+      this.variationSlant = variationSlant;
+      this.faceIndex = faceIndex;
       this.unitsPerEm = 0;
-      // HarfBuzz face handle (src/shaping.js) — the single resident copy of
-      // the font bytes. Outlines and metadata come from here; msdfgen.wasm
-      // never sees font bytes anymore (design/text-rendering.md).
+      // Registered HarfBuzz face in fused renderer memory. The native
+      // collector supplies outline bytes and metadata; msdfgen receives
+      // only bounded verb spans, never font bytes (design/text-rendering.md).
       this._outlineSource = null;
+    }
+
+    // The variation instance a glyph is outlined at: the requested weight,
+    // the atlas's width and slant (a font without a 'slnt' axis ignores
+    // it), and the clamped optical size (opsz-less fonts take none).
+    _outlineVariations(Module, weight, opszCss) {
+      const variations = [["wght", weight], ["slnt", this.variationSlant]];
+      if (this.variationWidth !== 0) {
+        variations.push(["wdth", this.variationWidth]);
+      }
+      if (this._outlineSource.opszAxis) {
+        variations.push([
+          "opsz",
+          Module._atlas_resolve_opsz(this.id, opszCss ?? Number.NaN),
+        ]);
+      }
+      return variations;
     }
 
     async _ensureCreated() {
       const created = this.id === 0;
       const Module = await super._ensureCreated();
       if (!this._outlineSource) {
-        this._outlineSource = await createGlyphOutlineSource(this.fontBytes);
+        this._outlineSource = await createGlyphOutlineSource(this.fontBytes, { faceIndex: this.faceIndex });
       }
       if (created) {
         const axis = this._outlineSource.opszAxis;
@@ -589,14 +621,9 @@ export function createAtlasRuntime({
       );
 
       if (missing.length > 0) {
-        const variations = [["wght", weight]];
-        if (this._outlineSource.opszAxis) {
-          variations.push([
-            "opsz",
-            Module._atlas_resolve_opsz(this.id, opszCss ?? Number.NaN),
-          ]);
-        }
-        const font = this._outlineSource.createFont(variations);
+        const font = this._outlineSource.createFont(
+          this._outlineVariations(Module, weight, opszCss),
+        );
         try {
           for (const glyphId of missing) {
             const outlineStartedAt = performance.now();
@@ -710,14 +737,9 @@ export function createAtlasRuntime({
         ) < 0
       );
       if (missing.length > 0) {
-        const variations = [["wght", weight]];
-        if (this._outlineSource.opszAxis) {
-          variations.push([
-            "opsz",
-            Module._atlas_resolve_opsz(this.id, opszCss ?? Number.NaN),
-          ]);
-        }
-        const font = this._outlineSource.createFont(variations);
+        const font = this._outlineSource.createFont(
+          this._outlineVariations(Module, weight, opszCss),
+        );
         try {
           for (const glyphId of missing) {
             const outlineStartedAt = performance.now();
@@ -738,11 +760,17 @@ export function createAtlasRuntime({
                 this.id,
                 devicePx ?? 0,
               );
+              const minimumShapeUnitsPerTexel = Module
+                ._atlas_glyph_minimum_shape_units_per_texel(
+                  this.id,
+                  devicePx ?? 0,
+                );
               preparedLength = Module._prepare_outline_msdf_geometry(
                 verbsPointer,
                 verbs.length,
                 msdfSize,
                 MSDF_RANGE,
+                minimumShapeUnitsPerTexel,
                 preparedPointer,
                 preparedCapacity,
               );
@@ -755,6 +783,7 @@ export function createAtlasRuntime({
                   verbs.length,
                   msdfSize,
                   MSDF_RANGE,
+                  minimumShapeUnitsPerTexel,
                   preparedPointer,
                   preparedCapacity,
                 );
@@ -957,23 +986,44 @@ export function createAtlasRuntime({
         slots.fill(-1);
         return slots;
       }
-      const Module = this._ensureCreatedSync();
-      const batch = Module._atlas_glyph_keys_create(
-        glyphIds.length,
+      return this._glyphKeyBatch(
+        this._ensureCreatedSync(),
         GlyphPolicy.MODE_RESIDENCY,
+        "residency",
+        glyphIds,
+        weight,
+        opszCss,
+        devicePx,
+        (view, outputPointer) => {
+          for (let index = 0; index < glyphIds.length; index++) {
+            slots[index] = view.getInt32(
+              outputPointer + index * GlyphPolicy.RESIDENCY_SIZE +
+                GlyphPolicy.RESIDENCY_SLOT_OFFSET,
+              true,
+            );
+          }
+          return slots;
+        },
       );
+    }
+
+    // Runs one glyph-policy key batch over glyphIds at one weight, optical
+    // size and device size, and hands its published output records to
+    // readOutput(view, outputPointer).
+    _glyphKeyBatch(Module, mode, label, glyphIds, weight, opszCss, devicePx, readOutput) {
+      const batch = Module._atlas_glyph_keys_create(glyphIds.length, mode);
       if (!batch) {
         const error = GlyphPolicy.readError(
           new DataView(Module.HEAPU8.buffer),
           Module._atlas_glyph_keys_error_ptr(),
         );
         throw new Error(
-          `glyph residency batch creation failed (${error.code}:${error.field})`,
+          `glyph ${label} batch creation failed (${error.code}:${error.field})`,
         );
       }
       try {
         const inputPointer = Module._atlas_glyph_keys_input_ptr(batch);
-        let view = new DataView(Module.HEAPU8.buffer);
+        const view = new DataView(Module.HEAPU8.buffer);
         for (let index = 0; index < glyphIds.length; index++) {
           const row = inputPointer + index * GlyphPolicy.INPUT_SIZE;
           view.setFloat64(
@@ -1009,19 +1059,13 @@ export function createAtlasRuntime({
             Module._atlas_glyph_keys_error_ptr(),
           );
           throw new Error(
-            `glyph residency query failed (${error.code}:${error.field}:${error.recordIndex})`,
+            `glyph ${label} query failed (${error.code}:${error.field}:${error.recordIndex})`,
           );
         }
-        const outputPointer = Module._atlas_glyph_keys_output_ptr(batch);
-        view = new DataView(Module.HEAPU8.buffer);
-        for (let index = 0; index < glyphIds.length; index++) {
-          slots[index] = view.getInt32(
-            outputPointer + index * GlyphPolicy.RESIDENCY_SIZE +
-              GlyphPolicy.RESIDENCY_SLOT_OFFSET,
-            true,
-          );
-        }
-        return slots;
+        return readOutput(
+          new DataView(Module.HEAPU8.buffer),
+          Module._atlas_glyph_keys_output_ptr(batch),
+        );
       } finally {
         Module._atlas_glyph_keys_destroy(batch);
       }
@@ -1094,8 +1138,69 @@ export function createAtlasRuntime({
    * a scene.
    */
   class SvgPathAtlas extends WasmAtlas {
-    constructor() {
+    constructor({ coverageMode = false } = {}) {
       super(1);
+      this._pathBoundsByKey = new Map();
+      this.coverageMode = coverageMode;
+      // pathIndex -> the entry its alias was last ensured from, with the
+      // atlas handle. The atlas never evicts an entry, so a path index
+      // ensured again from the same definition and screen size names the
+      // same slot: ensurePaths skips it instead of encoding its `d` string
+      // and probing the atlas every frame.
+      this._ensuredByPathIndex = new Map();
+    }
+
+    destroy() {
+      this._ensuredByPathIndex.clear();
+      super.destroy();
+    }
+
+    get generationCount() {
+      return this.id ? wasmModule._atlas_generation_count(this.id) : 0;
+    }
+
+    // The SVG scene writer needs the path bbox before it knows the screen
+    // size. Measure geometry without constructing a throwaway distance field;
+    // both the async and layout-getter paths share the same cached result.
+    async measurePathBounds(pathDef, fillRule) {
+      const Module = await this._ensureCreated();
+      return this._measurePathBounds(Module, pathDef, fillRule);
+    }
+
+    measurePathBoundsSync(pathDef, fillRule) {
+      const Module = this._ensureCreatedSync();
+      return this._measurePathBounds(Module, pathDef, fillRule);
+    }
+
+    _measurePathBounds(Module, pathDef, fillRule) {
+      const key = `${fillRule}\0${pathDef}`;
+      const cached = this._pathBoundsByKey.get(key);
+      if (cached) return cached;
+      const bytes = textEncoder.encode(pathDef);
+      const pathPtr = Module._wasm_alloc(bytes.length || 1);
+      const boundsPtr = Module._wasm_alloc(16);
+      let bounds;
+      try {
+        Module.HEAPU8.set(bytes, pathPtr);
+        Module._measure_path_fill_bounds(
+          pathPtr,
+          bytes.length,
+          fillRule === "evenodd" ? 1 : 0,
+          boundsPtr,
+        );
+        const values = new Float32Array(Module.HEAPU8.buffer, boundsPtr, 4);
+        bounds = {
+          xMin: values[0],
+          yMin: values[1],
+          xMax: values[2],
+          yMax: values[3],
+        };
+      } finally {
+        Module._wasm_dealloc(boundsPtr, 16);
+        Module._wasm_dealloc(pathPtr, bytes.length || 1);
+      }
+      this._pathBoundsByKey.set(key, bounds);
+      return bounds;
     }
 
     /**
@@ -1107,24 +1212,37 @@ export function createAtlasRuntime({
      */
     async ensurePaths(entries) {
       const Module = await this._ensureCreated();
-      for (const entry of entries) {
-        const slot = this._ensurePath(Module, entry);
-        if (entry.pathIndex !== undefined) {
-          Module._atlas_alias_path_index(this.id, entry.pathIndex, slot);
-        }
-      }
+      this._ensureEntries(Module, entries);
     }
 
     // Synchronous counterpart of ensurePaths, for the layout-getter fast
     // path — throws (via _ensureCreatedSync) rather than awaiting if the
     // wasm module isn't loaded yet.
     ensurePathsSync(entries) {
-      const Module = this._ensureCreatedSync();
+      this._ensureEntries(this._ensureCreatedSync(), entries);
+    }
+
+    _ensureEntries(Module, entries) {
       for (const entry of entries) {
-        const slot = this._ensurePath(Module, entry);
-        if (entry.pathIndex !== undefined) {
-          Module._atlas_alias_path_index(this.id, entry.pathIndex, slot);
+        if (entry.pathIndex === undefined) {
+          this._ensurePath(Module, entry);
+          continue;
         }
+        const ensured = this._ensuredByPathIndex.get(entry.pathIndex);
+        if (
+          ensured !== undefined && ensured.id === this.id &&
+          ensured.pathDef === entry.pathDef && ensured.fillRule === entry.fillRule &&
+          ensured.stroke === entry.stroke && ensured.screenSize === entry.screenSize
+        ) continue;
+        const slot = this._ensurePath(Module, entry);
+        Module._atlas_alias_path_index(this.id, entry.pathIndex, slot);
+        this._ensuredByPathIndex.set(entry.pathIndex, {
+          id: this.id,
+          pathDef: entry.pathDef,
+          fillRule: entry.fillRule,
+          stroke: entry.stroke,
+          screenSize: entry.screenSize,
+        });
       }
     }
 
@@ -1161,6 +1279,7 @@ export function createAtlasRuntime({
           dashArray,
         );
       }
+
       const slot = wasmFunction(
         this.id,
         pathPtr,
@@ -1175,6 +1294,7 @@ export function createAtlasRuntime({
         dashPtr,
         dashArray.length,
         stroke?.dashPhase ?? 0,
+        this.coverageMode ? 1 : 0,
       );
       if (dashPtr) Module._wasm_dealloc(dashPtr, dashArray.length * 4);
       Module._wasm_dealloc(pathPtr, pathBytes.length);

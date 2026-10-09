@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "disabled": { "type": "boolean" },
+    "invalid": { "type": "boolean" },
+    "initialValue": { "type": "string", "enum": ["", "Design systems"] }
+  },
+  "required": ["disabled", "invalid", "initialValue"],
+  "additionalProperties": false
+}

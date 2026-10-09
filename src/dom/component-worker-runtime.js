@@ -57,7 +57,8 @@ async function onMessage(event) {
         resolveDeliveredFrame();
       });
       try {
-        frame = await surface.renderNow();
+        // The host boundary transfers bytes; a GPU texture cannot cross it.
+        frame = await surface.renderNow({ pixels: true });
         if (!frame) {
           await delivery;
           frame = deliveredFrame;

@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "size": { "type": "string", "enum": ["default", "sm"] },
+    "checked": { "type": "boolean" },
+    "disabled": { "type": "boolean" }
+  },
+  "required": ["size", "checked", "disabled"],
+  "additionalProperties": false
+}

@@ -1,7 +1,8 @@
 import { GlyphResourceManager } from "./glyph-resource-manager.js";
+import { validateClosedRecord } from "./closed-record.js";
 import { clipUniformFloats } from "./gpu-composition-clip.js";
 import { createGpuCompositionOperations } from "./rasterize.js";
-import { shapeText } from "./shaping.js";
+import { shapeFontText } from "./shaping.js";
 import { decodeWebFont } from "./web-font.js";
 
 const IDENTITY_TRANSFORM = Object.freeze({
@@ -34,17 +35,6 @@ const TEXT_LAYER_FIELDS = new Set([
   "clipRectangle",
   "transform",
 ]);
-
-function validateClosedRecord(value, allowedFields, name) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError(`${name} must be a record`);
-  }
-  for (const field of Object.keys(value)) {
-    if (!allowedFields.has(field)) {
-      throw new TypeError(`${name} contains unknown field ${field}`);
-    }
-  }
-}
 
 function validateFiniteNumber(value, name) {
   if (!Number.isFinite(value)) {
@@ -453,7 +443,7 @@ export async function createGpuCompositor(options) {
   function shapeTextRecord(record) {
     const operation = settledShaping.then(async () => {
       const decodedFontBytes = await decodedFont(record.fontBytes);
-      const shaped = await shapeText(
+      const shaped = await shapeFontText(
         decodedFontBytes,
         record.text,
         record.fontSize,

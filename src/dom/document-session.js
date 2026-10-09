@@ -1,4 +1,5 @@
 import {
+  inspectAnimationPreparedInput,
   inspectDocumentLayout,
   inspectPreparedInput,
   prepareRenderInput,
@@ -10,12 +11,13 @@ import {
   createFrameTransaction,
   createRenderSurface,
 } from "./render-surface.js";
-import { createSandomDOM } from "./dom.js";
+import { createSandomDOM } from "./sandom-dom.js";
 import { normalizeInputBatch } from "./interaction.js";
 import { recommendViewportFromInspection } from "./viewport-recommendation.js";
 import { serializeToScene } from "./serialize.js";
 import { serializeSnapshotNode } from "./html.js";
 import { buildAccessibilitySnapshot } from "./accessibility.js";
+import { assertScrollbarStyle } from "./scrollbar-visibility.js";
 
 const SESSION_STATE = new WeakMap();
 
@@ -88,7 +90,11 @@ function normalizeMutationChange(node, record, identify) {
 }
 
 export class DocumentSession {
-  constructor(preparedInput) {
+  // `scrollbarStyle` ("overlay" or "classic") is the style of every surface
+  // and layout the session creates (plans/PLAN-native-scrollbars.md,
+  // decision 1). An inspect, plan, or renderOnce request that names its
+  // own scrollbarStyle overrides it for that request.
+  constructor(preparedInput, { scrollbarStyle } = {}) {
     if (!preparedInput?.document?.documentElement) {
       throw new TypeError("DocumentSession requires a prepared render input.");
     }
@@ -97,6 +103,11 @@ export class DocumentSession {
     ].some((element) => element._customElementState === "custom");
     const state = {
       preparedInput,
+      // Undefined when the creator named no style: a request then reports
+      // the "overlay" default as its own (render plan decision source).
+      scrollbarStyle: scrollbarStyle === undefined
+        ? undefined
+        : assertScrollbarStyle(scrollbarStyle, "document session options"),
       baselineDocument: containsCustomElement
         ? null
         : clonePreparedDocument(preparedInput),
@@ -112,6 +123,10 @@ export class DocumentSession {
     };
     SESSION_STATE.set(this, state);
     this.#addInstance("instance-1", preparedInput.document);
+  }
+
+  get scrollbarStyle() {
+    return requiredState(this).scrollbarStyle ?? "overlay";
   }
 
   get document() {
@@ -228,6 +243,7 @@ export class DocumentSession {
       const inspectedLayout = await inspectDocumentLayout(
         renderRoot,
         environment,
+        { scrollbarStyle: this.scrollbarStyle },
       );
       const serialized = serializeToScene(renderRoot, {
         viewportWidth: environment.width,
@@ -693,6 +709,7 @@ export class DocumentSession {
         viewportHeight: environment.height,
         deviceScale: environment.deviceScale ?? 1,
         capturePaintArtifact: true,
+        scrollbarStyle: this.scrollbarStyle,
       });
       try {
         frame = await surface.renderNow();
@@ -876,9 +893,16 @@ export class DocumentSession {
       output: null,
       createSurface: options.createSurface ?? createRenderSurface,
       displacesRegisteredSurfaces: options.createSurface === undefined,
-      surfaceOptions: options.surfaceOptions ?? {},
+      surfaceOptions: {
+        scrollbarStyle: this.scrollbarStyle,
+        ...options.surfaceOptions,
+      },
       width: options.width ?? null,
       height: options.height ?? null,
+      // Texture delivery by default: each layer frame carries the
+      // renderer's GPU texture image and `output.pixels` is null. A pixel
+      // target reads every layer back and composites one CPU buffer.
+      pixels: options.pixels === true,
     };
     state.targets.set(identifier, target);
     return identifier;
@@ -958,8 +982,7 @@ export class DocumentSession {
         }
         // The default factory owns the root registry slot. A custom factory
         // owns its own lifecycle and can wrap an already registered surface,
-        // as the desktop and device-viewer presentation targets do — a
-        // FOREIGN registered surface is preserved. The target's OWN
+        // so a FOREIGN registered surface is preserved. The target's OWN
         // surfaces still serialize: a duplicate (root, environment)
         // placement displaces this target's earlier occupant.
         const occupying = root._renderSurfaces?.get(placementEnvironmentKey);
@@ -994,7 +1017,10 @@ export class DocumentSession {
       const documentRevision = current.revision;
       const interactionRevision = frameTransaction?.instances.get(current)?.interactionRevision ??
         current.interactionRevision;
-      const frame = await surface.renderNow({ _transaction: frameTransaction }) ??
+      const frame = await surface.renderNow({
+        pixels: target.pixels,
+        _transaction: frameTransaction,
+      }) ??
         previousOutputLayers.get(index)?.frame;
       if (!frame) {
         throw new Error(
@@ -1057,7 +1083,12 @@ export class DocumentSession {
             "Raster placement coordinates must be integers.",
           );
         }
-        const sourceStride = Number(frame.rowStride ?? frame.width * 4);
+        // rowStride counts BYTES; subarray indexes ELEMENTS. A float32 RGBA
+        // frame carries width * 16 bytes per row, which is width * 4 elements.
+        const byteStride = Number(
+          frame.rowStride ?? frame.width * 4 * frame.pixels.BYTES_PER_ELEMENT,
+        );
+        const sourceStride = byteStride / frame.pixels.BYTES_PER_ELEMENT;
         for (let sourceY = 0; sourceY < frame.height; sourceY++) {
           const outputY = top + sourceY;
           if (outputY < 0 || outputY >= height) continue;
@@ -1286,7 +1317,7 @@ export class DocumentSession {
               throw new Error(`Pointer ${record.pointerId} is already active.`);
             }
           },
-          afterRecord: (record, _index, result) => {
+          afterRecord: (record, _index, result, scrolled) => {
             if (record.kind === "pointer-down" && result) {
               instance.pointerBindings.set(record.pointerId, bindingKey);
             } else if (
@@ -1301,7 +1332,7 @@ export class DocumentSession {
               targetIdentifier: resultTarget
                 ? this.#nodeIdentifier(resultTarget)
                 : null,
-              scrolled: Boolean(result?.scrolled),
+              scrolled,
             }));
           },
         });
@@ -1567,18 +1598,31 @@ export class DocumentSession {
 
   async inspect(request = {}) {
     const state = requiredState(this);
-    return await inspectPreparedInput(state.preparedInput, request);
+    return await inspectPreparedInput(
+      state.preparedInput,
+      this.#withScrollbarStyle(request),
+    );
   }
 
   async plan(request = {}) {
     const state = requiredState(this);
     const { planRenderInput } = await import("./render-planning.js");
-    return await planRenderInput(state.preparedInput, request);
+    return await planRenderInput(
+      state.preparedInput,
+      this.#withScrollbarStyle(request),
+    );
   }
 
+  // A render plan carries its own scrollbarStyle; an exact request takes
+  // the session style unless it names one.
   async renderOnce(request = {}) {
     const state = requiredState(this);
-    return await renderPreparedInput(state.preparedInput, request);
+    return await renderPreparedInput(
+      state.preparedInput,
+      request?.kind === "render-plan"
+        ? request
+        : this.#withScrollbarStyle(request),
+    );
   }
 
   async dispose() {
@@ -1591,6 +1635,13 @@ export class DocumentSession {
     state.targets.clear();
     state.disposed = true;
     await state.preparedInput.release();
+  }
+
+  #withScrollbarStyle(request) {
+    const style = requiredState(this).scrollbarStyle;
+    return style === undefined || request.scrollbarStyle !== undefined
+      ? request
+      : { ...request, scrollbarStyle: style };
   }
 
   #addInstance(identifier, document) {
@@ -1719,8 +1770,58 @@ export class DocumentSession {
 }
 
 export async function createDocumentSession(input, options = {}) {
+  const { scrollbarStyle, ...preparationOptions } = options;
+  if (scrollbarStyle !== undefined) {
+    assertScrollbarStyle(scrollbarStyle, "document session options");
+  }
   const preparedInput = input?.document && typeof input.release === "function"
     ? input
-    : await prepareRenderInput(input, options);
-  return new DocumentSession(preparedInput);
+    : await prepareRenderInput(input, preparationOptions);
+  return new DocumentSession(preparedInput, { scrollbarStyle });
+}
+
+// One-shot entries over one DocumentSession. They live beside the session
+// so render-animation.js, which the session builds on, never imports it
+// back (test/module_graph_test.js).
+export async function renderAnimationInput(input, options = {}) {
+  const {
+    preprocessors = [],
+    preprocessor,
+    resolveResource = null,
+    ...renderRequest
+  } = options;
+  const preparedInput = await prepareRenderInput(input, {
+    preprocessors,
+    preprocessor,
+    resolveResource,
+  });
+  const session = new DocumentSession(preparedInput);
+  try {
+    return await session.renderOnce(renderRequest);
+  } finally {
+    await session.dispose();
+  }
+}
+
+export async function inspectAnimationInput(input, options = {}) {
+  const {
+    preprocessors = [],
+    preprocessor,
+    resolveResource = null,
+    ...inspectionRequest
+  } = options;
+  const preparedInput = await prepareRenderInput(input, {
+    preprocessors,
+    preprocessor,
+    resolveResource,
+  });
+  const session = new DocumentSession(preparedInput);
+  try {
+    return await inspectAnimationPreparedInput(
+      preparedInput,
+      inspectionRequest,
+    );
+  } finally {
+    await session.dispose();
+  }
 }

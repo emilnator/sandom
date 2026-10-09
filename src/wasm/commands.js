@@ -205,6 +205,9 @@ export function writePopClip(view, offset) {
 // filterSegments: [{ kind: 'matrix', matrix: f32[20] row-major 4x5 } |
 //                  { kind: 'blur', sigma: number } |
 //                  { kind: 'drop-shadow', dx, dy, sigma, color: {r,g,b,a} }],
+// sigma in CSS px, written as both the horizontal and the vertical standard
+// deviation (the wire carries both; only a non-uniformly scaling transform,
+// which $composeFilterSegments maps, makes them differ),
 // in APPLICATION order (matches $composeFilterSegments' own
 // list-order-is-application-order convention — a filter list's
 // contiguous color-matrix runs fold into ONE matrix segment each, a
@@ -225,6 +228,7 @@ function writeFilterSegments(view, segmentsBase, segments) {
     } else if (segment.kind === 'blur') {
       view.setUint8(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_KIND, CMD_PUSH_OPACITY_SEGMENT_KIND_BLUR);
       view.setFloat32(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD, segment.sigma, true);
+      view.setFloat32(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD + 4, segment.sigma, true);
     } else if (segment.kind === 'drop-shadow') {
       view.setUint8(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_KIND, CMD_PUSH_OPACITY_SEGMENT_KIND_DROP_SHADOW);
       const payloadOffset = segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD;
@@ -236,6 +240,7 @@ function writeFilterSegments(view, segmentsBase, segments) {
       view.setFloat32(payloadOffset + 16, c.g, true);
       view.setFloat32(payloadOffset + 20, c.b, true);
       view.setFloat32(payloadOffset + 24, c.a, true);
+      view.setFloat32(payloadOffset + 28, segment.sigma, true);
     } else {
       throw new Error(`writeFilterSegments: unknown filter segment kind "${segment.kind}"`);
     }

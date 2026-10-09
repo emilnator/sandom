@@ -20,18 +20,23 @@ import { encodePngOutputWithCodec } from './output/png.js';
 // empty) — no WASI, no env, no emscripten glue, unlike hb.wasm next door
 // which needs an env import object. So instantiation takes no imports and
 // there is no __wasm_call_ctors to run.
-const defaultJpegState = { instance: null };
+const defaultJpegState = { instance: null, loading: null };
 
+// Concurrent first decodes (a frame's images decode at once) share one
+// instantiation. A failed instantiation is not kept.
 async function ensureJpeg(state, getJpegBytes) {
   if (state.instance) return state.instance;
-
-  const wasmBytes = getJpegBytes
-    ? await getJpegBytes()
-    : await readBinaryFile(new URL('../vendor/jpeg.wasm', import.meta.url));
-
-  const { instance } = await WebAssembly.instantiate(wasmBytes, {});
-  state.instance = instance;
-  return instance;
+  state.loading ??= (async () => {
+    const wasmBytes = getJpegBytes
+      ? await getJpegBytes()
+      : await readBinaryFile(new URL('../vendor/jpeg.wasm', import.meta.url));
+    const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+    state.instance = instance;
+    return instance;
+  })().finally(() => {
+    state.loading = null;
+  });
+  return await state.loading;
 }
 
 // Mirrors the shim's return codes (vendor/jpeg-wasm-rs/src/lib.rs). Spelled
@@ -297,7 +302,7 @@ export function createImageCodecRuntime({
   decodeJXL = null,
   encodeJxlOutput = null,
 } = {}) {
-  const jpegState = { instance: null };
+  const jpegState = { instance: null, loading: null };
   const pngCodec = createPngCodec({ getPngBytes });
   return Object.freeze({
     async decodeJPEG(bytes) {
@@ -344,7 +349,6 @@ export function createImageCodecRuntime({
     },
     imageMimeType,
     encodeJxlOutput,
-    encodePNG: (pixels, width, height) => pngCodec.encode(pixels, width, height),
     encodePngOutput: (descriptor, request) => encodePngOutputWithCodec(pngCodec, descriptor, request),
     instanceIdentity() {
       return jpegState.instance;
@@ -372,6 +376,25 @@ const isPNG = (b) => b.length >= 8 &&
 const isWebP = (b) => b.length >= 12 &&
   b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
   b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50;
+
+// SVG is an XML image, not a magic-byte container. Only decode text when
+// the prefix could be XML; parse the full source in the SVG DOM path.
+export function svgImageSource(bytes) {
+  let offset = 0;
+  if (bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+    offset = 3;
+  }
+  while (
+    offset < bytes.length &&
+    (bytes[offset] === 0x20 || bytes[offset] === 0x09 ||
+      bytes[offset] === 0x0A || bytes[offset] === 0x0D)
+  ) offset++;
+  if (bytes[offset] !== 0x3C) return null;
+  const source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  const svgRoot =
+    /^(?:\uFEFF?\s*(?:<\?xml\b[\s\S]*?\?>\s*|<!--[\s\S]*?-->\s*|<!DOCTYPE\s+svg\b[\s\S]*?>\s*))*\uFEFF?\s*<(?:[A-Za-z_][\w.-]*:)?svg(?:\s|\/?>)/i;
+  return svgRoot.test(source) ? source : null;
+}
 
 // Both JPEG XL signatures (bare codestream and ISOBMFF container) live in
 // src/jpeg-xl.js beside their decoder, imported statically so this sniff
@@ -414,8 +437,8 @@ export async function decodeImage(bytes, options) {
 }
 
 /**
- * The MIME type for a data: URI carrying these bytes. Same sniff as
- * decodeImage — literally the same predicates, so the two cannot disagree.
+ * The MIME type for a data: URI carrying these bytes. Raster containers
+ * share decodeImage's predicates; XML SVG uses the renderer's SVG path.
  *
  * This does NOT change what Chrome renders today, and it is worth being
  * precise about that rather than claiming a bug fix: measured against the
@@ -430,6 +453,7 @@ export function imageMimeType(bytes) {
   if (isPNG(bytes)) return 'image/png';
   if (isWebP(bytes)) return 'image/webp';
   if (isJXL(bytes)) return 'image/jxl';
+  if (svgImageSource(bytes) !== null) return 'image/svg+xml';
   const head = Array.from(bytes.slice(0, 4), (b) => b.toString(16).padStart(2, '0')).join(' ');
   throw new Error(`imageMimeType: unrecognized image format (first bytes: ${head})`);
 }

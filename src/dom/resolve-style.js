@@ -96,7 +96,8 @@ export function resolveElementStyle(
         // parses this value, and the apply path dropped it anyway. That is
         // an internal defect, and the one thing a drop must never be is
         // silent - a swallowed splitting bug shipped as missing paint once
-        // already (BUG-style-resolution-swallows-internal-errors.md).
+        // already (BUG-style-resolution-swallows-internal-errors, resolved;
+        // see activity/reports/REPORT-2026-10-09-resolved-bug-records.md).
         throw new Error(
           `style.${property}: the cascade dropped "${value}", a value the engine parses`,
         );
@@ -106,6 +107,7 @@ export function resolveElementStyle(
   }
   return {
     fields,
+    declarations: cascaded.declarations ?? [],
     childContext: {
       customProperties,
       animationComposition: fields.animationComposition ?? ["replace"],

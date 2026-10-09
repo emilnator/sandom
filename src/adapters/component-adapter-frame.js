@@ -1,6 +1,11 @@
+// Own keys of a published component-session frame (render-surface.js frame
+// object plus render-component.js publication fields). The allow-list is
+// exact so a new surface field is a deliberate protocol decision, not a
+// silent leak across the realm boundary.
 const FRAME_FIELDS = new Set([
   "pixels",
-  "png",
+  "textureImage",
+  "device",
   "rowStride",
   "channelLayout",
   "sampleType",
@@ -11,12 +16,24 @@ const FRAME_FIELDS = new Set([
   "width",
   "height",
   "deviceScale",
+  "graphicsBackend",
+  "graphicsBackendInfo",
   "dirtyRectangles",
+  "pixelRegions",
   "readbackByteLength",
   "frameSequence",
   "scrollbars",
   "timeMilliseconds",
+  "renderTimings",
   "inspection",
+  "documentRevision",
+  "interactionRevision",
+  "presentationRevision",
+  "accessibilityRevision",
+  "focusIdentifier",
+  "accessibility",
+  "interactiveTextGeometry",
+  "changedControlStates",
 ]);
 
 const SCROLLBAR_FIELDS = new Set([
@@ -31,9 +48,11 @@ const SCROLLBAR_FIELDS = new Set([
   "thickness",
   "track",
   "thumb",
+  "side",
   "colors",
   "role",
   "clip",
+  "visibility",
 ]);
 
 function rejectUnknownFields(value, allowed, name) {
@@ -101,12 +120,21 @@ function scrollbarRecord(scrollbar, inspection) {
     thickness: scrollbar.thickness,
     track: scrollbar.track,
     thumb: scrollbar.thumb,
+    side: scrollbar.side ?? null,
     colors: scrollbar.colors,
     role: scrollbar.role,
     clip: scrollbar.clip ?? null,
+    visibility: scrollbar.visibility ?? null,
   };
 }
 
+// The realm protocol ships a pixel frame: the plain frame fields in the
+// structured header and the pixel bytes as one byte field. Not transported:
+// `textureImage` and `device` (GPU handles, null on a pixel frame),
+// `pixelRegions` (per-region typed arrays; the full pixels already ship),
+// and the session-only lazy getters `accessibility`,
+// `interactiveTextGeometry`, and `changedControlStates` (resolved against
+// the live document on demand, never as part of a frame record).
 export function componentAdapterFrameRecord(frame) {
   if (!frame || typeof frame !== "object" || Array.isArray(frame)) {
     throw new TypeError("Component frame must be an object");
@@ -114,7 +142,6 @@ export function componentAdapterFrameRecord(frame) {
   rejectUnknownFields(frame, FRAME_FIELDS, "Component frame");
   const {
     pixels,
-    png,
     inspection,
     rowStride,
     channelLayout,
@@ -126,17 +153,22 @@ export function componentAdapterFrameRecord(frame) {
     width,
     height,
     deviceScale,
+    graphicsBackend,
+    graphicsBackendInfo,
     dirtyRectangles,
     readbackByteLength,
     frameSequence,
     scrollbars,
     timeMilliseconds,
+    renderTimings,
+    documentRevision,
+    interactionRevision,
+    presentationRevision,
+    accessibilityRevision,
+    focusIdentifier,
   } = frame;
   if (!ArrayBuffer.isView(pixels) || pixels instanceof DataView) {
     throw new TypeError("Component frame pixels must be a typed array");
-  }
-  if (png !== null && png !== undefined && !(png instanceof Uint8Array)) {
-    throw new TypeError("Component frame PNG must be a Uint8Array, null, or absent");
   }
   if (!Array.isArray(scrollbars)) {
     throw new TypeError("Component frame scrollbars must be an array");
@@ -153,6 +185,8 @@ export function componentAdapterFrameRecord(frame) {
       width,
       height,
       deviceScale,
+      graphicsBackend,
+      graphicsBackendInfo,
       dirtyRectangles,
       readbackByteLength,
       frameSequence,
@@ -160,9 +194,14 @@ export function componentAdapterFrameRecord(frame) {
         scrollbarRecord(scrollbar, inspection)
       ),
       timeMilliseconds,
+      renderTimings,
+      documentRevision,
+      interactionRevision,
+      presentationRevision,
+      accessibilityRevision,
+      focusIdentifier,
       pixelsPresent: true,
       pixelsType: pixels.constructor.name,
-      pngPresent: png instanceof Uint8Array,
       ...(inspection
         ? { inspection: componentAdapterInspectionRecord(inspection) }
         : {}),
@@ -172,9 +211,6 @@ export function componentAdapterFrameRecord(frame) {
         "pixels",
         new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength),
       ],
-      ...(png instanceof Uint8Array
-        ? [["png", new Uint8Array(png.buffer, png.byteOffset, png.byteLength)]]
-        : []),
     ]),
   };
 }

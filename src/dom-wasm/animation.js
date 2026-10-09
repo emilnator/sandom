@@ -211,6 +211,12 @@ export function animationTransitionDefinitions(element) {
 
 const TRANSFORM_KINDS = { translate: 1, translateX: 2, translateY: 3, scale: 4,
   scaleX: 5, scaleY: 6, rotate: 7, skew: 8, skewX: 9, skewY: 10, matrix: 11 };
+// A box-shadow list travels as component pairs in the transform component
+// pool (engine-layout.watpart $animationWriteShadowSample): geometry
+// (offset-x, offset-y, blur, spread; kind bit 0 = inset) then colour.
+export const SHADOW_COMPONENT_GEOMETRY = 0x40;
+export const SHADOW_COMPONENT_COLOR = 0x41;
+export const SHADOW_LIST_MAX = 8;
 function nativeTransform(component) {
   const kind = component.kind;
   let values;
@@ -245,11 +251,14 @@ export function normalizeAnimationValue(property, input) {
     if (input?.kind === "lengthPercentage" || (input && "pixels" in input && "percentage" in input)) {
       kind = 2; values = [input.pixels, input.percentage, 0];
     } else if (input?.kind === "keyword") {
-      kind = 5; tag = ({ auto: 0, none: 0, zero: 0, "min-content": 3, "max-content": 4 })[input.keyword] ?? -1;
+      kind = 5; tag = ({ auto: 0, none: 0, zero: 0, "min-content": 3, "max-content": 4, "fit-content": 8 })[input.keyword] ?? -1;
       values = [0, 0, 0];
     }
   } else if (property.kind === 1) {
     if (input?.kind === "scalar") { kind = 1; values = [input.value]; }
+    else if (input?.kind === "lengthPercentage") {
+      kind = 2; values = [input.pixels, input.percentage];
+    }
   } else if (property.kind === 3) {
     if (input?.kind === "color" && Array.isArray(input.value) && input.value.length === 4) {
       kind = 3; values = input.value;
@@ -262,6 +271,37 @@ export function normalizeAnimationValue(property, input) {
       kind = 4; values = [0, 0, 0, 0, 0, 0];
       components = input.components.map(nativeTransform);
     }
+  } else if (property.kind === 7) {
+    if (input?.kind === "shadowList" && Array.isArray(input.shadows)) {
+      if (input.shadows.length > SHADOW_LIST_MAX) {
+        throw new RangeError(`A box-shadow list animates at most ${SHADOW_LIST_MAX} shadows, got ${input.shadows.length}`);
+      }
+      kind = 7;
+      // The envelope's vector is the first shadow's numbers (the reversing
+      // rule measures progress along it; every shadow shares the progress).
+      const first = input.shadows[0];
+      values = first
+        ? [first.offsetX, first.offsetY, first.blur, first.spread, first.color[3], 0]
+        : [0, 0, 0, 0, 0, 0];
+      components = input.shadows.flatMap((shadow) => {
+        for (const number of [shadow.offsetX, shadow.offsetY, shadow.blur, shadow.spread, ...shadow.color]) {
+          if (!Number.isFinite(number)) throw new TypeError("A shadow needs finite lengths and colour channels");
+        }
+        return [
+          { kind: SHADOW_COMPONENT_GEOMETRY | (shadow.inset ? 1 : 0), parameters: [shadow.offsetX, shadow.offsetY, shadow.blur, shadow.spread, 0, 0] },
+          { kind: SHADOW_COMPONENT_COLOR, parameters: [shadow.color[0], shadow.color[1], shadow.color[2], shadow.color[3], 0, 0] },
+        ];
+      });
+    }
+  } else if (property.kind === 8 && input?.kind === "lineHeight") {
+    kind = 8;
+    tag = ({ normal: 0, length: 1, number: 2 })[input.unit] ?? -1;
+    values = [input.value, tag];
+  } else if (property.kind === 9 && input?.kind === "translate") {
+    const x = input.x ?? { pixels: 0, percentage: 0 };
+    const y = input.y ?? { pixels: 0, percentage: 0 };
+    kind = 9;
+    values = [x.pixels, x.percentage, y.pixels, y.percentage];
   }
   const pointer = core.exports.abi_allocate(64);
   let view = new DataView(core.refreshBytes().buffer);
@@ -295,6 +335,16 @@ export function animationLength(value) {
   const length = view.getUint32(pointer + 28, true);
   return { kind: "keyword", keyword: core.decoder.decode(bytes.subarray(text, text + length)) };
 }
+export function animationLineHeight(value) {
+  const pointer = core.status("animation_length_parse", ...core.input(String(value)));
+  const view = new DataView(core.refreshBytes().buffer);
+  return {
+    kind: "lineHeight",
+    value: view.getFloat64(pointer, true),
+    unit: ["normal", "length", "number"][view.getUint32(pointer + 20, true)],
+  };
+}
+
 
 export function animationNumber(value, _label, mode = 0) {
   return core.status("animation_number", typeof value === "number" ? value : NaN, mode);

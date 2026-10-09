@@ -1,5 +1,7 @@
 import { sharedDomCore } from "../dom-wasm/core.js";
-import { buildGeometry, withLiveGeometry } from "./geometry.js";
+import { buildGeometry } from "./geometry.js";
+import { withLiveGeometry } from "./live-geometry.js";
+import { resolvedElementFields, resolvedOverflowAxes } from "./style.js";
 
 export const SCROLL_SOURCES = Object.freeze({ property: 1, scroll: 2, scrollTo: 3, scrollBy: 4, wheel: 5, keyboard: 6, pointer: 7, snap: 8, anchor: 9, scrollIntoView: 10, resize: 11, scrollbar: 12, momentum: 13 });
 const sourceNames = Object.keys(SCROLL_SOURCES);
@@ -35,6 +37,62 @@ export function scrollStore(target, slot, value) {
   if (!target._scrollState && value === 0) return;
   scrollCore(target).status("scroll_store", scrollState(target), slot, value);
 }
+
+// CSSOM View gives the viewport's scroll position to the root element in
+// standards mode and to the body element in quirks mode while the body is not
+// potentially scrollable; the root element in quirks mode reads 0 and ignores
+// writes. The root element's overflow, or the body's when the root's is
+// visible, belongs to the viewport (CSS Overflow 3, "Overflow Viewport
+// Propagation"), and the element it comes from does not scroll.
+function isScrollContainer(element) {
+  const fields = resolvedElementFields(element);
+  if (fields.display === "none" || fields.display === "contents") return false;
+  const overflow = resolvedOverflowAxes(fields);
+  return !(["visible", "clip"].includes(overflow.x) && ["visible", "clip"].includes(overflow.y));
+}
+
+function isQuirksMode(document) {
+  return document._domCore.documentMode(document._coreHandle) === 1;
+}
+
+// The scroller whose position an element's scrollLeft, scrollTop, scroll(),
+// scrollTo() and scrollBy() read and move: the element itself, the viewport
+// of the document element's surface, or null when the element reads 0 and
+// ignores writes (the root element in quirks mode, or a document whose root
+// element has no surface). A body in quirks mode scrolls itself while it is
+// potentially scrollable: it and the root element are both scroll
+// containers, so its overflow stays its own.
+export function elementScrollSource(element) {
+  const document = element.ownerDocument;
+  if (!document) return element;
+  const root = document.documentElement;
+  if (element === root) {
+    if (isQuirksMode(document)) return null;
+  } else if (element.localName !== "body" || element !== document.body || !isQuirksMode(document) ||
+    (isScrollContainer(root) && isScrollContainer(element))) {
+    return element;
+  }
+  return root._renderSurface?.viewport ?? null;
+}
+
+// CSSOM View `scrollingElement`: the root element in standards mode; in
+// quirks mode the body element unless it is potentially scrollable (it and
+// the root element are both scroll containers), otherwise null.
+export function documentScrollingElement(document) {
+  const root = document.documentElement;
+  if (!isQuirksMode(document)) return root;
+  const body = document.body;
+  if (body === null) return null;
+  return isScrollContainer(root) && isScrollContainer(body) ? null : body;
+}
+
+// Viewport and element scroll states share the slots: 0 and 1 requested,
+// 2 and 3 effective.
+export function elementScrollRead(element, slot) {
+  const source = elementScrollSource(element);
+  return source === null ? 0 : scrollRead(source, slot);
+}
+
 export function scrollRequest(target, left, top, behavior, source) {
   const core = scrollCore(target);
   const state = scrollState(target);

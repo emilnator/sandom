@@ -1,11 +1,21 @@
 import { canonicalizeAnimationKeyframes, resolvedElementFields } from "./style.js";
-import { parseCSSEasing } from "../dom-wasm/easing.js";
+import { parseCSSEasing, serializeCSSEasing } from "../dom-wasm/easing.js";
 import { deferAnimationBinding } from "../dom-wasm/animation.js";
-import { installAnimationBindings, createAnimationEffectBindings } from "./dom-bindings.generated.js";
+import {
+  installAnimationBindings,
+  installCSSAnimationBindings,
+  installCSSTransitionBindings,
+  createAnimationEffectBindings,
+} from "./dom-bindings.generated.js";
 
 const STATES = ["idle", "running", "paused", "finished"];
 const FILL_MODES = ["none", "forwards", "backwards", "both"];
-const LIFECYCLE = { animationstart: 1, animationend: 2, animationcancel: 3 };
+// A transition's track reports the same start, end and cancel lifecycle as
+// an animation's.
+const LIFECYCLE = {
+  animationstart: 1, animationend: 2, animationcancel: 3,
+  transitionstart: 1, transitionend: 2, transitioncancel: 3,
+};
 const MEASUREMENT = Symbol.for("sandom.domCore.measurement");
 const animationFinalizer = new FinalizationRegistry(({ core, handle, keyframes }) => {
   core.status("animation_release", handle);
@@ -24,12 +34,15 @@ function decodeCanonicalNumber(_key, value) {
   if (typeof value !== "string" || !value.startsWith("\0")) return value;
   return value.startsWith("\0\0") ? value.slice(1) : Number(value.slice(1));
 }
+// Animations created by script sort by creation in composite order.
+let nextAnimationSequence = 0;
 
 export class SDAnimation {
   constructor(surface, element, keyframes, timing, engineDeclarationOptions = {}) {
     this._surface = surface;
     this._element = element;
     this._core = element._domCore;
+    this._sequence = nextAnimationSequence++;
     // A surface is a timeline; a PendingAnimationTimeline is not. An
     // animation created before any surface claimed the element holds at its
     // current time until one adopts it and resolves its start time.
@@ -60,7 +73,7 @@ export class SDAnimation {
     if (defaultFill && this._timing.fill === undefined) this._timing.fill = FILL_MODES[defaultFill];
     this._animationId = this._core.handle("animation_create", element._coreHandle,
       this._timing.duration, this._timing.delay, Number(this._timing.iterations),
-      Number(this._timing.startTime ?? surface.currentTime), scroll ? 1 : 0);
+      Number(this._timing.startTime ?? engineDeclarationOptions.startTime ?? surface.currentTime), scroll ? 1 : 0);
     try {
       this._keyframesHandle = this._core.handle("animation_keyframes_create",
         ...this._core.input(JSON.stringify(canonicalKeyframes, encodeCanonicalNumber)));
@@ -121,12 +134,12 @@ export class SDAnimation {
       this._applyActions(this._core.status("animation_control", this._animationId, 10, generation, this._surface.currentTime));
     }
     if (actions & 1) this._engineHandle.cancelSilently();
-    if (actions & 16) this._surface._restoreAnimation(this);
+    if (actions & 16) this._rejoinHost();
     if (actions & 2) this._replaceEngineHandle();
     if (actions & 4) this._engineHandle.pause(this._surface.currentTime);
     if (actions & 8) this._engineHandle.resume(this._surface.currentTime);
     if (actions & 2048) this._engineHandle.seek(this._value(11), this._surface.currentTime);
-    if (actions & 32) this._surface._removeAnimation(this);
+    if (actions & 32) this._leaveHost();
     if (actions & 64) this._rejectFinished(new DOMException("Animation canceled", "AbortError"));
     if (actions & 128) this._resolveFinished(this);
     if (actions & 256) this._surface._scheduleAnimationFrame(this._element);
@@ -135,6 +148,11 @@ export class SDAnimation {
   _control(operation, value = 0) {
     return this._applyActions(this._core.status("animation_control", this._animationId, operation, value, this._surface.currentTime));
   }
+  _leaveHost() { this._surface._removeAnimation(this); }
+  _rejoinHost() { this._surface._restoreAnimation(this); }
+  // Whether an engine event with this animation id is one of this
+  // animation's tracks.
+  _ownsEngineAnimationId(animationId) { return animationId === this._animationId; }
   // The surface that adopted this animation has reached a frame, so its
   // timeline finally has a time. The animation held at the current time it
   // reached without a timeline (0 unless the host seeked or paused it), so
@@ -213,13 +231,200 @@ installAnimationBindings({
   },
 }, SDAnimation.prototype);
 
+// A CSS animation: the animation a keyframes rule names in an element's
+// animation-name list (css-animations-2 §4.1).
+export class CSSAnimation extends SDAnimation {
+  constructor(surface, element, keyframes, timing, engineDeclarationOptions) {
+    super(surface, element, keyframes, timing, engineDeclarationOptions);
+    this._cssAnimationName = engineDeclarationOptions.diagnosticAnimationName;
+  }
+}
+installCSSAnimationBindings({}, CSSAnimation.prototype);
+
+function transitionKeyframeValue(value) {
+  const number = (amount) => String(Math.round(amount * 1e6) / 1e6);
+  const length = ({ pixels, percentage }) =>
+    percentage === 0 ? `${number(pixels)}px`
+      : pixels === 0 ? `${number(percentage)}%`
+      : `calc(${number(percentage)}% + ${number(pixels)}px)`;
+  if (typeof value === "string") return value;
+  switch (value?.kind) {
+    case "scalar": return number(value.value);
+    case "lengthPercentage": return length(value);
+    case "color": {
+      const [red, green, blue, alpha] = value.value.map((channel, index) =>
+        index < 3 ? Math.round(channel * 255) : Math.round(channel * 1000) / 1000
+      );
+      return alpha === 1 ? `rgb(${red}, ${green}, ${blue})` : `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+    }
+    case "lineHeight":
+      return value.unit === "normal" ? "normal" : value.unit === "length" ? `${number(value.value)}px` : number(value.value);
+    case "translate":
+      return `${length(value.x)} ${length(value.y)}`;
+    default: return null;
+  }
+}
+
+// A running CSS transition (css-transitions-2 §6.1): the Web Animations
+// object over the track the renderer declared for it. Its timing is the
+// core's animation record; its controls drive that same engine track.
+export class CSSTransition extends SDAnimation {
+  constructor(surface, element, propertyName, record, generation) {
+    super(surface, element, [], {
+      delay: record.delay,
+      direction: "normal",
+      duration: record.duration,
+      easing: typeof record.easing === "string" ? record.easing : serializeCSSEasing(record.easing),
+      endDelay: 0,
+      fill: "backwards",
+      iterationStart: 0,
+      iterations: 1,
+    }, {
+      startTime: record.startTimeMilliseconds,
+      adoptedEngineHandle: record.engineHandle,
+      transitionTrack: {
+        propertyName,
+        easing: record.easing,
+        keyframes: [
+          { offset: 0, value: record.trackStartValue },
+          { offset: 1, value: record.endValue },
+        ],
+      },
+    });
+    this._transitionProperty = propertyName;
+    this._transitionRecord = record;
+    this._transitionGeneration = generation;
+    this._trackAnimationId = record.animationId;
+    const camelName = propertyName.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+    this._inputKeyframes = [record.trackStartValue, record.endValue].map((value, index) => {
+      const text = transitionKeyframeValue(value);
+      return {
+        offset: index, easing: "linear", composite: "auto",
+        ...(text === null ? {} : { [camelName]: text }),
+        computedOffset: index,
+      };
+    });
+  }
+  _timelineValue() { return "auto"; }
+  // Whether the transition's track still moves on the clock: running at a
+  // nonzero rate, or finished and awaiting the tick that ends its track.
+  _trackAdvances() { return this._needsFrame() || this._value(3) === 3; }
+  _ownsEngineAnimationId(animationId) {
+    return animationId === this._animationId || animationId === this._trackAnimationId;
+  }
+  // The renderer's own track serves the first declaration; a change of
+  // time, rate or direction declares the transition's track again.
+  _replaceEngineHandle() {
+    const { adoptedEngineHandle, transitionTrack } = this._engineDeclarationOptions;
+    if (adoptedEngineHandle) {
+      this._engineDeclarationOptions = { transitionTrack };
+      this._engineHandle = adoptedEngineHandle;
+      return;
+    }
+    this._engineHandle = this._surface._declareTransitionTrack(
+      this._element, transitionTrack.propertyName, transitionTrack.keyframes, {
+        duration: this._value(7), delay: this._value(8), startTime: this._value(6),
+        easing: transitionTrack.easing, direction: this._value(9) ? "reverse" : "normal",
+      }, { animationId: this._animationId, trackGeneration: this._value(5) },
+    );
+  }
+  _leaveHost() { this._surface._unregisterTransition(this); }
+  _rejoinHost() { this._surface._registerTransitionAnimation(this); }
+  _applyActions(actions) {
+    const applied = super._applyActions(actions);
+    // The registry holds the timing the track runs: a running or paused
+    // transition is registered (play() after its end registers it again),
+    // at the start, duration and delay of its current track.
+    const state = this._value(3);
+    if (state === 1 || state === 2) this._surface._registerTransitionAnimation(this);
+    const record = this._transitionRecord;
+    record.startTimeMilliseconds = this._value(6);
+    record.duration = this._value(7);
+    record.delay = this._value(8);
+    // A track declared, resumed or seeked now runs from the next tick.
+    if (actions & (2 | 8 | 2048)) record.trackAwaitsTick = true;
+    return applied;
+  }
+  // The engine replaced this transition's track before the registry saw
+  // its cancel: settle the record as cancelled without touching a track.
+  _settleReplaced() {
+    this._core.status("animation_control", this._animationId, 6, 0, this._surface.currentTime);
+    this._applyActions(this._core.status("animation_control", this._animationId, 10, this._value(12), this._surface.currentTime));
+  }
+}
+installCSSTransitionBindings({}, CSSTransition.prototype);
+
 export function createDOMAnimation(surface, element, keyframes, timing, engineDeclarationOptions = {}) {
-  return new SDAnimation(surface, element, keyframes, timing, engineDeclarationOptions);
+  return engineDeclarationOptions.diagnosticAnimationName == null
+    ? new SDAnimation(surface, element, keyframes, timing, engineDeclarationOptions)
+    : new CSSAnimation(surface, element, keyframes, timing, engineDeclarationOptions);
+}
+
+// Shadow-including tree order: a shadow root follows its host and precedes
+// the host's children.
+function treePath(node) {
+  const path = [];
+  for (let current = node; current; current = current.parentNode ?? current.host ?? null) path.push(current);
+  return path.reverse();
+}
+function compareTreeOrder(first, second, paths) {
+  if (first === second) return 0;
+  if (!paths.has(first)) paths.set(first, treePath(first));
+  if (!paths.has(second)) paths.set(second, treePath(second));
+  const a = paths.get(first);
+  const b = paths.get(second);
+  let depth = 0;
+  while (depth < a.length && depth < b.length && a[depth] === b[depth]) depth++;
+  if (depth === a.length) return -1;
+  if (depth === b.length) return 1;
+  if (a[depth].nodeType === 11) return -1;
+  if (b[depth].nodeType === 11) return 1;
+  for (let sibling = a[depth].nextSibling; sibling; sibling = sibling.nextSibling) {
+    if (sibling === b[depth]) return -1;
+  }
+  return 1;
+}
+function compositeClass(animation) {
+  return animation instanceof CSSTransition ? 0 : animation instanceof CSSAnimation ? 1 : 2;
+}
+// Web Animations composite order as Chrome orders getAnimations(): CSS
+// transitions by owning element in tree order, then transition generation,
+// then property name; CSS animations by owning element, then position in
+// animation-name; script animations by creation.
+function sortInCompositeOrder(animations) {
+  const paths = new Map();
+  const animationNameIndex = (animation) =>
+    animation._surface._cssAnimations?.get(animation._element)
+      ?.findIndex((record) => record.animation === animation) ?? -1;
+  return animations.sort((first, second) => {
+    const kind = compositeClass(first) - compositeClass(second);
+    if (kind !== 0) return kind;
+    if (compositeClass(first) === 2) return first._sequence - second._sequence;
+    const tree = compareTreeOrder(first._element, second._element, paths);
+    if (tree !== 0) return tree;
+    if (compositeClass(first) === 1) return animationNameIndex(first) - animationNameIndex(second);
+    if (first._transitionGeneration !== second._transitionGeneration) {
+      return first._transitionGeneration - second._transitionGeneration;
+    }
+    return first._transitionProperty < second._transitionProperty ? -1 : 1;
+  });
+}
+
+// An animation getAnimations() reports (Web Animations §5.1, relevant
+// animations): one that is not idle, and once finished only while its fill
+// keeps it in effect. A transition fills backwards, so its end leaves it out.
+function reportedAnimation(animation) {
+  const state = animation.playState;
+  if (state === "idle") return false;
+  if (state !== "finished") return true;
+  const fill = animation._timing.fill;
+  return fill === "both" ||
+    fill === (animation.playbackRate < 0 ? "backwards" : "forwards");
 }
 
 export function animationsForElement(animations, element, subtree) {
-  return animations.filter((animation) => {
-    if (animation.playState === "idle") return false;
+  return sortInCompositeOrder(animations.filter((animation) => {
+    if (!reportedAnimation(animation)) return false;
     if (animation._element === element) return true;
     if (!subtree) return false;
     for (
@@ -230,8 +435,26 @@ export function animationsForElement(animations, element, subtree) {
       if (node === element) return true;
     }
     return false;
-  });
+  }));
 }
+
+// document.getAnimations(): the animations of every element of the
+// document, from the surface that owns each element (the primary surface
+// of its root) or the document's pending timeline.
+export function documentAnimations(document) {
+  const candidates = [];
+  for (const surface of document._liveRenderSurfaces ?? []) {
+    if (surface._shutdown || surface._root._renderSurface !== surface) continue;
+    candidates.push(...surface._animationCandidates());
+  }
+  const pending = pendingAnimationTimelines.get(document);
+  if (pending !== undefined) candidates.push(...pending._animations);
+  return sortInCompositeOrder(candidates.filter((animation) =>
+    reportedAnimation(animation) && animation._element.isConnected &&
+    animation._element.ownerDocument === document
+  ));
+}
+
 
 // `element.animate()` does not require a render surface: the Web Animations
 // API has none of that, and a host that builds a whole animating document

@@ -174,15 +174,15 @@ export function readEngineFrameFact(view, pointer) { return {
   flags: view.getUint32(pointer + 0, true),
   poolDigest: view.getUint32(pointer + 4, true),
   previousGeneration: view.getUint32(pointer + 8, true),
-  reserved: view.getUint32(pointer + 12, true),
+  appliedScrollbars: view.getUint32(pointer + 12, true),
 }; }
 export function writeEngineFrameFact(view, pointer, value) {
   view.setUint32(pointer + 0, value.flags ?? 0, true);
   view.setUint32(pointer + 4, value.poolDigest ?? 0, true);
   view.setUint32(pointer + 8, value.previousGeneration ?? 0, true);
-  view.setUint32(pointer + 12, value.reserved ?? 0, true);
+  view.setUint32(pointer + 12, value.appliedScrollbars ?? 0, true);
 }
-export const EngineFrameFactFields = Object.freeze({"flags":0,"poolDigest":4,"previousGeneration":8,"reserved":12});
+export const EngineFrameFactFields = Object.freeze({"flags":0,"poolDigest":4,"previousGeneration":8,"appliedScrollbars":12});
 export const EngineFrameFinishRowSize = 8;
 export function readEngineFrameFinishRow(view, pointer) { return {
   index: view.getUint32(pointer + 0, true),

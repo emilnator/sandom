@@ -1,8 +1,8 @@
 // WebGL 2 degraded raster backend (PLAN-webgl-2-degraded-backend.md).
 //
-// Consumes the SAME batch list the WebGPU backend consumes (the shared
-// walker in src/render-commands.js) and produces the same tightly packed
-// straight-alpha RGBA pixels. Every shader below is a hand-maintained
+// Interprets the same native numeric raster plan as the WebGPU backend and
+// produces the same tightly packed straight-alpha RGBA pixels. Every shader
+// below is a hand-maintained
 // OpenGL ES Shading Language 3.00 port of the corresponding WGSL program
 // in src/rasterize.js — the two families MUST stay in sync; each port
 // keeps the original's structure so a diff against the WGSL source is
@@ -34,18 +34,45 @@
 
 import { createNativeWebgl2Context } from "./native-webgl2-adapter.js";
 
-import { BLEND_NORMAL } from "./wasm/layout.js";
+import {
+  BLEND_NORMAL,
+  CMD_BOX_SHADOW,
+  CMD_DAMAGE,
+  CMD_IMAGE,
+  CMD_POP_BACKDROP_FILTER,
+  CMD_POP_BACKGROUND,
+  CMD_POP_BLEND_LAYER,
+  CMD_POP_CLIP,
+  CMD_POP_MASK_LAYER,
+  CMD_POP_OPACITY,
+  CMD_PUSH_BACKDROP_FILTER,
+  CMD_PUSH_BACKGROUND,
+  CMD_PUSH_BLEND_LAYER,
+  CMD_PUSH_CLIP,
+  CMD_PUSH_MASK,
+  CMD_PUSH_MASK_LAYER,
+  CMD_PUSH_OPACITY,
+  CMD_RECT,
+  CMD_SET_NODE,
+  CMD_SET_SCROLL,
+  CMD_SVG_PATH,
+  CMD_TEXT,
+  RASTER_PLAN_PASS_BOX_BLUR_H,
+  RASTER_PLAN_PASS_BOX_BLUR_V,
+  RASTER_PLAN_PASS_DROP_SHADOW,
+  RASTER_PLAN_PASS_MATRIX,
+} from "./wasm/layout.js";
 import {
   BOX_SHADOW_INSTANCE_FLOATS,
-  blurBoxWidths,
-  buildBatches,
   clipUniformFloats,
+  createRasterPlanCursor,
+  dirtyTileRectangles,
   EMPTY_CLIP_STATE,
-  filterMatrixUniformFloats,
+  filterPassReaches,
+  filterRegionPadding,
   MAX_SHADER_CLIP_ENTRIES,
-  pathMaskUniformFloats,
   RECT_INSTANCE_FLOATS,
-} from "./render-commands.js";
+} from "./raster-plan.js";
 import { STANDARD_WORKING_COLOR_ENCODING } from "./color.js";
 
 // Fixed width (texels) of the two gradient data textures. 4096 records ×
@@ -93,7 +120,7 @@ const CLIP_EVAL_GLSL = `
       if (clipAxisBits == 2.0 || clipAxisBits == 3.0) {
         if (vPixelPos.y < clipRect.y || vPixelPos.y > clipRect.w) { clipCoverage = 0.0; }
       }
-    } else {
+    } else if (clipMode < 2.5) {
       // SDF mode: rounded and/or oriented — evaluate in the entry's own
       // local space, antialias over ~1 screen pixel via fwidth.
       vec2 clipLocalP = vec2(
@@ -104,6 +131,17 @@ const CLIP_EVAL_GLSL = `
       float clipD = roundedRectSDF(clipLocalP - clipCenter, clipHalfSize, clipRadiiX, clipRadiiY);
       float clipAa = fwidth(clipD) * 0.5;
       clipCoverage = clipCoverage * (1.0 - smoothstep(-clipAa, clipAa, clipD));
+    } else {
+      // Area axis-aligned screen-space clip (an SVG viewport, a color
+      // glyph's clip box): the fraction of the fragment's own pixel inside
+      // the rect on each axis (CLIP_EVAL_WGSL's exact pixel square).
+      float clipAxisBits = clipInvB.w;
+      vec2 clipPixel = floor(gl_FragCoord.xy);
+      vec2 clipInside = clamp(
+        min(clipPixel + 1.0, clipRect.zw) - max(clipPixel, clipRect.xy),
+        vec2(0.0), vec2(1.0));
+      if (clipAxisBits == 1.0 || clipAxisBits == 3.0) { clipCoverage = clipCoverage * clipInside.x; }
+      if (clipAxisBits == 2.0 || clipAxisBits == 3.0) { clipCoverage = clipCoverage * clipInside.y; }
     }
   }
   if (clipCoverage < 0.001) { discard; }
@@ -221,6 +259,58 @@ vec4 sampleConicGradient(vec2 posO, vec4 geomA, int stopStart, int stopCount, bo
   float rawT = (pointAngle - geomA.z) / 6.283185307179586;
   float t = rawT - floor(rawT);
   return walkGradientStops(t, stopStart, stopCount, isRepeating);
+}
+
+// COLRv1 gradients, a port of svg-path.wgsl's sampleColrGradient (see its
+// comments): geomA and geomB.xy are the affine to the canonical space,
+// geomB.zw the kind's parameters.
+float colrWrap(float rawT, int stopStart, int stopCount, uint extendBits) {
+  if (extendBits == 0u || stopCount < 2) { return rawT; }
+  float firstPos = gradientStopPosition(stopStart);
+  float lastPos = gradientStopPosition(stopStart + stopCount - 1);
+  float span = max(lastPos - firstPos, 1e-6);
+  float rel = (rawT - firstPos) / span;
+  if ((extendBits & 0x80u) != 0u) { return firstPos + fract(rel) * span; }
+  return firstPos + (1.0 - abs(fract(rel * 0.5) * 2.0 - 1.0)) * span;
+}
+
+vec4 sampleColrGradient(vec2 posO, vec4 geomA, vec4 geomB, uint kind, uint extendBits, int stopStart, int stopCount) {
+  vec2 u = vec2(
+    geomA.x * posO.x + geomA.z * posO.y + geomB.x,
+    geomA.y * posO.x + geomA.w * posO.y + geomB.y);
+  float t = u.x;
+  if (kind == 5u || kind == 6u) {
+    float r0 = geomB.z;
+    float dr = geomB.w - geomB.z;
+    float cx = kind == 5u ? 1.0 : 0.0;
+    float a = cx * cx - dr * dr;
+    float b = u.x * cx + r0 * dr;
+    float c = dot(u, u) - r0 * r0;
+    if (abs(a) < 1e-9) {
+      if (abs(b) < 1e-9) { return vec4(0.0); }
+      t = c / (2.0 * b);
+      if (r0 + t * dr < 0.0) { return vec4(0.0); }
+    } else {
+      float discriminant = b * b - a * c;
+      if (discriminant < 0.0) { return vec4(0.0); }
+      float root = sqrt(discriminant);
+      float high = max((b + root) / a, (b - root) / a);
+      float low = min((b + root) / a, (b - root) / a);
+      if (r0 + high * dr >= 0.0) {
+        t = high;
+      } else if (r0 + low * dr >= 0.0) {
+        t = low;
+      } else {
+        return vec4(0.0);
+      }
+    }
+  } else if (kind == 7u) {
+    float angle = atan(u.y, u.x);
+    if (angle < 0.0) { angle = angle + 6.283185307179586; }
+    float sweep = geomB.w - geomB.z;
+    t = abs(sweep) < 1e-9 ? 0.0 : (angle - geomB.z) / sweep;
+  }
+  return walkGradientStops(colrWrap(t, stopStart, stopCount, extendBits), stopStart, stopCount, false);
 }
 `;
 
@@ -344,6 +434,75 @@ float insetRectSDF(vec2 localPos, vec2 halfSize, vec4 radiiX, vec4 radiiY, vec4 
   vec4 rX = max(radiiX - vec4(insets.w, insets.y, insets.y, insets.w), vec4(0.0));
   vec4 rY = max(radiiY - vec4(insets.x, insets.x, insets.z, insets.z), vec4(0.0));
   return roundedRectSDF(localPos - centerOffset, half_, rX, rY);
+}
+
+// Distance from v (both >= 0) to the ellipse of semi-axes e (see WGSL
+// ellipseDistanceQ1: Eberly's bisection, fixed trip count).
+float ellipseDistanceQ1(vec2 v, vec2 e) {
+  bool swapAxes = e.x < e.y;
+  vec2 y = swapAxes ? v.yx : v;
+  vec2 a = swapAxes ? e.yx : e;
+  if (a.x == a.y) { return abs(length(y) - a.x); }
+  vec2 z = y / a;
+  float r0 = (a.x / a.y) * (a.x / a.y);
+  float n0 = r0 * z.x;
+  float s0 = z.y - 1.0;
+  float s1 = dot(z, z) < 1.0 ? 0.0 : length(vec2(n0, z.y)) - 1.0;
+  for (int i = 0; i < 40; i++) {
+    float s = 0.5 * (s0 + s1);
+    vec2 ratio = vec2(n0 / (s + r0), z.y / (s + 1.0));
+    bool above = dot(ratio, ratio) > 1.0;
+    s0 = above ? s : s0;
+    s1 = above ? s1 : s;
+  }
+  float s = 0.5 * (s0 + s1);
+  float x0 = r0 * y.x / (s + r0);
+  float x1 = s + 1.0 > 0.01 ? y.y / (s + 1.0) : a.y * sqrt(max(1.0 - (x0 / a.x) * (x0 / a.x), 0.0));
+  return length(vec2(x0, x1) - y);
+}
+
+// The SVG stroke ring's outer (x) and inner (y) contour SDFs: offsets of
+// the midline at half the width (see WGSL svgStrokeRingSDF).
+const uint SVG_STROKE_BIT = 0x20000u;
+vec2 svgStrokeRingSDF(vec2 localP, vec2 halfSize, vec4 radiiX, vec4 radiiY, float width) {
+  float halfWidth = width * 0.5;
+  vec2 h = max(halfSize - vec2(halfWidth), vec2(0.0));
+  vec2 grown = max(vec2(cornerSelect(localP, radiiX), cornerSelect(localP, radiiY)) - vec2(halfWidth), vec2(0.0));
+  vec2 r = (grown.x > 0.0 && grown.y > 0.0) ? grown : vec2(0.0);
+  vec2 p = abs(localP);
+  vec2 v = p - (h - r);
+  float nearest = min(length(vec2(max(v.x, 0.0), p.y - h.y)), length(vec2(p.x - h.x, max(v.y, 0.0))));
+  bool beyondArc = false;
+  if (v.x > 0.0 && v.y > 0.0 && r.x > 0.0) {
+    nearest = min(nearest, ellipseDistanceQ1(v, r));
+    beyondArc = dot(v / r, v / r) > 1.0;
+  }
+  bool inside = p.x <= h.x && p.y <= h.y && !beyondArc;
+  float s = inside ? -nearest : nearest;
+  return vec2(s - halfWidth, s + halfWidth);
+}
+
+// Exact pixel-area coverage of the half-plane d < 0 (see WGSL
+// halfPlaneCoverage): the box filter's trapezoid along the screen normal.
+const uint AREA_COVERAGE_BIT = 0x10000u;
+float halfPlaneCoverage(float d, vec2 grad) {
+  float gradLength = length(grad);
+  if (gradLength < 1e-6) { return d < 0.0 ? 1.0 : 0.0; }
+  vec2 n = abs(grad) / gradLength;
+  float wide = max(n.x, n.y);
+  float narrow = min(n.x, n.y);
+  float inside = -d / gradLength;
+  float distance_ = abs(inside);
+  float linearEnd = 0.5 * (wide - narrow);
+  float support = 0.5 * (wide + narrow);
+  float beyond = 0.0;
+  if (distance_ < linearEnd) {
+    beyond = 0.5 - distance_ / wide;
+  } else if (distance_ < support) {
+    float remaining = support - distance_;
+    beyond = remaining * remaining / (2.0 * wide * narrow);
+  }
+  return inside > 0.0 ? 1.0 - beyond : beyond;
 }
 
 // border-style inset/outset/groove/ridge colors — Blink's exact rules
@@ -629,14 +788,21 @@ void main() {
   // Derivatives FIRST, unconditionally — same uniform-control-flow rule
   // the WGSL original documents (GLSL derivatives after a non-uniform
   // discard are equally undefined).
-  float d = roundedRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY);
+  bool isSvgStroke = (vBorderStyles & SVG_STROKE_BIT) != 0u;
+  vec2 svgRing = vec2(0.0);
+  if (isSvgStroke) {
+    svgRing = svgStrokeRingSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, vBorderWidths.x);
+  }
+  float d = isSvgStroke ? svgRing.x : roundedRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY);
   float aa = fwidth(d) * 0.5;
   vec2 localPerScreen = abs(vec2(dFdx(vLocalPos.x), dFdy(vLocalPos.y)));
   vec2 screenPerLocal = 1.0 / max(localPerScreen, vec2(1e-6));
 
   vec4 widths = vBorderWidths;  // x=top, y=right, z=bottom, w=left
-  float dInner = insetRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, widths);
+  float dInner = isSvgStroke ? svgRing.y : insetRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, widths);
   float aaInner = fwidth(dInner) * 0.5;
+  vec2 dGrad = vec2(dFdx(d), dFdy(d));
+  vec2 dInnerGrad = vec2(dFdx(dInner), dFdy(dInner));
 
   vec4 doubleThirds = floor((widths + vec4(1.0)) / 3.0);
   float dStripeOuter = insetRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, doubleThirds);
@@ -719,8 +885,12 @@ ${CLIP_EVAL_GLSL}
     return;
   }
 
-  float outerAlpha = 1.0 - smoothstep(-aa, aa, d);
-  float innerAlpha = isFillOnly ? outerAlpha : 1.0 - smoothstep(-aaInner, aaInner, dInner);
+  // SVG geometry (bit 16 of the styles word) takes exact area coverage;
+  // CSS boxes keep the smoothstep ramp (see the WGSL original).
+  bool areaCoverage = (vBorderStyles & AREA_COVERAGE_BIT) != 0u;
+  float outerAlpha = areaCoverage ? halfPlaneCoverage(d, dGrad) : 1.0 - smoothstep(-aa, aa, d);
+  float innerAlpha = isFillOnly ? outerAlpha
+    : areaCoverage ? halfPlaneCoverage(dInner, dInnerGrad) : 1.0 - smoothstep(-aaInner, aaInner, dInner);
   float ringCoverage = max(outerAlpha - innerAlpha, 0.0);
 
   float stripeOuterAlpha = 1.0 - smoothstep(-aaStripeOuter, aaStripeOuter, dStripeOuter);
@@ -814,6 +984,10 @@ ${CLIP_UNIFORMS_GLSL}
 uniform float opacity;
 uniform float blendMode;
 uniform float hasMatrix;
+uniform float outputPremultiplied;
+// A Porter-Duff operator (layout.js COMPOSITE_*); 0 is source-over with
+// the blend mode. Drawn with blending disabled over the backdrop copy.
+uniform float porterDuff;
 uniform vec4 matrixR;
 uniform vec4 matrixG;
 uniform vec4 matrixB;
@@ -823,8 +997,10 @@ uniform vec4 pathMaskInfo;
 uniform vec4 pathMaskRect;
 uniform vec4 pathMaskBbox;
 uniform vec4 pathMaskUv;
+// The mask's linear map from screen pixels to its local space, and in xy
+// its translation: local = invA (pixel - translation).
 uniform vec4 pathMaskInvA;
-uniform vec4 pathMaskInvB;
+uniform vec4 pathMaskTranslation;
 uniform vec4 maskInfo;
 uniform sampler2D srcTex;
 uniform sampler2D backdropTex;
@@ -970,32 +1146,103 @@ float median(float r, float g, float b) {
   return max(min(r, g), min(max(r, g), b));
 }
 
+// COMPOSITE_SHADER's targetTexel (see its comments): a target-sized
+// texture is read at the fragment's own texel.
+vec4 targetTexel(sampler2D source) {
+  if (vec2(textureSize(source, 0)) == resolution) {
+    return texelFetch(source, ivec2(gl_FragCoord.xy), 0);
+  }
+  return textureLod(source, vUv, 0.0);
+}
+
+// COMPOSITE_SHADER's pathMaskTexel (see its comments): the mask path's
+// bitmap read bilinearly by hand at a position in its own texels.
+vec4 pathMaskTexel(ivec2 origin, ivec2 size, vec2 texelPos) {
+  vec2 corner = texelPos - 0.5;
+  vec2 base = floor(corner);
+  vec2 weight = corner - base;
+  ivec2 low = clamp(ivec2(base), ivec2(0), size - 1) + origin;
+  ivec2 high = clamp(ivec2(base) + 1, ivec2(0), size - 1) + origin;
+  vec4 top = mix(
+    texelFetch(pathMaskTex, low, 0),
+    texelFetch(pathMaskTex, ivec2(high.x, low.y), 0),
+    weight.x);
+  vec4 bottom = mix(
+    texelFetch(pathMaskTex, ivec2(low.x, high.y), 0),
+    texelFetch(pathMaskTex, high, 0),
+    weight.x);
+  return mix(top, bottom, weight.y);
+}
+
+const int BOX_GRID = 4;
+vec2 boxCentre(int i) {
+  return (vec2(float(i % BOX_GRID), float(i / BOX_GRID)) + 0.5) / float(BOX_GRID) - 0.5;
+}
+
+// Porter-Duff factors (Fa, Fb): result = Fa * source + Fb * destination
+// (composite.wgsl porterDuffFactors).
+vec2 porterDuffFactors(float op, float sa, float da) {
+  if (op < 1.5) { return vec2(0.0, 0.0); }
+  if (op < 2.5) { return vec2(1.0, 0.0); }
+  if (op < 3.5) { return vec2(0.0, 1.0); }
+  if (op < 4.5) { return vec2(1.0 - da, 1.0); }
+  if (op < 5.5) { return vec2(da, 0.0); }
+  if (op < 6.5) { return vec2(0.0, sa); }
+  if (op < 7.5) { return vec2(1.0 - da, 0.0); }
+  if (op < 8.5) { return vec2(0.0, 1.0 - sa); }
+  if (op < 9.5) { return vec2(da, 1.0 - sa); }
+  if (op < 10.5) { return vec2(1.0 - da, sa); }
+  if (op < 11.5) { return vec2(1.0 - da, 1.0 - sa); }
+  return vec2(1.0, 1.0);
+}
+
 void main() {
 ${CLIP_EVAL_GLSL}
 
-  vec4 src = texture(srcTex, vUv);
-  if (src.a < 0.001) { discard; }
+  bool isPorterDuff = porterDuff > 0.5;
+  vec4 src = targetTexel(srcTex);
+  if (src.a < 0.001 && !isPorterDuff) { discard; }
+  src.rgb = clamp(src.rgb / max(src.a, 1e-6), vec3(0.0), vec3(1.0));
   if (pathMaskInfo.x > 0.5) {
+    // COMPOSITE_SHADER's path mask (see its comments).
+    vec2 fromTranslation = gl_FragCoord.xy - pathMaskTranslation.xy;
     vec2 localPos = vec2(
-      pathMaskInvA.x * vPixelPos.x + pathMaskInvA.z * vPixelPos.y + pathMaskInvB.x,
-      pathMaskInvA.y * vPixelPos.x + pathMaskInvA.w * vPixelPos.y + pathMaskInvB.y);
+      pathMaskInvA.x * fromTranslation.x + pathMaskInvA.z * fromTranslation.y,
+      pathMaskInvA.y * fromTranslation.x + pathMaskInvA.w * fromTranslation.y);
     vec2 pathPos = (localPos - pathMaskRect.xy) / pathMaskInfo.y;
     vec2 bboxSize = pathMaskBbox.zw - pathMaskBbox.xy;
     vec2 normalized = (pathPos - pathMaskBbox.xy) / bboxSize;
     bool insidePathBounds = all(greaterThanEqual(normalized, vec2(0.0))) && all(lessThanEqual(normalized, vec2(1.0)));
-    vec2 atlasUv = pathMaskUv.xy
-      + clamp(normalized, vec2(0.0), vec2(1.0)) * pathMaskUv.zw;
-    vec4 msdf = textureLod(pathMaskTex, atlasUv, 0.0);
-    float screenPxDistance = (median(msdf.r, msdf.g, msdf.b) - 0.5) * pathMaskInfo.z;
-    float fw = max(fwidth(screenPxDistance), 1e-4);
-    float sampledCoverage = clamp(screenPxDistance / fw + 0.5, 0.0, 1.0);
+    ivec2 bitmapOrigin = ivec2(round(pathMaskUv.xy * vec2(textureSize(pathMaskTex, 0))));
+    vec2 bitmapSize = pathMaskUv.zw;
+    ivec2 bitmapTexels = ivec2(bitmapSize);
+    float padding = pathMaskInfo.w;
+    vec2 insetSize = bitmapSize - 2.0 * padding;
+    vec2 texelPos = padding + clamp(normalized, vec2(0.0), vec2(1.0)) * insetSize;
+    float sampledCoverage = 0.0;
+    if (pathMaskInfo.z == 0.0) {
+      sampledCoverage = pathMaskTexel(bitmapOrigin, bitmapTexels, texelPos).r;
+    } else {
+      vec2 texelPerLocal = insetSize / (bboxSize * pathMaskInfo.y);
+      vec2 texeldx = pathMaskInvA.xy * texelPerLocal;
+      vec2 texeldy = pathMaskInvA.zw * texelPerLocal;
+      float coverage = 0.0;
+      for (int i = 0; i < BOX_GRID * BOX_GRID; i++) {
+        vec2 o = boxCentre(i);
+        vec2 boxPos = clamp(texelPos + texeldx * o.x + texeldy * o.y, vec2(padding), bitmapSize - padding);
+        vec4 m = pathMaskTexel(bitmapOrigin, bitmapTexels, boxPos);
+        float distance = (median(m.r, m.g, m.b) - 0.5) * pathMaskInfo.z;
+        coverage += clamp(distance * float(BOX_GRID) + 0.5, 0.0, 1.0);
+      }
+      sampledCoverage = coverage / float(BOX_GRID * BOX_GRID);
+    }
     float pathCoverage = insidePathBounds ? sampledCoverage : 0.0;
     src.a = src.a * pathCoverage;
-    if (src.a < 0.001) { discard; }
+    if (src.a < 0.001 && !isPorterDuff) { discard; }
   }
   if (maskInfo.x > 0.5) {
-    src.a = src.a * textureLod(maskTex, vUv, 0.0).a;
-    if (src.a < 0.001) { discard; }
+    src.a = src.a * targetTexel(maskTex).a;
+    if (src.a < 0.001 && !isPorterDuff) { discard; }
   }
 
   if (hasMatrix > 0.5) {
@@ -1010,17 +1257,33 @@ ${CLIP_EVAL_GLSL}
 
   vec4 color = src;
   if (blendMode != ${BLEND_NORMAL}.0) {
-    vec4 backdrop = textureLod(backdropTex, vUv, 0.0);
+    vec4 backdrop = targetTexel(backdropTex);
+    vec3 backdropColor = backdrop.a > 0.0
+      ? clamp(backdrop.rgb / max(backdrop.a, 1e-6), vec3(0.0), vec3(1.0))
+      : vec3(0.0);
     vec3 blended;
     if (blendMode <= BLEND_EXCLUSION) {
-      blended = blendSeparable(blendMode, backdrop.rgb, src.rgb);
+      blended = blendSeparable(blendMode, backdropColor, src.rgb);
     } else {
-      blended = blendNonSeparable(blendMode, backdrop.rgb, src.rgb);
+      blended = blendNonSeparable(blendMode, backdropColor, src.rgb);
     }
     vec3 mixed = mix(src.rgb, blended, backdrop.a);
     color = vec4(mixed, src.a);
   }
-  fragColor = vec4(color.rgb, color.a * opacity * clipCoverage);
+  if (isPorterDuff) {
+    vec4 destination = targetTexel(backdropTex);
+    float alpha = color.a * opacity;
+    vec2 factors = porterDuffFactors(porterDuff, alpha, destination.a);
+    vec4 composed = min(vec4(color.rgb * alpha, alpha) * factors.x + destination * factors.y, vec4(1.0));
+    fragColor = mix(destination, composed, clipCoverage);
+    return;
+  }
+  float alpha = color.a * opacity * clipCoverage;
+  if (outputPremultiplied > 0.5) {
+    fragColor = vec4(color.rgb * alpha, alpha);
+    return;
+  }
+  fragColor = vec4(color.rgb, alpha);
 }
 `;
 
@@ -1096,16 +1359,10 @@ void main() {
     if (sampleUv.x < 0.0 || sampleUv.x > 1.0 || sampleUv.y < 0.0 || sampleUv.y > 1.0) {
       continue;
     }
-    vec4 c = textureLod(srcTex, sampleUv, 0.0);
-    sum = sum + vec4(c.rgb * c.a, c.a);
+    sum = sum + textureLod(srcTex, sampleUv, 0.0);
     count = count + 1.0;
   }
-  vec4 premult = sum / max(count, 1.0);
-  if (premult.a < 0.0001) {
-    fragColor = vec4(0.0);
-    return;
-  }
-  fragColor = vec4(premult.rgb / premult.a, premult.a);
+  fragColor = sum / max(count, 1.0);
 }
 `;
 
@@ -1128,15 +1385,29 @@ void main() {
   if (offsetUv.x >= 0.0 && offsetUv.x <= 1.0 && offsetUv.y >= 0.0 && offsetUv.y <= 1.0) {
     shadowAlpha = textureLod(blurredAlphaTex, offsetUv, 0.0).a;
   }
-  vec4 shadow = vec4(shadowColor.rgb, shadowColor.a * shadowAlpha);
+  float shadowAlphaOut = shadowColor.a * shadowAlpha;
+  vec4 shadow = vec4(shadowColor.rgb * shadowAlphaOut, shadowAlphaOut);
   vec4 current = texture(currentTex, vUv);
-  float outAlpha = current.a + shadow.a * (1.0 - current.a);
-  if (outAlpha < 0.0001) {
-    fragColor = vec4(0.0);
-    return;
-  }
-  vec3 outRgb = (current.rgb * current.a + shadow.rgb * shadow.a * (1.0 - current.a)) / outAlpha;
-  fragColor = vec4(outRgb, outAlpha);
+  fragColor = current + shadow * (1.0 - current.a);
+}
+`;
+
+// --------------------------------------------------------------------------
+// Filter-window program (port of FILTER_WINDOW_SHADER) — pads a group
+// target into its filter region and crops the filtered region back.
+// Texel row 0 holds the image's top row here too, so the WGSL shift
+// applies to gl_FragCoord unchanged.
+// --------------------------------------------------------------------------
+
+const FILTER_WINDOW_FRAGMENT_GLSL = `#version 300 es
+precision highp float;
+uniform vec2 shift; // whole texels; the native adapter sets float uniforms
+uniform sampler2D srcTex;
+out vec4 fragColor;
+void main() {
+  ivec2 last = textureSize(srcTex, 0) - ivec2(1);
+  ivec2 texel = clamp(ivec2(gl_FragCoord.xy) + ivec2(shift), ivec2(0), last);
+  fragColor = texelFetch(srcTex, texel, 0);
 }
 `;
 
@@ -1155,8 +1426,8 @@ void main() {
 `;
 
 // --------------------------------------------------------------------------
-// Text program (port of TEXT_SHADER) — MSDF glyph quads with Skia-style
-// mask gamma.
+// Text program (port of TEXT_SHADER) — MSDF glyph quads with the
+// Chrome-on-macOS coverage model.
 // --------------------------------------------------------------------------
 
 const TEXT_VERTEX_GLSL = `#version 300 es
@@ -1178,6 +1449,7 @@ out vec4 vColor;
 out float vPxRange;
 out vec2 vPixelPos;
 out float vShadowSoft;
+out vec2 vLocalPerUv;
 void main() {
   vec2 localPixelPos = glyphPos + quadVertex * glyphSize;
   mat3x2 transform = mat3x2(transformCol0, transformCol1, transformCol2);
@@ -1190,24 +1462,25 @@ void main() {
   vPxRange = params.x;
   vPixelPos = pixelPos;
   vShadowSoft = params.y;
+  vLocalPerUv = glyphSize / uvSize;
 }
 `;
 
 const TEXT_FRAGMENT_GLSL = `#version 300 es
 precision highp float;
 ${CLIP_UNIFORMS_GLSL}
-// Chrome-on-macOS text mask model (kept in sync with the WebGPU
-// TEXT_SHADER): per-polarity SDF dilation in screen px (0 neutral) +
-// Schlick steepness gain (1.0 identity).
+// Pixel area coverage of the outline with optional per-polarity outline
+// dilation in screen px (textThickening; 0 draws the exact outline). Kept
+// in sync with the WebGPU text shader.
 uniform float dilateLight;
 uniform float dilateDark;
-uniform float gammaSteepness;
 uniform sampler2D atlasTex;
 in vec2 vUv;
 in vec4 vColor;
 in float vPxRange;
 in vec2 vPixelPos;
 in float vShadowSoft;
+in vec2 vLocalPerUv;
 out vec4 fragColor;
 
 float median(float r, float g, float b) {
@@ -1216,10 +1489,10 @@ float median(float r, float g, float b) {
 
 ${SDF_HELPERS_GLSL}
 
-// Rotated-grid supersampling offsets (RGSS), in pixel-footprint units.
-const vec2 RGSS_OFFSETS[4] = vec2[4](
-  vec2(0.125, 0.375), vec2(0.375, -0.125),
-  vec2(-0.125, -0.375), vec2(-0.375, 0.125));
+// Centres of the four half-pixel boxes that tile a pixel, in pixel units.
+const vec2 SUBPIXEL_BOX_CENTRES[4] = vec2[4](
+  vec2(-0.25, -0.25), vec2(0.25, -0.25),
+  vec2(-0.25, 0.25), vec2(0.25, 0.25));
 
 void main() {
 ${CLIP_EVAL_GLSL}
@@ -1237,20 +1510,35 @@ ${CLIP_EVAL_GLSL}
     fragColor = vec4(vColor.rgb, softAlpha);
     return;
   }
+  // Pixel area coverage from four half-pixel boxes, screen distances
+  // through the uv Jacobian (see the WebGPU text shader).
   float luma = dot(vColor.rgb, vec3(0.299, 0.587, 0.114));
   float dilate = mix(dilateDark, dilateLight, luma);
+  float boxDistances[4];
+  for (int i = 0; i < 4; i++) {
+    vec2 o = SUBPIXEL_BOX_CENTRES[i];
+    vec4 m = textureLod(atlasTex, vUv + uvdx * o.x + uvdy * o.y, 0.0);
+    boxDistances[i] = (median(m.r, m.g, m.b) - 0.5) * vPxRange;
+  }
+  vec2 gradient = vec2(
+    (boxDistances[1] + boxDistances[3]) - (boxDistances[0] + boxDistances[2]),
+    (boxDistances[2] + boxDistances[3]) - (boxDistances[0] + boxDistances[1]));
+  vec2 localPerScreenX = uvdx * vLocalPerUv;
+  vec2 localPerScreenY = uvdy * vLocalPerUv;
+  float determinant = abs(localPerScreenX.x * localPerScreenY.y - localPerScreenX.y * localPerScreenY.x);
+  float gradientLength = length(gradient);
+  vec2 inverseTransposeGradient = vec2(
+    localPerScreenY.y * gradient.x - localPerScreenX.y * gradient.y,
+    localPerScreenX.x * gradient.y - localPerScreenY.x * gradient.x);
+  float screenPerLocal = gradientLength > 1e-6
+    ? length(inverseTransposeGradient) / max(determinant * gradientLength, 1e-12)
+    : inversesqrt(max(determinant, 1e-12));
   float cov = 0.0;
   for (int i = 0; i < 4; i++) {
-    vec2 o = RGSS_OFFSETS[i];
-    vec4 m = textureLod(atlasTex, vUv + uvdx * o.x + uvdy * o.y, 0.0);
-    float d = (median(m.r, m.g, m.b) - 0.5) * vPxRange + dilate;
-    cov += clamp(d / fw + 0.5, 0.0, 1.0);
+    float d = boxDistances[i] * screenPerLocal + dilate;
+    cov += clamp(d * 2.0 + 0.5, 0.0, 1.0);
   }
   float alpha = cov * 0.25;
-  float sp = max(gammaSteepness, 1e-3);
-  float ap = pow(alpha, sp);
-  alpha = ap / max(ap + pow(1.0 - alpha, sp), 1e-6);
-
   if (alpha < 0.001) { discard; }
   fragColor = vec4(vColor.rgb, vColor.a * alpha * clipCoverage);
 }
@@ -1278,13 +1566,18 @@ layout(location = 8) in vec2 transformCol1;
 layout(location = 9) in vec2 transformCol2;
 layout(location = 10) in vec2 gradRectPos;
 layout(location = 11) in vec2 gradRectSize;
-out vec2 vUv;
-out vec4 vColor;
-out float vPxRange;
+// SVG_PATH_SHADER's per-fragment local position (see its comments): flat
+// per-draw values, the fragment's position from gl_FragCoord.
+flat out vec4 vUvRect;
+flat out vec4 vColor;
+flat out float vPxRange;
 out vec2 vPixelPos;
-out vec2 vGradLocalPos;
-out vec2 vGradHalfSize;
+flat out vec4 vLocalOrigins;
+flat out vec2 vGradHalfSize;
 flat out int vInstanceIndex;
+flat out vec2 vDestSize;
+flat out vec4 vInverseLinear;
+flat out vec2 vTranslation;
 void main() {
   vec2 localPixelPos = destPos + quadVertex * destSize;
   mat3x2 transform = mat3x2(transformCol0, transformCol1, transformCol2);
@@ -1292,13 +1585,22 @@ void main() {
   float clipX = (pixelPos.x / resolution.x) * 2.0 - 1.0;
   float clipY = (pixelPos.y / resolution.y) * 2.0 - 1.0;
   gl_Position = vec4(clipX, clipY, 0.0, 1.0);
-  vUv = uvPos + quadVertex * uvSize;
+  vUvRect = vec4(uvPos, uvSize);
   vColor = color;
   vPxRange = pxRange;
   vPixelPos = pixelPos;
-  vGradLocalPos = localPixelPos - (gradRectPos + gradRectSize * 0.5);
+  vLocalOrigins = vec4(destPos, gradRectPos + gradRectSize * 0.5);
   vGradHalfSize = gradRectSize * 0.5;
   vInstanceIndex = gl_InstanceID;
+  vDestSize = destSize;
+  float determinant = transformCol0.x * transformCol1.y - transformCol1.x * transformCol0.y;
+  float inverseDeterminant = determinant != 0.0 ? 1.0 / determinant : 0.0;
+  vInverseLinear = vec4(
+    transformCol1.y * inverseDeterminant,
+    -transformCol0.y * inverseDeterminant,
+    -transformCol1.x * inverseDeterminant,
+    transformCol0.x * inverseDeterminant);
+  vTranslation = transformCol2;
 }
 `;
 
@@ -1308,17 +1610,46 @@ precision highp int;
 ${CLIP_UNIFORMS_GLSL}
 ${GRADIENT_FETCH_GLSL}
 uniform sampler2D atlasTex;
-in vec2 vUv;
-in vec4 vColor;
-in float vPxRange;
+flat in vec4 vUvRect;
+flat in vec4 vColor;
+flat in float vPxRange;
 in vec2 vPixelPos;
-in vec2 vGradLocalPos;
-in vec2 vGradHalfSize;
+flat in vec4 vLocalOrigins;
+flat in vec2 vGradHalfSize;
 flat in int vInstanceIndex;
+flat in vec2 vDestSize;
+flat in vec4 vInverseLinear;
+flat in vec2 vTranslation;
 out vec4 fragColor;
 
 float median(float r, float g, float b) {
   return max(min(r, g), min(max(r, g), b));
+}
+
+// SVG_PATH_SHADER's BOX_GRID × BOX_GRID boxes that tile a pixel (see its
+// comments), in pixel units.
+const int BOX_GRID = 4;
+vec2 boxCentre(int i) {
+  return (vec2(float(i % BOX_GRID), float(i / BOX_GRID)) + 0.5) / float(BOX_GRID) - 0.5;
+}
+
+// SVG_PATH_SHADER's bitmapTexel (see its comments): the path's bitmap read
+// bilinearly by hand at a position in its own texels, clamped to it.
+vec4 bitmapTexel(ivec2 origin, ivec2 size, vec2 texelPos) {
+  vec2 corner = texelPos - 0.5;
+  vec2 base = floor(corner);
+  vec2 weight = corner - base;
+  ivec2 low = clamp(ivec2(base), ivec2(0), size - 1) + origin;
+  ivec2 high = clamp(ivec2(base) + 1, ivec2(0), size - 1) + origin;
+  vec4 top = mix(
+    texelFetch(atlasTex, low, 0),
+    texelFetch(atlasTex, ivec2(high.x, low.y), 0),
+    weight.x);
+  vec4 bottom = mix(
+    texelFetch(atlasTex, ivec2(low.x, high.y), 0),
+    texelFetch(atlasTex, high, 0),
+    weight.x);
+  return mix(top, bottom, weight.y);
 }
 
 ${SDF_HELPERS_GLSL}
@@ -1327,11 +1658,44 @@ ${GRADIENT_SAMPLING_GLSL}
 void main() {
 ${CLIP_EVAL_GLSL}
 
-  vec4 msdf = texture(atlasTex, vUv);
-  float sd = median(msdf.r, msdf.g, msdf.b);
-  float screenPxDistance = (sd - 0.5) * vPxRange;
-  float fw = max(fwidth(screenPxDistance), 1e-4);
-  float alpha = clamp(screenPxDistance / fw + 0.5, 0.0, 1.0);
+  vec2 fromTranslation = gl_FragCoord.xy - vTranslation;
+  vec2 localPixelPos = vec2(
+    vInverseLinear.x * fromTranslation.x + vInverseLinear.z * fromTranslation.y,
+    vInverseLinear.y * fromTranslation.x + vInverseLinear.w * fromTranslation.y);
+  vec2 atlasSize = vec2(textureSize(atlasTex, 0));
+  ivec2 bitmapOrigin = ivec2(round(vUvRect.xy * atlasSize));
+  vec2 bitmapSize = round(vUvRect.zw * atlasSize);
+  ivec2 bitmapTexels = ivec2(bitmapSize);
+  vec2 texelPerLocal = bitmapSize / max(vDestSize, vec2(1e-6));
+  vec2 texelPos = (localPixelPos - vLocalOrigins.xy) * texelPerLocal;
+  vec2 gradLocalPos = localPixelPos - vLocalOrigins.zw;
+  vec4 msdf = bitmapTexel(bitmapOrigin, bitmapTexels, texelPos);
+  // SVG_PATH_SHADER's box grid, its texel distances read in screen pixels
+  // through the texel Jacobian (see its comments).
+  vec2 texelPerScreenX = vInverseLinear.xy * texelPerLocal;
+  vec2 texelPerScreenY = vInverseLinear.zw * texelPerLocal;
+  float texelRange = vPxRange * max(bitmapSize.x, bitmapSize.y) / max(max(vDestSize.x, vDestSize.y), 1e-6);
+  float boxDistances[BOX_GRID * BOX_GRID];
+  vec2 gradient = vec2(0.0);
+  for (int i = 0; i < BOX_GRID * BOX_GRID; i++) {
+    vec2 o = boxCentre(i);
+    vec4 m = bitmapTexel(bitmapOrigin, bitmapTexels, texelPos + texelPerScreenX * o.x + texelPerScreenY * o.y);
+    boxDistances[i] = (median(m.r, m.g, m.b) - 0.5) * texelRange;
+    gradient += boxDistances[i] * o;
+  }
+  float determinant = abs(texelPerScreenX.x * texelPerScreenY.y - texelPerScreenX.y * texelPerScreenY.x);
+  float gradientLength = length(gradient);
+  vec2 inverseTransposeGradient = vec2(
+    texelPerScreenY.y * gradient.x - texelPerScreenX.y * gradient.y,
+    texelPerScreenX.x * gradient.y - texelPerScreenY.x * gradient.x);
+  float screenPerTexel = gradientLength > 1e-6
+    ? length(inverseTransposeGradient) / max(determinant * gradientLength, 1e-12)
+    : inversesqrt(max(determinant, 1e-12));
+  float cov = 0.0;
+  for (int i = 0; i < BOX_GRID * BOX_GRID; i++) {
+    cov += clamp(boxDistances[i] * screenPerTexel * float(BOX_GRID) + 0.5, 0.0, 1.0);
+  }
+  float alpha = vPxRange == 0.0 ? msdf.r : cov / float(BOX_GRID * BOX_GRID);
 
   if (alpha < 0.001) { discard; }
 
@@ -1340,18 +1704,21 @@ ${CLIP_EVAL_GLSL}
   uint gradKindBits = uint(gradHeader.y);
   int gradStopStart = int(gradHeader.z);
   int gradStopCount = int(gradHeader.w);
-  uint gradKind = gradKindBits & 0x7Fu;
+  uint gradKind = gradKindBits & 0x3Fu;
   bool gradIsRepeating = (gradKindBits & 0x80u) != 0u;
   vec4 resolvedColor = vColor;
   if (gradFlags != 0u) {
     vec4 geomA = fetchGradientTexel(gradientRecordsTex, vInstanceIndex * 3 + 1);
     vec4 geomB = fetchGradientTexel(gradientRecordsTex, vInstanceIndex * 3 + 2);
     vec2 gradOriginSize = max(vec2(geomB.z, geomB.w), vec2(1e-6));
-    vec2 gradPosO = vGradLocalPos + vGradHalfSize - vec2(geomB.x, geomB.y);
+    vec2 gradPosO = gradLocalPos + vGradHalfSize - vec2(geomB.x, geomB.y);
     if ((gradFlags & 2u) != 0u) {
       gradPosO = gradPosO - floor(gradPosO / gradOriginSize) * gradOriginSize;
     }
-    if (gradKind == 1u) {
+    if (gradKind >= 4u) {
+      resolvedColor = sampleColrGradient(gradLocalPos + vGradHalfSize, geomA, geomB, gradKind,
+        gradKindBits & 0xC0u, gradStopStart, gradStopCount);
+    } else if (gradKind == 1u) {
       resolvedColor = sampleLinearGradient(gradPosO, gradOriginSize, geomA, gradStopStart, gradStopCount, gradIsRepeating);
     } else if (gradKind == 2u) {
       resolvedColor = sampleRadialGradient(gradPosO, geomA, gradStopStart, gradStopCount, gradIsRepeating);
@@ -1424,6 +1791,8 @@ const IMAGE_FRAGMENT_GLSL = `#version 300 es
 precision highp float;
 ${CLIP_UNIFORMS_GLSL}
 uniform sampler2D imageTex;
+// IMAGE_SHADER's GROUP_STRAIGHT_COLOR: 1 for a color glyph cache page.
+uniform float groupStraightColor;
 in vec2 vUv;
 in vec2 vPixelPos;
 in vec2 vLocalPos;
@@ -1479,7 +1848,10 @@ ${CLIP_EVAL_GLSL}
   vec4 premultipliedColor = textureLod(imageTex, uv, imageLod - 0.25);
   float sampledAlpha = premultipliedColor.a;
   if (sampledAlpha < 0.001) { discard; }
-  vec3 straightColor = premultipliedColor.rgb / sampledAlpha;
+  // IMAGE_SHADER's straight color (see its comments).
+  vec3 straightColor = groupStraightColor > 0.5
+    ? clamp(premultipliedColor.rgb / max(sampledAlpha, 1e-6), vec3(0.0), vec3(1.0))
+    : premultipliedColor.rgb / sampledAlpha;
   float alpha = sampledAlpha * clipCoverage * edgeCoverage;
   if (alpha < 0.001) { discard; }
   fragColor = vec4(straightColor, alpha);
@@ -1523,8 +1895,9 @@ out vec2 vBorderBoxHalfSize;
 out vec4 vBorderBoxRadiiX;
 out vec4 vBorderBoxRadiiY;
 void main() {
-  vec2 quadPos = isInset > 0.5 ? borderBoxPos : rectPos;
-  vec2 quadSize = isInset > 0.5 ? borderBoxSize : rectSize;
+  bool insetQuad = isInset > 0.5 && isInset < 1.5;
+  vec2 quadPos = insetQuad ? borderBoxPos : rectPos;
+  vec2 quadSize = insetQuad ? borderBoxSize : rectSize;
 
   float skirt = max(1.5, 3.0 * blurSigma);
   vec2 expandedPos = quadPos - skirt;
@@ -1632,7 +2005,16 @@ float roundedBoxShadow(vec2 halfSize, vec2 point, float sigma, vec4 radiiX, vec4
 void main() {
 ${CLIP_EVAL_GLSL}
 
-  bool isInset = vIsInset > 0.5;
+  bool isInset = vIsInset > 0.5 && vIsInset < 1.5;
+  bool excludesBorderBox = vIsInset > 1.5;
+
+  bool isCoincidentOutset = excludesBorderBox
+    && vBlurSigma <= 0.0
+    && all(equal(vBorderBoxLocalCenter, vec2(0.0)))
+    && all(equal(vHalfSize, vBorderBoxHalfSize))
+    && all(equal(vRadiiX, vBorderBoxRadiiX))
+    && all(equal(vRadiiY, vBorderBoxRadiiY));
+  if (isCoincidentOutset) { discard; }
 
   float bd = roundedRectSDF(vLocalPos - vBorderBoxLocalCenter, vBorderBoxHalfSize, vBorderBoxRadiiX, vBorderBoxRadiiY);
   float bAa = fwidth(bd) * 0.5;
@@ -1640,6 +2022,8 @@ ${CLIP_EVAL_GLSL}
   if (isInset) {
     if (bd > bAa) { discard; }
     borderBoxCoverage = 1.0 - smoothstep(-bAa, bAa, bd);
+  } else if (excludesBorderBox) {
+    if (bd < -1.0) { discard; }
   }
 
   float d = roundedRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY);
@@ -1948,6 +2332,12 @@ async function createSharedWebgl2State() {
     FULLSCREEN_VERTEX_GLSL,
     DROP_SHADOW_FRAGMENT_GLSL,
   );
+  const filterWindowProgram = compileProgram(
+    gl,
+    "filterWindow",
+    FULLSCREEN_VERTEX_GLSL,
+    FILTER_WINDOW_FRAGMENT_GLSL,
+  );
   const downsampleProgram = compileProgram(
     gl,
     "downsample",
@@ -1995,6 +2385,8 @@ async function createSharedWebgl2State() {
         "opacity",
         "blendMode",
         "hasMatrix",
+        "outputPremultiplied",
+        "porterDuff",
         "matrixR",
         "matrixG",
         "matrixB",
@@ -2005,7 +2397,7 @@ async function createSharedWebgl2State() {
         "pathMaskBbox",
         "pathMaskUv",
         "pathMaskInvA",
-        "pathMaskInvB",
+        "pathMaskTranslation",
         "maskInfo",
         "srcTex",
         "backdropTex",
@@ -2040,6 +2432,10 @@ async function createSharedWebgl2State() {
         "currentTex",
       ]),
     },
+    filterWindow: {
+      program: filterWindowProgram,
+      uniforms: uniformLocations(gl, filterWindowProgram, ["shift", "srcTex"]),
+    },
     downsample: {
       program: downsampleProgram,
       uniforms: uniformLocations(gl, downsampleProgram, ["srcTex"]),
@@ -2050,7 +2446,6 @@ async function createSharedWebgl2State() {
         ...CLIP_UNIFORM_NAMES,
         "dilateLight",
         "dilateDark",
-        "gammaSteepness",
         "atlasTex",
       ]),
     },
@@ -2068,6 +2463,7 @@ async function createSharedWebgl2State() {
       uniforms: uniformLocations(gl, imageProgram, [
         ...CLIP_UNIFORM_NAMES,
         "imageTex",
+        "groupStraightColor",
       ]),
     },
     boxShadow: {
@@ -2290,6 +2686,54 @@ export async function createRenderContextWebgl2(options) {
   };
 }
 
+// A page of the color glyph cache (src/color-glyph-cache.js): an RGBA8
+// texture of the shared GL context that the entries a render with
+// readback "none" left in a source context's main target are copied into,
+// sampled texel for texel.
+export function createWebgl2ColorGlyphCachePage(context, width, height) {
+  const { gl } = context.shared;
+  gl.activate?.();
+  const target = createCanvasTexture(gl, width, height);
+  gl.bindTexture(gl.TEXTURE_2D, target.texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return {
+    texture: target.texture,
+    width,
+    height,
+    copyFrom(sourceContext, rects) {
+      gl.activate?.();
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, sourceContext.mainTarget.framebuffer);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, target.framebuffer);
+      for (const rect of rects) {
+        const right = rect.x + rect.width;
+        const bottom = rect.y + rect.height;
+        gl.blitFramebuffer(
+          rect.x,
+          rect.y,
+          right,
+          bottom,
+          rect.x,
+          rect.y,
+          right,
+          bottom,
+          gl.COLOR_BUFFER_BIT,
+          gl.NEAREST,
+        );
+      }
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    },
+    destroy() {
+      gl.activate?.();
+      gl.deleteFramebuffer(target.framebuffer);
+      gl.deleteTexture(target.texture);
+    },
+  };
+}
+
 function probeSelfTest(shared) {
   const { gl } = shared;
   const target = createCanvasTexture(gl, 4, 4);
@@ -2344,9 +2788,8 @@ function probeSelfTest(shared) {
 }
 
 // --------------------------------------------------------------------------
-// Frame execution — mirrors src/rasterize.js render()'s second pass batch
-// for batch; see that file for the paint-order and effect-stack design
-// comments (not duplicated here).
+// Frame execution interprets the same numeric plan as src/rasterize.js; see
+// that file for the paint-order and effect-stack design comments.
 // --------------------------------------------------------------------------
 
 // mask-composite operators as fixed-function blend factors — same
@@ -2370,30 +2813,18 @@ function maskCompositeBlendFactors(gl, compositeOperator) {
   }
 }
 
-export async function renderWebgl2(
-  context,
-  commandBuffer,
-  commandBytes,
-  options = {},
-) {
+export function renderWebgl2(context, options = {}) {
   const {
     background = { r: 0, g: 0, b: 0, a: 0 },
-    atlases = null,
-    glyphBuffer = null,
     svgPathAtlas = null,
+    planReader,
+    atlases = null,
     images = null,
-    gradientStopPool = null,
-    overlayRects = null,
-    scrollTable = null,
     dirtyTiles = null,
     tileSize = 64,
     deferReadback = false,
     readback = "float32",
-    textGamma = { dilateLight: 0.45, dilateDark: 0.12, steepness: 1.6 },
-    deviceScale = 1,
-    // Visible-region rasterization: CSS-px rectangle the target covers
-    // (see buildBatches); null covers the full scene.
-    visibleRectangle = null,
+    textThickening = { darkInk: 0, lightInk: 0 },
     glyphPerformance = null,
   } = options;
   const { width, height, mainTarget } = context;
@@ -2405,8 +2836,6 @@ export async function renderWebgl2(
     instanceBuffer,
     gradientRecordsTexture,
     gradientStopsTexture,
-    blitReadFramebuffer,
-    blitDrawFramebuffer,
     placeholderTexture,
     atlasTextures,
     premultipliedImagePixelCache,
@@ -2421,23 +2850,18 @@ export async function renderWebgl2(
 
   const incremental = dirtyTiles !== null;
 
-  const {
-    batches,
-    opacityStack,
-    maskStack,
-    maskLayerStack,
-    backgroundStack,
-    blendLayerStack,
-  } = options._preparedBatches ?? buildBatches(commandBuffer, commandBytes, {
+  if (planReader == null) {
+    throw new TypeError("renderWebgl2: options.planReader is required");
+  }
+  const opacityStack = [];
+  const backgroundStack = [];
+  const blendLayerStack = [];
+  const maskStack = [];
+  const maskLayerStack = [];
+  const batch = createRasterPlanCursor(planReader, {
     atlases,
-    glyphBuffer,
     svgPathAtlas,
     images,
-    gradientStopPool,
-    deviceScale,
-    overlayRects,
-    scrollTable,
-    visibleRectangle,
   });
 
   // Per-frame GL objects deleted at the end of the frame (mirrors the
@@ -2446,8 +2870,8 @@ export async function renderWebgl2(
   const texturesToDestroy = [];
   const framebuffersToDestroy = [];
 
-  function makeCanvasTarget() {
-    const target = createCanvasTexture(gl, width, height);
+  function makeCanvasTarget(targetWidth = width, targetHeight = height) {
+    const target = createCanvasTexture(gl, targetWidth, targetHeight);
     targetsToDestroy.push(target);
     return target;
   }
@@ -2477,12 +2901,14 @@ export async function renderWebgl2(
 
   // One instanced quad draw with the bound program and state. Dependency
   // groups render their complete source; only the retained destination is
-  // scissored, once per dirty rect the unit touches (the WebGPU backend's
-  // drawCurrentPass rule).
-  function drawInstanced(vertexArray, count) {
+  // scissored, once per dirty rect the draw reaches: a selected draw
+  // (`reach` true) only for the rects its plan bounds overlap, any other
+  // draw for every rect (the WebGPU backend's drawCurrentPass rule).
+  function drawInstanced(vertexArray, count, reach = false) {
     gl.bindVertexArray(vertexArray);
     if (currentDamage && currentTarget === mainTarget) {
       for (const rect of currentDamage.rects) {
+        if (reach && !batch.reaches(rect.x, rect.y, rect.w, rect.h)) continue;
         gl.scissor(rect.x, rect.y, rect.w, rect.h);
         gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
       }
@@ -2591,53 +3017,66 @@ export async function renderWebgl2(
     return cachedAtlasTexture(atlas);
   }
 
-  // Pack and upload one batch's gradient records and stops into the two
-  // data textures. gradients: array of (gradient | null), one per
-  // instance. Returns nothing — the textures are context-shared and GL
-  // draws execute immediately, so per-batch reupload is safe.
+  // Upload native raster-plan gradient spans. WebGL data textures encode the
+  // record's integer header as exact floats; stop colors come from each
+  // 48-byte stop's precomputed sRGB copy at byte 32.
   function uploadGradients(gradients, count) {
     const recordFloats = new Float32Array(count * 12);
-    const allStops = [];
+    let stopCount = 0;
     for (let i = 0; i < count; i++) {
       const gradient = gradients[i];
+      if (gradient === null) continue;
+      const source = new DataView(
+        gradient.record.buffer,
+        gradient.record.byteOffset,
+        gradient.record.byteLength,
+      );
       const base = i * 12;
-      if (gradient) {
-        recordFloats[base + 0] = 1 | (gradient.tiled ? 2 : 0);
-        recordFloats[base + 1] = gradient.kind;
-        recordFloats[base + 2] = allStops.length;
-        recordFloats[base + 3] = gradient.stops.length;
-        recordFloats[base + 4] = gradient.geom0;
-        recordFloats[base + 5] = gradient.geom1;
-        recordFloats[base + 6] = gradient.geom2;
-        recordFloats[base + 7] = gradient.geom3;
-        recordFloats[base + 8] = gradient.geom4;
-        recordFloats[base + 9] = gradient.geom5;
-        recordFloats[base + 10] = gradient.geom6;
-        recordFloats[base + 11] = gradient.geom7;
-        allStops.push(...gradient.stops);
+      recordFloats[base] = source.getUint32(0, true);
+      recordFloats[base + 1] = source.getUint32(4, true);
+      recordFloats[base + 2] = stopCount;
+      recordFloats[base + 3] = gradient.stopCount;
+      for (let component = 0; component < 8; component++) {
+        recordFloats[base + 4 + component] = source.getFloat32(
+          16 + component * 4,
+          true,
+        );
       }
+      stopCount += gradient.stopCount;
     }
     uploadDataTexture(gl, gradientRecordsTexture, recordFloats, count * 3);
-    if (allStops.length > 0) {
-      const stopFloats = new Float32Array(allStops.length * 8);
-      for (let i = 0; i < allStops.length; i++) {
-        // srgbColor: the walker's prepared stops carry interpolation-space
-        // components in `color`; this degraded backend interpolates in
-        // sRGB between per-stop sRGB conversions instead (documented
-        // degradation - correct stop colors, sRGB segment interiors).
-        stopFloats[i * 8 + 0] = allStops[i].srgbColor[0];
-        stopFloats[i * 8 + 1] = allStops[i].srgbColor[1];
-        stopFloats[i * 8 + 2] = allStops[i].srgbColor[2];
-        stopFloats[i * 8 + 3] = allStops[i].srgbColor[3];
-        stopFloats[i * 8 + 4] = allStops[i].position;
-      }
-      uploadDataTexture(
-        gl,
-        gradientStopsTexture,
-        stopFloats,
-        allStops.length * 2,
+    if (stopCount === 0) return;
+    const stopFloats = new Float32Array(stopCount * 8);
+    let destination = 0;
+    for (const gradient of gradients) {
+      if (gradient === null) continue;
+      const source = new DataView(
+        gradient.stops.buffer,
+        gradient.stops.byteOffset,
+        gradient.stops.byteLength,
       );
+      for (let stopIndex = 0; stopIndex < gradient.stopCount; stopIndex++) {
+        const sourceBase = stopIndex * 48;
+        const destinationBase = destination * 8;
+        for (let component = 0; component < 4; component++) {
+          stopFloats[destinationBase + component] = source.getFloat32(
+            sourceBase + 32 + component * 4,
+            true,
+          );
+        }
+        stopFloats[destinationBase + 4] = source.getFloat32(
+          sourceBase + 16,
+          true,
+        );
+        destination++;
+      }
     }
+    uploadDataTexture(
+      gl,
+      gradientStopsTexture,
+      stopFloats,
+      stopCount * 2,
+    );
   }
 
   function bindGradientTextures(programInfo) {
@@ -2650,8 +3089,7 @@ export async function renderWebgl2(
     gl.activeTexture(gl.TEXTURE0);
   }
 
-  const needsPathAtlas = batches.some((batch) => batch.pathMask);
-  const pathMaskAtlasTexture = needsPathAtlas
+  const pathMaskAtlasTexture = batch.pathMaskInUse
     ? pathAtlasTexture(svgPathAtlas)
     : placeholderTexture;
 
@@ -2663,33 +3101,16 @@ export async function renderWebgl2(
     gl.clearColor(background.r, background.g, background.b, background.a);
     gl.clear(gl.COLOR_BUFFER_BIT);
   } else {
-    const columns = Math.ceil(width / tileSize);
-    const rows = Math.ceil(height / tileSize);
     gl.enable(gl.SCISSOR_TEST);
     gl.clearColor(background.r, background.g, background.b, background.a);
-    for (let row = 0; row < rows; row++) {
-      let firstDirtyColumn = -1;
-      for (let column = 0; column <= columns; column++) {
-        const dirty = column < columns &&
-          dirtyTiles[row * columns + column];
-        if (dirty && firstDirtyColumn === -1) {
-          firstDirtyColumn = column;
-          continue;
-        }
-        if (dirty || firstDirtyColumn === -1) continue;
-        const rectangleX = firstDirtyColumn * tileSize;
-        const rectangleY = row * tileSize;
-        const rectangleRight = Math.min(column * tileSize, width);
-        const rectangleBottom = Math.min(rectangleY + tileSize, height);
-        gl.scissor(
-          rectangleX,
-          rectangleY,
-          rectangleRight - rectangleX,
-          rectangleBottom - rectangleY,
-        );
-        gl.clear(gl.COLOR_BUFFER_BIT);
-        firstDirtyColumn = -1;
-      }
+    for (const { x, y, w, h } of dirtyTileRectangles(
+      dirtyTiles,
+      width,
+      height,
+      tileSize,
+    )) {
+      gl.scissor(x, y, w, h);
+      gl.clear(gl.COLOR_BUFFER_BIT);
     }
     gl.disable(gl.SCISSOR_TEST);
   }
@@ -2707,6 +3128,8 @@ export async function renderWebgl2(
     opacity = 1,
     blendMode = BLEND_NORMAL,
     hasMatrix = 0,
+    outputPremultiplied = 0,
+    porterDuff = 0,
     matrixRows = null,
     pathMaskUniforms = null,
     hasMask = 0,
@@ -2721,6 +3144,8 @@ export async function renderWebgl2(
     gl.uniform1f(composite.uniforms.opacity, opacity);
     gl.uniform1f(composite.uniforms.blendMode, blendMode);
     gl.uniform1f(composite.uniforms.hasMatrix, hasMatrix);
+    gl.uniform1f(composite.uniforms.outputPremultiplied, outputPremultiplied);
+    gl.uniform1f(composite.uniforms.porterDuff, porterDuff);
     gl.uniform4fv(
       composite.uniforms.matrixR,
       matrixRows ? matrixRows.subarray(0, 4) : ZERO_MATRIX_ROWS,
@@ -2763,7 +3188,7 @@ export async function renderWebgl2(
       pathMask.length ? new Float32Array(pathMask.slice(16, 20)) : ZERO_VEC4,
     );
     gl.uniform4fv(
-      composite.uniforms.pathMaskInvB,
+      composite.uniforms.pathMaskTranslation,
       pathMask.length ? new Float32Array(pathMask.slice(20, 24)) : ZERO_VEC4,
     );
     gl.uniform4fv(
@@ -2790,68 +3215,135 @@ export async function renderWebgl2(
     drawInstanced(vertexArrays.composite, 1);
   }
 
-  function applyMatrixSegment(sourceTarget, matrix) {
-    const outputTarget = makeCanvasTarget();
-    clearTargetTransparent(outputTarget);
-    const matrixRows = new Float32Array(filterMatrixUniformFloats(matrix));
-    // Pure overwrite — no blending (see the WebGPU matrixOverwritePipeline
-    // comment for why blending would double-apply alpha).
+  // Filter passes mirror the WebGPU backend's: each writes a target the
+  // size of the one it reads (the frame, or the padded filter region of
+  // applyFilterPasses), scissored to the part of that region a later pass
+  // still reads. The scissor is set after the clear, which it would
+  // otherwise bound.
+  function enableFilterScissor(outputTarget, reachX, reachY) {
+    const padX = (outputTarget.width - width) / 2;
+    const padY = (outputTarget.height - height) / 2;
+    const x = Math.max(0, padX - reachX);
+    const y = Math.max(0, padY - reachY);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(
+      x,
+      y,
+      Math.min(outputTarget.width, padX + width + reachX) - x,
+      Math.min(outputTarget.height, padY + height + reachY) - y,
+    );
+  }
+
+  function applyWindowPass(
+    sourceTarget,
+    outputWidth,
+    outputHeight,
+    shiftX,
+    shiftY,
+  ) {
+    const outputTarget = makeCanvasTarget(outputWidth, outputHeight);
+    bindTarget(outputTarget);
     gl.disable(gl.BLEND);
-    setCompositeUniforms({
-      hasMatrix: 1,
-      matrixRows,
-      srcTexture: sourceTarget.texture,
-    });
-    drawCompositeQuad();
+    const filterWindow = programs.filterWindow;
+    gl.useProgram(filterWindow.program);
+    gl.uniform2f(filterWindow.uniforms.shift, shiftX, shiftY);
+    gl.uniform1i(filterWindow.uniforms.srcTex, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, sourceTarget.texture);
+    gl.bindVertexArray(fullscreenVertexArray);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.bindVertexArray(null);
     setStandardBlend();
     return outputTarget;
   }
 
-  function applyBlurSegment(sourceTarget, sigma) {
-    const widths = blurBoxWidths(sigma);
-    let current = sourceTarget;
+  function applyMatrixPass(sourceTarget, matrixRows, reachX, reachY) {
+    const outputTarget = makeCanvasTarget(
+      sourceTarget.width,
+      sourceTarget.height,
+    );
+    clearTargetTransparent(outputTarget);
+    enableFilterScissor(outputTarget, reachX, reachY);
+    // Pure overwrite of associated color — no blending (see the WebGPU
+    // matrixOverwritePipeline comment). The frame-sized composite quad
+    // covers a padded target whole (see the WebGPU applyMatrixPass).
+    gl.disable(gl.BLEND);
+    setCompositeUniforms({
+      hasMatrix: 1,
+      outputPremultiplied: 1,
+      matrixRows,
+      srcTexture: sourceTarget.texture,
+    });
+    drawCompositeQuad();
+    gl.disable(gl.SCISSOR_TEST);
+    setStandardBlend();
+    return outputTarget;
+  }
+
+  function applyBlurPass(sourceTarget, uniform, reachX, reachY) {
     gl.disable(gl.BLEND);
     const boxBlur = programs.boxBlur;
     gl.useProgram(boxBlur.program);
-    gl.uniform2f(boxBlur.uniforms.resolution, width, height);
+    gl.uniform2f(
+      boxBlur.uniforms.resolution,
+      sourceTarget.width,
+      sourceTarget.height,
+    );
     gl.uniform1i(boxBlur.uniforms.srcTex, 0);
     gl.bindVertexArray(fullscreenVertexArray);
-    for (const boxWidth of widths) {
-      for (const direction of [[1, 0], [0, 1]]) {
-        const passTarget = makeCanvasTarget();
-        bindTarget(passTarget);
-        gl.clearColor(0, 0, 0, 0);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-        gl.uniform2f(boxBlur.uniforms.direction, direction[0], direction[1]);
-        gl.uniform1f(boxBlur.uniforms.boxWidth, boxWidth);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, current.texture);
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
-        current = passTarget;
-      }
-    }
+    const passTarget = makeCanvasTarget(
+      sourceTarget.width,
+      sourceTarget.height,
+    );
+    bindTarget(passTarget);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    enableFilterScissor(passTarget, reachX, reachY);
+    gl.uniform2f(boxBlur.uniforms.direction, uniform[1], uniform[2]);
+    gl.uniform1f(boxBlur.uniforms.boxWidth, uniform[0]);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, sourceTarget.texture);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.disable(gl.SCISSOR_TEST);
     gl.bindVertexArray(null);
     setStandardBlend();
-    return current;
+    return passTarget;
   }
 
-  function applyDropShadowSegment(sourceTarget, dx, dy, sigma, color) {
-    const blurredAlphaTarget = applyBlurSegment(sourceTarget, sigma);
-    const outputTarget = makeCanvasTarget();
+  function applyDropShadowPass(
+    blurredAlphaTarget,
+    sourceTarget,
+    uniform,
+    reachX,
+    reachY,
+  ) {
+    const outputTarget = makeCanvasTarget(
+      sourceTarget.width,
+      sourceTarget.height,
+    );
     bindTarget(outputTarget);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
+    enableFilterScissor(outputTarget, reachX, reachY);
     gl.disable(gl.BLEND);
     const dropShadow = programs.dropShadow;
     gl.useProgram(dropShadow.program);
-    gl.uniform2f(dropShadow.uniforms.resolution, width, height);
-    gl.uniform2f(dropShadow.uniforms.shadowOffset, dx, dy);
+    gl.uniform2f(
+      dropShadow.uniforms.resolution,
+      sourceTarget.width,
+      sourceTarget.height,
+    );
+    gl.uniform2f(
+      dropShadow.uniforms.shadowOffset,
+      uniform[0],
+      uniform[1],
+    );
     gl.uniform4f(
       dropShadow.uniforms.shadowColor,
-      color.r,
-      color.g,
-      color.b,
-      color.a,
+      uniform[3],
+      uniform[4],
+      uniform[5],
+      uniform[6],
     );
     gl.uniform1i(dropShadow.uniforms.blurredAlphaTex, 0);
     gl.uniform1i(dropShadow.uniforms.currentTex, 1);
@@ -2862,29 +3354,60 @@ export async function renderWebgl2(
     gl.activeTexture(gl.TEXTURE0);
     gl.bindVertexArray(fullscreenVertexArray);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.disable(gl.SCISSOR_TEST);
     gl.bindVertexArray(null);
     setStandardBlend();
     return outputTarget;
   }
 
-  function applyFilterSegments(sourceTarget, filterSegments) {
-    let target = sourceTarget;
-    for (const segment of filterSegments ?? []) {
-      if (segment.kind === "matrix") {
-        target = applyMatrixSegment(target, segment.matrix);
-      } else if (segment.kind === "blur") {
-        target = applyBlurSegment(target, segment.sigma);
-      } else if (segment.kind === "drop-shadow") {
-        target = applyDropShadowSegment(
+  // The filter region: see the WebGPU backend's applyFilterPasses.
+  function applyFilterPasses(sourceTarget, passes) {
+    const reaches = filterPassReaches(passes);
+    const maxExtent = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const padX = filterRegionPadding(reaches[0], width, maxExtent);
+    const padY = filterRegionPadding(reaches[1], height, maxExtent);
+    const padded = padX > 0 || padY > 0;
+    let target = padded
+      ? applyWindowPass(
+        sourceTarget,
+        width + 2 * padX,
+        height + 2 * padY,
+        -padX,
+        -padY,
+      )
+      : sourceTarget;
+    let blurSource = target;
+    let blurPassIndex = 0;
+    for (let index = 0; index < passes.length; index++) {
+      const pass = passes[index];
+      const reachX = reaches[2 * index + 2];
+      const reachY = reaches[2 * index + 3];
+      if (pass.kind === RASTER_PLAN_PASS_MATRIX) {
+        target = applyMatrixPass(target, pass.uniform, reachX, reachY);
+        blurPassIndex = 0;
+      } else if (
+        pass.kind === RASTER_PLAN_PASS_BOX_BLUR_H ||
+        pass.kind === RASTER_PLAN_PASS_BOX_BLUR_V
+      ) {
+        if (blurPassIndex === 0) blurSource = target;
+        target = applyBlurPass(target, pass.uniform, reachX, reachY);
+        blurPassIndex = (blurPassIndex + 1) % 6;
+      } else if (pass.kind === RASTER_PLAN_PASS_DROP_SHADOW) {
+        target = applyDropShadowPass(
           target,
-          segment.dx,
-          segment.dy,
-          segment.sigma,
-          segment.color,
+          blurSource,
+          pass.uniform,
+          reachX,
+          reachY,
         );
+        blurPassIndex = 0;
+      } else {
+        throw new Error(`render: unknown native filter pass ${pass.kind}`);
       }
     }
-    return target;
+    return padded
+      ? applyWindowPass(target, width, height, padX, padY)
+      : target;
   }
 
   function compositeTexture(sourceTarget, blendMode, backdropTarget) {
@@ -2899,12 +3422,16 @@ export async function renderWebgl2(
   }
 
   // --- Second pass: execute batches ---
-  for (const batch of batches) {
-    if (batch.type === "damage") {
-      currentDamage = batch;
-      continue;
-    }
-    if (batch.type === "rect") {
+  for (let entryIndex = 0; entryIndex < batch.entryCount; entryIndex++) {
+    // One draw per span of mergeable records; see createRasterPlanCursor
+    // and design/interaction.md, "Invalidation split".
+    const recordIndex = batch.selectEntry(entryIndex);
+    switch (planReader.kind(recordIndex)) {
+      case CMD_DAMAGE:
+        currentDamage = { rects: batch.rects };
+        continue;
+      case CMD_RECT: {
+      if (batch.instances.length === 0) break;
       bindTarget(currentTarget);
       setStandardBlend();
       const rect = programs.rect;
@@ -2913,16 +3440,22 @@ export async function renderWebgl2(
       uploadGradients(batch.gradients, batch.count);
       bindGradientTextures(rect);
       uploadInstances(batch.instances);
-      drawInstanced(vertexArrays.rect, batch.count);
-    } else if (batch.type === "boxShadow") {
+      drawInstanced(vertexArrays.rect, batch.count, true);
+        break;
+      }
+      case CMD_BOX_SHADOW: {
+      if (batch.instances.length === 0) break;
       bindTarget(currentTarget);
       setStandardBlend();
       const boxShadow = programs.boxShadow;
       gl.useProgram(boxShadow.program);
       setClipUniforms(boxShadow, batch.clipState);
       uploadInstances(batch.instances);
-      drawInstanced(vertexArrays.boxShadow, batch.count);
-    } else if (batch.type === "text") {
+      drawInstanced(vertexArrays.boxShadow, batch.count, true);
+        break;
+      }
+      case CMD_TEXT: {
+      if (batch.instances.length === 0) break;
       bindTarget(currentTarget);
       setStandardBlend();
       const glyphUploadStartedAt = glyphPerformance ? performance.now() : 0;
@@ -2934,15 +3467,17 @@ export async function renderWebgl2(
       const text = programs.text;
       gl.useProgram(text.program);
       setClipUniforms(text, batch.clipState);
-      gl.uniform1f(text.uniforms.dilateLight, textGamma.dilateLight);
-      gl.uniform1f(text.uniforms.dilateDark, textGamma.dilateDark);
-      gl.uniform1f(text.uniforms.gammaSteepness, textGamma.steepness ?? 1);
+      gl.uniform1f(text.uniforms.dilateLight, textThickening.lightInk);
+      gl.uniform1f(text.uniforms.dilateDark, textThickening.darkInk);
       gl.uniform1i(text.uniforms.atlasTex, 0);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
       uploadInstances(batch.instances);
-      drawInstanced(vertexArrays.text, batch.count);
-    } else if (batch.type === "svgPath") {
+      drawInstanced(vertexArrays.text, batch.count, true);
+        break;
+      }
+      case CMD_SVG_PATH: {
+      if (batch.instances.length === 0) break;
       bindTarget(currentTarget);
       setStandardBlend();
       const atlasTexture = cachedAtlasTexture(batch.atlas);
@@ -2955,8 +3490,27 @@ export async function renderWebgl2(
       uploadGradients([batch.gradient], 1);
       bindGradientTextures(svgPath);
       uploadInstances(batch.instances);
-      drawInstanced(vertexArrays.svgPath, batch.count);
-    } else if (batch.type === "image") {
+      drawInstanced(vertexArrays.svgPath, batch.count, true);
+        break;
+      }
+      case CMD_IMAGE: {
+      if (batch.instances.length === 0) break;
+      if (batch.image.kind === "color-glyph-cache-page") {
+        // A color glyph cache page (src/color-glyph-cache.js): rendered
+        // entries, premultiplied, each drawn texel for texel.
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, batch.image.texture);
+        bindTarget(currentTarget);
+        setStandardBlend();
+        const image = programs.image;
+        gl.useProgram(image.program);
+        setClipUniforms(image, batch.clipState);
+        gl.uniform1i(image.uniforms.imageTex, 0);
+        gl.uniform1f(image.uniforms.groupStraightColor, 1);
+        uploadInstances(batch.instances);
+        drawInstanced(vertexArrays.image, batch.count, true);
+        break;
+      }
       const { width: imageWidth, height: imageHeight, pixels } = batch.image;
       const mipLevelCount = 1 +
         Math.floor(Math.log2(Math.max(imageWidth, imageHeight)));
@@ -3076,31 +3630,48 @@ export async function renderWebgl2(
       gl.useProgram(image.program);
       setClipUniforms(image, batch.clipState);
       gl.uniform1i(image.uniforms.imageTex, 0);
+      gl.uniform1f(image.uniforms.groupStraightColor, 0);
       uploadInstances(batch.instances);
-      drawInstanced(vertexArrays.image, batch.count);
-    } else if (batch.type === "pushOpacity") {
+      drawInstanced(vertexArrays.image, batch.count, true);
+        break;
+      }
+      case CMD_PUSH_OPACITY: {
       const offscreenTarget = makeCanvasTarget();
       clearTargetTransparent(offscreenTarget);
       opacityStack.push({
         target: offscreenTarget,
-        ...batch,
+        opacity: batch.opacity,
+        blendMode: batch.blendMode,
+        filterPasses: batch.filterPasses,
+        clipState: batch.clipState,
+        hasMask: batch.hasMask,
         previousTarget: currentTarget,
       });
       currentTarget = offscreenTarget;
-    } else if (batch.type === "popOpacity") {
+        break;
+      }
+      case CMD_POP_OPACITY: {
       const entry = opacityStack.pop();
       currentTarget = entry.previousTarget;
 
-      const filteredTarget = applyFilterSegments(
+      const filteredTarget = applyFilterPasses(
         entry.target,
-        entry.filterSegments,
+        entry.filterPasses,
       );
 
-      const blendMode = entry.blendMode || BLEND_NORMAL;
-      const clipState = entry.clipState ?? EMPTY_CLIP_STATE;
-      const pathMaskUniforms = entry.pathMask
-        ? pathMaskUniformFloats(entry.pathMask, svgPathAtlas)
-        : null;
+      const nativeComposite = batch.nativeComposite;
+      const blendMode = nativeComposite?.[1] ??
+        entry.blendMode ?? BLEND_NORMAL;
+      const clipState = nativeComposite
+        ? {
+          packedFloats: nativeComposite.subarray(54),
+          entryCount: nativeComposite[3],
+          entries: [],
+        }
+        : entry.clipState ?? EMPTY_CLIP_STATE;
+      const pathMaskUniforms = nativeComposite
+        ? nativeComposite.subarray(26, 50)
+        : entry.pathMaskUniforms ?? null;
       const maskTarget = entry.hasMask ? maskStack.pop() : null;
       if (entry.hasMask && !maskTarget) {
         throw new Error(
@@ -3108,23 +3679,33 @@ export async function renderWebgl2(
         );
       }
       let backdropTarget = null;
-      if (blendMode !== BLEND_NORMAL) {
+      if (batch.needsBackdropCopy || blendMode !== BLEND_NORMAL) {
         backdropTarget = snapshotTarget(currentTarget);
       }
       bindTarget(currentTarget);
-      setStandardBlend();
+      // A Porter-Duff operator (composite uniform float 7) writes its
+      // result over the backdrop copy itself: blending off.
+      const porterDuff = nativeComposite?.[5] ?? 0;
+      if (porterDuff) gl.disable(gl.BLEND);
+      else setStandardBlend();
       setCompositeUniforms({
-        opacity: entry.opacity,
+        opacity: nativeComposite?.[0] ?? entry.opacity,
         blendMode,
+        hasMatrix: nativeComposite?.[2] ?? 0,
+        porterDuff,
+        matrixRows: nativeComposite?.subarray(6, 26) ?? null,
         pathMaskUniforms,
-        hasMask: maskTarget ? 1 : 0,
+        hasMask: nativeComposite?.[50] ?? (maskTarget ? 1 : 0),
         clipState,
         srcTexture: filteredTarget.texture,
         backdropTexture: backdropTarget ? backdropTarget.texture : null,
         maskTexture: maskTarget ? maskTarget.texture : null,
       });
       drawCompositeQuad();
-    } else if (batch.type === "pushBackground") {
+      if (porterDuff) setStandardBlend();
+        break;
+      }
+      case CMD_PUSH_BACKGROUND: {
       const accumulator = makeCanvasTarget();
       clearTargetTransparent(accumulator);
       backgroundStack.push({
@@ -3132,14 +3713,18 @@ export async function renderWebgl2(
         previousTarget: currentTarget,
       });
       currentTarget = accumulator;
-    } else if (batch.type === "popBackground") {
+        break;
+      }
+      case CMD_POP_BACKGROUND: {
       const entry = backgroundStack.pop();
       if (!entry) {
         throw new Error("render: CMD_POP_BACKGROUND with no matching push");
       }
       currentTarget = entry.previousTarget;
       compositeTexture(entry.target, BLEND_NORMAL, null);
-    } else if (batch.type === "pushBlendLayer") {
+        break;
+      }
+      case CMD_PUSH_BLEND_LAYER: {
       const scratch = makeCanvasTarget();
       clearTargetTransparent(scratch);
       blendLayerStack.push({
@@ -3148,7 +3733,9 @@ export async function renderWebgl2(
         blendMode: batch.blendMode,
       });
       currentTarget = scratch;
-    } else if (batch.type === "popBlendLayer") {
+        break;
+      }
+      case CMD_POP_BLEND_LAYER: {
       const layer = blendLayerStack.pop();
       if (!layer) {
         throw new Error("render: CMD_POP_BLEND_LAYER with no matching push");
@@ -3156,11 +3743,15 @@ export async function renderWebgl2(
       currentTarget = layer.previousTarget;
       const backdropTarget = snapshotTarget(currentTarget);
       compositeTexture(layer.target, layer.blendMode, backdropTarget);
-    } else if (batch.type === "pushMask") {
+        break;
+      }
+      case CMD_PUSH_MASK: {
       const accumulator = makeCanvasTarget();
       clearTargetTransparent(accumulator);
       maskStack.push(accumulator);
-    } else if (batch.type === "pushMaskLayer") {
+        break;
+      }
+      case CMD_PUSH_MASK_LAYER: {
       const scratch = makeCanvasTarget();
       clearTargetTransparent(scratch);
       maskLayerStack.push({
@@ -3170,7 +3761,9 @@ export async function renderWebgl2(
         composite: batch.composite,
       });
       currentTarget = scratch;
-    } else if (batch.type === "popMaskLayer") {
+        break;
+      }
+      case CMD_POP_MASK_LAYER: {
       const layer = maskLayerStack.pop();
       currentTarget = layer.previousTarget;
       const accumulator = maskStack[maskStack.length - 1];
@@ -3194,11 +3787,13 @@ export async function renderWebgl2(
       gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, 1);
       gl.bindVertexArray(null);
       setStandardBlend();
-    } else if (batch.type === "pushBackdropFilter") {
+        break;
+      }
+      case CMD_PUSH_BACKDROP_FILTER: {
       const snapshot = snapshotTarget(currentTarget);
-      const filteredTarget = applyFilterSegments(
+      const filteredTarget = applyFilterPasses(
         snapshot,
-        batch.filterSegments,
+        batch.filterPasses,
       );
       bindTarget(currentTarget);
       setStandardBlend();
@@ -3208,6 +3803,20 @@ export async function renderWebgl2(
       });
       drawCompositeQuad();
     }
+      break;
+    case CMD_PUSH_CLIP:
+    case CMD_POP_CLIP:
+    case CMD_POP_BACKDROP_FILTER:
+    case CMD_SET_NODE:
+    case CMD_SET_SCROLL:
+      break;
+    default:
+      throw new Error(
+        `render: unknown raster-plan record kind 0x${
+          planReader.kind(recordIndex).toString(16)
+        } at index ${recordIndex}`,
+      );
+  }
   }
   gl.disable(gl.SCISSOR_TEST);
 

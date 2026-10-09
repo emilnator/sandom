@@ -1,0 +1,8 @@
+{
+  "importMap": "./import-map.json",
+  "tasks": {
+    "start": "deno run --unstable-raw-imports --allow-read --allow-write=.studio --allow-net=127.0.0.1 --allow-run=git --allow-env=STUDIO_PORT,STUDIO_PROJECT server.js",
+    "test": "deno test --unstable-raw-imports --allow-read --allow-write --allow-net=127.0.0.1 --allow-run=git server_test.js",
+    "check": "deno check server.js studio.js live-component.js && deno lint server.js studio.js live-component.js server_test.js"
+  }
+}

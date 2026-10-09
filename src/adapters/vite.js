@@ -313,10 +313,7 @@ function relativeInvalidationPath(root, filePath) {
 }
 
 function reconstructFrame(value, binary) {
-  const expectedBinaryNames = new Set([
-    "pixels",
-    ...(value.pngPresent ? ["png"] : []),
-  ]);
+  const expectedBinaryNames = new Set(["pixels"]);
   for (const name of binary.keys()) {
     if (!expectedBinaryNames.delete(name)) {
       throw new TypeError(`The Vite realm returned unknown frame bytes ${name}`);
@@ -346,14 +343,9 @@ function reconstructFrame(value, binary) {
   const pixels = PixelArray === Uint8Array
     ? pixelBytes
     : new PixelArray(pixelBytes.slice().buffer);
-  const png = value.pngPresent ? binary.get("png") : null;
-  if (value.pngPresent && !(png instanceof Uint8Array)) {
-    throw new TypeError("The Vite realm returned a frame without declared PNG bytes");
-  }
   const {
     pixelsPresent,
     pixelsType,
-    pngPresent,
     durationMilliseconds,
     ...fields
   } = value;
@@ -361,7 +353,7 @@ function reconstructFrame(value, binary) {
     throw new TypeError("The Vite realm returned malformed frame metadata");
   }
   return {
-    frame: Object.freeze({ ...fields, pixels, png }),
+    frame: Object.freeze({ ...fields, pixels }),
     durationMilliseconds,
   };
 }

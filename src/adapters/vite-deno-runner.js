@@ -246,7 +246,9 @@ async function executeRequest(operation, value, binary) {
   if (operation === "render") {
     if (session === null) throw new Error("No component session exists");
     const startedAt = performance.now();
-    const frame = componentAdapterFrameRecord(await session.render());
+    const frame = componentAdapterFrameRecord(
+      await session.render({ pixels: true }),
+    );
     frame.value.durationMilliseconds = performance.now() - startedAt;
     return frame;
   }
@@ -291,10 +293,12 @@ async function executeRequest(operation, value, binary) {
       });
     }
     try {
-      const dispatchedFrame = await session.dispatch(value.records, {
-        ready: settlement ?? undefined,
-      });
-      const frame = componentAdapterFrameRecord(dispatchedFrame);
+      // The dispatched frame is a texture frame; the protocol ships pixel
+      // bytes, so read the settled document back once for the record.
+      await session.dispatch(value.records, { ready: settlement ?? undefined });
+      const frame = componentAdapterFrameRecord(
+        await session.render({ pixels: true }),
+      );
       frame.value.durationMilliseconds = performance.now() - startedAt;
       return frame;
     } finally {

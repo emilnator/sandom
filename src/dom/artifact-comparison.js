@@ -419,13 +419,14 @@ function validatePaintOperation(operation, path) {
       const glyphPath = `${path}.glyphs[${glyphIndex}]`;
       requireExactFields(
         glyph,
-        ["x", "width", "sourceStart", "sourceEnd"],
+        ["x", "width", "sourceStart", "sourceEnd", "rtl"],
         glyphPath,
       );
       requireFiniteNumber(glyph.x, `${glyphPath}.x`);
       requireFiniteNumber(glyph.width, `${glyphPath}.width`);
       requireNonnegativeInteger(glyph.sourceStart, `${glyphPath}.sourceStart`);
       requireNonnegativeInteger(glyph.sourceEnd, `${glyphPath}.sourceEnd`);
+      requireBoolean(glyph.rtl, `${glyphPath}.rtl`);
       if (glyph.sourceEnd < glyph.sourceStart) {
         throw new TypeError(
           `${glyphPath}.sourceEnd must not precede ${glyphPath}.sourceStart.`,

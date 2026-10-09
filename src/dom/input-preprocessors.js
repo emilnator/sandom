@@ -5,6 +5,7 @@ import {
   installComponentGlobals,
 } from "./component-globals.js";
 import { parseHTMLDocument } from "./html.js";
+import { parseXMLDocument } from "./xml.js";
 import { exceedsInputBound } from "./interaction.js";
 import { SDDocument } from "./node.js";
 
@@ -297,10 +298,43 @@ export const jsxPreprocessor = Object.freeze({
   },
 });
 
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+
+// A standalone SVG document: the XML tree with the svg element as the
+// document element, as a browser opens an image/svg+xml file.
+export const svgPreprocessor = Object.freeze({
+  name: "svg",
+  extensions: Object.freeze([".svg"]),
+  async prepare({ input, document }) {
+    parseXMLDocument(
+      textDecoder.decode(input.bytes),
+      "image/svg+xml",
+      () => document,
+    );
+    const diagnostic = document._domCore.xmlParseDiagnostic();
+    if (diagnostic !== null) {
+      throw new SyntaxError(
+        `SVG input ${input.url.href} is not well-formed XML: ${diagnostic.message} at line ${diagnostic.line}, column ${diagnostic.column}`,
+      );
+    }
+    const root = document.documentElement;
+    if (root?.localName !== "svg" || root.namespaceURI !== SVG_NAMESPACE) {
+      throw new TypeError(
+        `SVG input ${input.url.href} has document element ${
+          root === null
+            ? "null"
+            : JSON.stringify(`{${root.namespaceURI}}${root.localName}`)
+        }; expected an svg element in the ${SVG_NAMESPACE} namespace`,
+      );
+    }
+  },
+});
+
 export const builtInPreprocessors = Object.freeze([
   htmlPreprocessor,
   javascriptPreprocessor,
   jsxPreprocessor,
+  svgPreprocessor,
 ]);
 
 function validatePreprocessor(candidate, source) {

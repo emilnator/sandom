@@ -2,8 +2,8 @@
 
 Sandom is an experimental rendering engine that runs inside your process. It
 accepts a mutable DOM-like tree, performs layout in WebAssembly, rasterizes with
-WebGPU, and returns a GPU texture or raw RGBA pixels. It does not start or
-retain a browser process.
+WebGPU, and delivers each frame as a GPU texture or, on request, as float32
+working pixels. It does not start or retain a browser process.
 
 The canonical distribution is the immutable ES module set at
 `https://cdn.urania-libs.com`. This npm package is a convenience distribution of
@@ -28,8 +28,8 @@ bun  add     sandom bun-webgpu # Bun
 ```javascript
 import "sandom/gpu"; // mounts navigator.gpu on Node and Bun; no-op elsewhere
 import { loadFont } from "sandom/font-registry";
-import { createSandomDOM } from "sandom/dom";
-import { encodePNG } from "sandom/png";
+import { createRenderSurface, createSandomDOM } from "sandom/dom";
+import { encodeImage } from "sandom/output";
 
 const font = await loadFont(
   "IBM Plex Mono",
@@ -47,9 +47,22 @@ root.style.height = "180px";
 // render throws rather than picking a font nobody asked for.
 root.style.fontFamily = "IBM Plex Mono";
 root.appendChild(dom.createTextNode("DOM in. Pixels out."));
-const snapshot = await dom.renderSnapshot(root);
-const png = await encodePNG(snapshot.pixels, snapshot.width, snapshot.height);
+
+const surface = createRenderSurface(root, {
+  viewportWidth: 320,
+  viewportHeight: 180,
+});
+surface.stop(); // no host frame loop; render on demand
+const frame = await surface.renderNow({ pixels: true });
+const png = await encodeImage(frame, { format: "png" });
+await surface.shutdown();
+font.unload();
 ```
+
+Mutate `root` and call `surface.renderNow` again for the next frame: the
+surface retains layout, glyphs, and the GPU target, so the second frame costs
+what changed. `renderNow()` without `{ pixels: true }` delivers the WebGPU
+texture and performs no readback.
 
 `sandom/gpu` resolves per runtime through conditional exports: the Node entry
 mounts Google Dawn from the `webgpu` package, the Bun entry mounts Dawn from
@@ -255,8 +268,9 @@ const successor = await component.dispatch([{
 await component.dispose();
 ```
 
-Each accepted frame contains pixels, focus, changed control states, interactive
-text geometry, and one matching accessibility snapshot.
+Each accepted frame is a texture frame and contains focus, changed control
+states, interactive text geometry, and one matching accessibility snapshot.
+`component.render({ pixels: true })` reads the current state back as pixels.
 
 The maintained defaults cover button, text input, textarea, checkbox, radio,
 select, option, and label controls. The package does not provide form
@@ -265,15 +279,33 @@ menus, auxiliary click, double-click defaults, or cross-document navigation.
 
 ## Entry points
 
+- `sandom` — the public surface, one entry per job: `createRenderSurface`,
+  `createSandomDOM`, `createSandomRuntime`, `createSceneRenderer`,
+  `createPersistentSceneRenderer`, `createLayoutArtifact`,
+  `createDisplayListArtifact`, `createInvalidationArtifact`,
+  `GlyphResourceManager`, `DEFAULT_GLYPH_RESOURCE_LIMITS`,
+  `releaseRenderContexts`, `createDocumentSession`, `DocumentSession`,
+  `SandomDocument`, `evaluateComponentModule`, `renderComponent`,
+  `renderInput`, `renderInBrowserWorker`, `planAutomaticViewport`,
+  `recommendMotionCapture`, `RenderPlanningError`, `loadFont`,
+  `createCanvasPresenter`, `createGpuCompositor`, `encodeImage`,
+  `OUTPUT_FORMATS`, `validateOutputRequest`, `createGifRecorder`, and
+  `quantizeWorkingPixels`.
 - `sandom/runtime` — the bundler-safe `createSandomRuntime` entry.
-- `sandom` — scene renderer: `createSandomRuntime`,
-  `createLayoutArtifact`, `createDisplayListArtifact`,
-  `createInvalidationArtifact`, and `renderScenePixels`.
 - `sandom/dom` — the public DOM facade: `createSandomRuntime`,
-  `createSandomDOM`, `renderComponent`, render planning, inspection, and
-  browser-worker rendering.
+  `createSandomDOM`, `createRenderSurface`, `renderComponent`, document
+  sessions, render planning, inspection, and browser-worker rendering.
 - `sandom/web-component` — the `<sandom-renderer>` browser component.
 - `sandom/font-registry` — `loadFont` and the font family registry.
+- `sandom/gpu-compositor` — `createGpuCompositor`, the same-device texture and
+  text compositor.
+- `sandom/adaptive-jpeg` — the focused gain-map JPEG encoder, inspector, and
+  reconstruction.
+- `sandom/output` — `encodeImage`, `OUTPUT_FORMATS`, and
+  `validateOutputRequest`.
+- `sandom/color-transform` — `quantizeWorkingPixels` and the output color
+  transform.
+- `sandom/jsx-runtime` — the JSX automatic runtime for Sandom documents.
 - `sandom/gpu` — runtime-conditional `navigator.gpu` mounting.
 - `sandom/adapters/vite` — the optional Vite development adapter.
 - `sandom/adapters/compiled-application` — the public browser-application

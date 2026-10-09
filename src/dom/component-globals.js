@@ -5,6 +5,7 @@ import {
   SDHTMLButtonElement,
   SDHTMLCanvasElement,
   SDHTMLElement,
+  SDHTMLFormElement,
   SDHTMLIFrameElement,
   SDHTMLInputElement,
   SDHTMLScriptElement,
@@ -29,10 +30,14 @@ import {
   addEventListener as addComponentEventListener,
   dispatchEvent as dispatchComponentEvent,
   removeEventListener as removeComponentEventListener,
+  SDClipboardEvent,
+  SDDataTransfer,
   SDFocusEvent,
   SDKeyboardEvent,
   SDMouseEvent,
   SDPointerEvent,
+  SDSubmitEvent,
+  SDToggleEvent,
 } from "./events.js";
 import {
   CSS,
@@ -66,12 +71,21 @@ import {
   Screen,
   ScreenOrientation,
 } from "./component-environment.js";
+import { scrollRead } from "./scroll-core.js";
 
 const animationFrameOwnerFinalizer = new FinalizationRegistry(
   ({ coreReference, owner }) => {
     coreReference.deref()?.status("animation_frame_surface_discard", owner);
   },
 );
+
+// window.scrollX and scrollY (and the visual viewport's page offsets): the
+// effective offset, slot 2 left or 3 top, of the component surface's
+// viewport.
+function viewportScrollOffset(document, slot) {
+  const surface = document._componentRenderSurface;
+  return surface ? scrollRead(surface.viewport, slot) : 0;
+}
 
 let ambientComponentOwnership = null;
 let ambientFilePreparationCount = 0;
@@ -196,16 +210,20 @@ export function installComponentGlobals(
     Element: SDElement,
     HTMLElement: SDHTMLElement,
     SVGElement: SDSVGElement,
+    ClipboardEvent: SDClipboardEvent,
+    DataTransfer: SDDataTransfer,
     FocusEvent: SDFocusEvent,
     KeyboardEvent: SDKeyboardEvent,
     MouseEvent: SDMouseEvent,
     PointerEvent: SDPointerEvent,
+    SubmitEvent: SDSubmitEvent,
+    ToggleEvent: SDToggleEvent,
     HTMLButtonElement: SDHTMLButtonElement,
     HTMLCanvasElement: SDHTMLCanvasElement,
     GPUCanvasContext: SandomGPUCanvasContext,
     HTMLTemplateElement: SDHTMLTemplateElement,
     HTMLInputElement: SDHTMLInputElement,
-    HTMLFormElement: SDHTMLElement,
+    HTMLFormElement: SDHTMLFormElement,
     HTMLOptionElement: SDHTMLElement,
     HTMLSelectElement: SDHTMLSelectElement,
     HTMLTextAreaElement: SDHTMLElement,
@@ -358,11 +376,11 @@ export function installComponentGlobals(
     offsetTop: { enumerable: true, value: 0 },
     pageLeft: {
       enumerable: true,
-      get: () => document._componentRenderSurface?.viewport.scrollLeft ?? 0,
+      get: () => viewportScrollOffset(document, 2),
     },
     pageTop: {
       enumerable: true,
-      get: () => document._componentRenderSurface?.viewport.scrollTop ?? 0,
+      get: () => viewportScrollOffset(document, 3),
     },
     scale: { enumerable: true, value: 1 },
   });
@@ -536,19 +554,19 @@ export function installComponentGlobals(
     },
     pageXOffset: {
       configurable: true,
-      get: () => document._componentRenderSurface?.viewport.scrollLeft ?? 0,
+      get: () => viewportScrollOffset(document, 2),
     },
     pageYOffset: {
       configurable: true,
-      get: () => document._componentRenderSurface?.viewport.scrollTop ?? 0,
+      get: () => viewportScrollOffset(document, 3),
     },
     scrollX: {
       configurable: true,
-      get: () => document._componentRenderSurface?.viewport.scrollLeft ?? 0,
+      get: () => viewportScrollOffset(document, 2),
     },
     scrollY: {
       configurable: true,
-      get: () => document._componentRenderSurface?.viewport.scrollTop ?? 0,
+      get: () => viewportScrollOffset(document, 3),
     },
   });
   // devicePixelRatio follows the live session deviceScale the same way

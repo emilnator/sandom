@@ -43,6 +43,11 @@ export function createTextPreparationRuntime(engine) {
 
       let released = false;
       let results = 0;
+      // A batch's results never change, and a sparse write keeps the batch
+      // only while every row's run is the one it prepared (a row that stops
+      // or starts being text changes its run): one copy serves every frame
+      // of the batch.
+      let copiedRuns = null;
       const assertLive = () => {
         if (released) throw new Error("text preparation batch is released");
       };
@@ -55,9 +60,11 @@ export function createTextPreparationRuntime(engine) {
         resultsBase,
         // Owned copies for inspection artifacts only.
         copyRuns() {
+          assertLive();
+          if (copiedRuns !== null) return copiedRuns;
           const base = resultsBase();
           const view = new DataView(engine.memory.buffer);
-          return nodes.map((node, index) => {
+          copiedRuns = Object.freeze(nodes.map((node, index) => {
             if (node.display !== "text") return null;
             const result = base + index * TEXT_PREPARATION_RESULT_SIZE;
             const bytes = view.getUint32(result + TEXT_PREPARATION_RESULT.BYTES, true);
@@ -91,7 +98,8 @@ export function createTextPreparationRuntime(engine) {
                 true,
               ),
             });
-          });
+          }));
+          return copiedRuns;
         },
         release() {
           assertLive();

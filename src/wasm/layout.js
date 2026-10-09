@@ -153,14 +153,15 @@ export const BATCH_OFFSET_COMMAND_START = 0x04; // u32: byte offset into command
 export const BATCH_OFFSET_COMMAND_COUNT = 0x08; // u32: number of commands in batch
 
 // =======================================================================
-// Layout buffer (2,251 fixed-size records at 0x2B40 initially; grows)
+// Layout buffer (2,228 fixed-size records at 0x2B40 initially; grows)
 // =======================================================================
 //
 // The serialized DOM tree. Written by JS, read by WASM.
 // Each node is a fixed-size record (see LAYOUT_NODE_* constants below).
 // The buffer is a flat array of nodes in depth-first pre-order.
 //
-// This region is the INITIAL map only (2,251 records). A scene with more
+// This region is the INITIAL map only (2,228 records; the node-indexed side
+// tables below hold 2,251 rows, more than the buffer). A scene with more
 // nodes makes the engine move this buffer and every node-indexed side
 // table (computed, pristine, table-grid and previous painted boxes,
 // subtree info, layout cache, scroll table, emission history, scope
@@ -171,7 +172,7 @@ export const BATCH_OFFSET_COMMAND_COUNT = 0x08; // u32: number of commands in ba
 // The composed engine synchronizes DOM table addresses natively; these
 // constants describe the map verifyLayout checks at load, never a live address.
 export const LAYOUT_BUFFER_BASE = 0x00002B40;
-export const LAYOUT_BUFFER_SIZE = 0x001A1C60; // 2,251 nodes * 760 B (initial)
+export const LAYOUT_BUFFER_SIZE = 0x001A1C60; // 2,228 nodes * 768 B (initial)
 
 // --- Layout node record (LAYOUT_NODE_SIZE bytes) — STYLE ONLY (Slice 2) ---
 //
@@ -211,7 +212,13 @@ export const LAYOUT_BUFFER_SIZE = 0x001A1C60; // 2,251 nodes * 760 B (initial)
 // LAYOUT_NODE_OFFSET_BG_CENTER_X_TAG's own comment for the full
 // rationale (no safe alias existed; the free tail sits on the wrong side
 // of CHANGED_GEN for session.js's write-if-changed diffing).
-export const LAYOUT_NODE_SIZE = 760;
+//
+// The tail 0x2F8..0x2FF holds orphans (0x2F8) and widows (0x2F9) (see
+// LAYOUT_NODE_OFFSET_ORPHANS), an SVG shape's currentcolor paint bits
+// (0x2FA, LAYOUT_NODE_OFFSET_SVG_PAINT_CURRENT_COLOR), line-break and
+// word-break (0x2FB, LAYOUT_NODE_OFFSET_LINE_BREAK) and the paint-only
+// generation, a u32 at 0x2FC..0x2FF (LAYOUT_NODE_OFFSET_PAINT_GEN).
+export const LAYOUT_NODE_SIZE = 768;
 
 export const LAYOUT_NODE_OFFSET_CHILD_OFFSET = 0x00; // u32: byte offset to first child
 export const LAYOUT_NODE_OFFSET_CHILD_COUNT = 0x04; // u16: number of children
@@ -272,7 +279,9 @@ export const LAYOUT_NODE_OFFSET_INSET_TOP_TAG = 0xD5; // u8
 export const LAYOUT_NODE_OFFSET_INSET_RIGHT_TAG = 0xD6; // u8
 export const LAYOUT_NODE_OFFSET_INSET_BOTTOM_TAG = 0xD7; // u8
 export const LAYOUT_NODE_OFFSET_INSET_LEFT_TAG = 0xD8; // u8
-// 0xD9..0xDC padding (3 bytes) to realign f32s.
+// 0xD9 holds COLUMN_SPAN (declared with the multi-column fields below);
+// 0xDA holds NATIVE_APPEARANCE (declared with COLUMN_SPAN); 0xDB holds
+// EMPTY_CELLS (declared with the table fields).
 export const LAYOUT_NODE_OFFSET_INSET_TOP = 0xDC; // f32
 export const LAYOUT_NODE_OFFSET_INSET_RIGHT = 0xE0; // f32
 export const LAYOUT_NODE_OFFSET_INSET_BOTTOM = 0xE4; // f32
@@ -298,7 +307,26 @@ export const LAYOUT_NODE_OFFSET_FLEX_BASIS_TAG = 0xF1; // u8: 0=auto,1=length,2=
 // value of an auto edge is 0 (writer convention); consumers that distribute
 // free space read this mask.
 export const LAYOUT_NODE_OFFSET_MARGIN_AUTO = 0xF2; // u8 bitmask (see MARGIN_AUTO_*)
-// 0xF3 padding
+// Where a box came from in the flow, for an out-of-flow box's static
+// position (css-position 3 §3.5; Blink's PlaceOutOfFlowObjects): an
+// anonymous block run (the block holding a container's inline content
+// beside its blocks), and an out-of-flow box whose display was
+// inline-level before blockification. Such a box sits in the last line
+// of the run before it, at the line's top and after its content; a
+// block-level one sits below the run. Before CHANGED_GEN, so the
+// write-if-changed diff compares it with the other style bytes.
+export const LAYOUT_NODE_OFFSET_FLOW_ORIGIN = 0xF3; // u8: FLOW_ORIGIN_* bits
+export const FLOW_ORIGIN_ANONYMOUS_RUN = 0x01;
+export const FLOW_ORIGIN_INLINE_LEVEL = 0x02;
+// content-visibility: hidden (CSS Contain 2, 4.1) on a box that size
+// containment applies to. The engine sizes the box as if it had no
+// contents: its auto block size and its intrinsic inline sizes take none,
+// and its contents add nothing to its scrollable overflow. The contents
+// still lay out, so their geometry stays readable; the core writes their
+// records visibility: hidden, so they paint nothing. Shares the
+// FLOW_ORIGIN byte.
+export const LAYOUT_NODE_OFFSET_CONTAINMENT = 0xF3; // u8 bit 2, aliases FLOW_ORIGIN
+export const CONTAINMENT_CONTENT_HIDDEN = 0x04;
 export const LAYOUT_NODE_OFFSET_FLEX_GROW = 0xF4; // f32
 export const LAYOUT_NODE_OFFSET_FLEX_SHRINK = 0xF8; // f32
 export const LAYOUT_NODE_OFFSET_FLEX_BASIS = 0xFC; // f32
@@ -319,7 +347,27 @@ export const LAYOUT_NODE_OFFSET_FONT_STYLE = 0x10B; // u8: 0=normal, 1=italic
 export const LAYOUT_NODE_OFFSET_FONT_SIZE = 0x10C; // f32
 export const LAYOUT_NODE_OFFSET_LINE_HEIGHT_TAG = 0x110; // u8: 0=normal,1=length,2=number
 export const LAYOUT_NODE_OFFSET_TEXT_ALIGN = 0x111; // u8: 0=left,1=center,2=right
-// 0x112..0x114 padding to realign the f32 below
+// Which animatable inherited fields this node took from its parent
+// (design/animations.md, "Inherited properties"). The animation tick
+// propagates a sampled value into descendants whose bit is set and
+// stops at one whose bit is clear. Scene-spec writers leave it zero.
+export const LAYOUT_NODE_OFFSET_INHERITED_MASK = 0x112; // u8 bitmask (see INHERITED_MASK_*)
+// A DISPLAY_TEXT node that is a list item's ::marker. Zero for every other
+// node. Bits 0-2 are the marker style (LIST_MARKER_DISC/CIRCLE/SQUARE paint
+// Chrome's geometric symbol instead of glyphs, LIST_MARKER_DISCLOSURE_CLOSED/
+// OPEN its disclosure triangle; LIST_MARKER_COUNTER is text such as "3. ");
+// LIST_MARKER_OUTSIDE marks list-style-position: outside,
+// which takes the marker out of its list item's flow: the list item places
+// it beside its first line.
+export const LAYOUT_NODE_OFFSET_LIST_MARKER = 0x113; // u8
+export const LIST_MARKER_STYLE_MASK = 0x07;
+export const LIST_MARKER_DISC = 1;
+export const LIST_MARKER_CIRCLE = 2;
+export const LIST_MARKER_SQUARE = 3;
+export const LIST_MARKER_COUNTER = 4;
+export const LIST_MARKER_DISCLOSURE_CLOSED = 5;
+export const LIST_MARKER_DISCLOSURE_OPEN = 6;
+export const LIST_MARKER_OUTSIDE = 0x08;
 export const LAYOUT_NODE_OFFSET_LINE_HEIGHT = 0x114; // f32 (length px or ×fontSize number)
 export const LAYOUT_NODE_OFFSET_TEXT_COLOR = 0x118; // f32[4] (rgba) — CMD_TEXT's fill color
 // text ends at 0x128 = 296; style ends at 0x128
@@ -394,10 +442,14 @@ export const TEXT_BEHAVIOR_ELLIPSIS = 0x01;
 export const TEXT_BEHAVIOR_NOWRAP = 0x02;
 export const TEXT_BEHAVIOR_BREAK_ANYWHERE = 0x04;
 export const TEXT_BEHAVIOR_PRESERVE_SPACES = 0x08;
+// overflow-wrap: break-word. The line breaker splits an overflowing word at
+// a cluster boundary only when its line has no other break opportunity;
+// min-content is unchanged (unlike BREAK_ANYWHERE).
+export const TEXT_BEHAVIOR_BREAK_WORD = 0x10;
 export const LAYOUT_NODE_OFFSET_TABLE_LAYOUT = 0x139; // u8: 0=auto,1=fixed (plans/layout/PLAN-layout-tables.md)
 export const LAYOUT_NODE_OFFSET_BORDER_COLLAPSE = 0x13A; // u8: 0=separate,1=collapse (plans/layout/PLAN-layout-tables.md)
 export const LAYOUT_NODE_OFFSET_CAPTION_SIDE = 0x13B; // u8: 0=top,1=bottom (plans/layout/PLAN-layout-tables.md)
-export const LAYOUT_NODE_OFFSET_EMPTY_CELLS = 0x0F2; // u8: 0=show,1=hide
+export const LAYOUT_NODE_OFFSET_EMPTY_CELLS = 0x0DB; // u8: 0=show,1=hide
 export const LAYOUT_NODE_OFFSET_GRID_AUTO_FLOW = 0x13C; // u8: row/column + dense bit (plans/layout/PLAN-layout-grid.md)
 export const LAYOUT_NODE_OFFSET_ALIGN_CONTENT = 0x13D; // u8 (grid; reuses JUSTIFY_* enum space)
 export const LAYOUT_NODE_OFFSET_JUSTIFY_ITEMS = 0x13E; // u8 (grid; reuses JUSTIFY_* enum space; plans/layout/PLAN-layout-grid.md)
@@ -511,6 +563,32 @@ export const LAYOUT_NODE_OFFSET_SVG_VIEW_BOX_WIDTH = 0x1F4; // f32, aliases SVG_
 export const LAYOUT_NODE_OFFSET_SVG_VIEW_BOX_HEIGHT = 0x1F8; // f32, aliases SVG_FILL_COLOR.a
 export const LAYOUT_NODE_OFFSET_SVG_HAS_VIEW_BOX = 0x141; // u8, aliases SVG_FILL_RULE: 0=no viewBox (use intrinsic px), 1=has viewBox
 export const LAYOUT_NODE_OFFSET_SVG_PRESERVE_ASPECT_RATIO = 0x142; // u8, aliases SVG_LINE_CAP: PRESERVE_ASPECT_RATIO_* enum
+// <textarea> intrinsic size (Blink's TextAreaIntrinsicInlineSize and
+// TextAreaIntrinsicBlockSize). A textarea is never an svg shape, so these
+// alias the shape-only stroke color, and LAYOUT_FLAG_TEXTAREA names the
+// meaning. The engine resolves the font-dependent parts: width = ceil(average
+// character width x cols) + INLINE_SCROLLBAR, height = line height x rows +
+// BLOCK_SCROLLBAR. The scrollbar terms are px, already resolved from
+// overflow and scrollbar-width.
+export const LAYOUT_NODE_OFFSET_TEXTAREA_COLS = 0x1FC; // f32, aliases SVG_STROKE_COLOR.r
+export const LAYOUT_NODE_OFFSET_TEXTAREA_ROWS = 0x200; // f32, aliases SVG_STROKE_COLOR.g
+export const LAYOUT_NODE_OFFSET_TEXTAREA_INLINE_SCROLLBAR = 0x204; // f32 px, aliases SVG_STROKE_COLOR.b
+export const LAYOUT_NODE_OFFSET_TEXTAREA_BLOCK_SCROLLBAR = 0x208; // f32 px, aliases SVG_STROKE_COLOR.a
+// MathML box fields (plans/layout/PLAN-mathml-layout.md). A math box
+// (DISPLAY_MATH, DISPLAY_BLOCK_MATH, or an mtd cell) is never an svg node, a
+// textarea, or a grid container, so these alias the SVG fill and stroke
+// colors (and the grid percentage and textarea aliases over them).
+export const LAYOUT_NODE_OFFSET_MATH_KIND = 0x1EC; // u8 MATH_KIND_*
+export const LAYOUT_NODE_OFFSET_MATH_FLAGS = 0x1ED; // u8 MATH_FLAG_*
+export const LAYOUT_NODE_OFFSET_MATH_OPERATOR_FLAGS = 0x1EE; // u8 MATH_OPERATOR_*
+export const LAYOUT_NODE_OFFSET_MATH_SPACE_UNITS = 0x1EF; // u8: default lspace (bits 0-3) and rspace (4-7) in 1/18 em
+export const LAYOUT_NODE_OFFSET_MATH_LSPACE = 0x1F0; // f32 px or percent, by MATH_TAGS
+export const LAYOUT_NODE_OFFSET_MATH_RSPACE = 0x1F4; // f32 px or percent, by MATH_TAGS
+export const LAYOUT_NODE_OFFSET_MATH_CODE_POINT = 0x1F8; // u32: the token's single code point, else 0xFFFF
+export const LAYOUT_NODE_OFFSET_MATH_LENGTH = 0x1FC; // f32: mfrac linethickness or mspace width
+export const LAYOUT_NODE_OFFSET_MATH_MIN_SIZE = 0x200; // f32: mo minsize, or mspace height
+export const LAYOUT_NODE_OFFSET_MATH_MAX_SIZE = 0x204; // f32: mo maxsize, or mspace depth
+export const LAYOUT_NODE_OFFSET_MATH_TAGS = 0x208; // u16: MATH_LENGTH_* pairs (see MATH_LENGTH_DEFAULT)
 export const LAYOUT_NODE_OFFSET_BG_GRADIENT_GEOMETRY = 0x20C; // f32[4]: linear{dx,dy,length,pad} / radial{cx,cy,rx,ry} / conic{cx,cy,angle,pad} (P4)
 export const LAYOUT_NODE_OFFSET_CLIP_PATH_GEOMETRY = 0x21C; // f32[5] (P9)
 
@@ -688,7 +766,7 @@ export const LAYOUT_NODE_OFFSET_RADIAL_EXPLICIT_RY = 0x264; // f32
 // clip-path (design/paint-coverage.md P9): ONE-BASED index into
 // CLIP_PATH_POOL (pool entry k is stored as k+1); 0 = none, so a zeroed
 // struct naturally reads as "no clip-path" and hand-written node writers
-// (test/helpers/scene.js, test/oracle/sandom-layout.js, src/session.js —
+// (test/helpers/scene.js, test/oracle/sandom-layout.js—
 // they all zero the struct first) need no knowledge of this field.
 // Sits BEFORE CHANGED_GEN so change tracking sees it.
 export const LAYOUT_NODE_OFFSET_CLIP_PATH_INDEX = 0x268; // u16
@@ -700,10 +778,74 @@ export const LAYOUT_NODE_OFFSET_CLIP_PATH_INDEX = 0x268; // u16
 export const LAYOUT_NODE_OFFSET_SCROLL_LEFT = 0x294; // i32 LayoutUnits: requested scrollLeft
 export const LAYOUT_NODE_OFFSET_SCROLL_TOP = 0x298; // i32 LayoutUnits: requested scrollTop
 export const LAYOUT_NODE_OFFSET_POSITION_STICKY = 0x29C; // u8: paint-time sticky constraints enabled
+// The shaping context of the node: its content language (HTML "The lang
+// and xml:lang attributes": the lang attribute of the nearest inclusive
+// ancestor element that has one) and its font feature set, as an index
+// into LANGUAGE_TABLE and LANGUAGE_TABLE_FEATURES; 0 when the node has
+// neither. The DOM core writes it for every box, text included.
+export const LAYOUT_NODE_OFFSET_LANGUAGE = 0x29D; // u8: LANGUAGE_TABLE index
+// The authored font stack of a text node (plans/PLAN-font-fallback.md):
+// a FONT_STACK_TABLE index, or 0 for a stack of LAYOUT_NODE_OFFSET_FONT_INDEX
+// alone. Past CHANGED_GEN, so the core's row diff compares it explicitly.
+export const LAYOUT_NODE_OFFSET_FONT_STACK = 0x29E; // u16
 export const LAYOUT_NODE_OFFSET_OVERFLOW_CLIP_MARGIN = 0x2A0; // f32 px
-export const LAYOUT_NODE_OFFSET_OVERFLOW_CLIP_BOX = 0x2A4; // u8: 0=padding,1=border,2=content
-export const LAYOUT_NODE_OFFSET_DIRECTION_RTL = 0x2A5; // u8: exposed horizontal scroll origin is right
-// background-origin (BUG-background-origin-not-modeled.md): the box the
+export const LAYOUT_NODE_OFFSET_OVERFLOW_CLIP_BOX = 0x2A4; // u8 bits 0-1 (SCROLLBAR_CLIP_BOX_MASK): 0=padding,1=border,2=content
+export const LAYOUT_NODE_OFFSET_SCROLL_ORIGIN_RIGHT = 0x2A5; // u8 bit 0 (SCROLLBAR_ORIGIN_RIGHT_MASK): exposed horizontal scroll origin is right
+// Classic scrollbars (plans/PLAN-native-scrollbars.md, decision 3). A
+// classic bar takes its thickness from the scroll container's content box:
+// the record holds it as extra padding on the bar's side. Overlay bars take
+// no space and set none of these bits.
+//
+// SCROLLBAR_LAYOUT shares the OVERFLOW_CLIP_BOX byte (bits 2-7). The core
+// writes it from style: the thickness code, the side of the vertical bar,
+// and the reservations it already added to the padding (overflow: scroll,
+// scrollbar-gutter: stable).
+//
+// SCROLLBAR_STATE shares the SCROLL_ORIGIN_RIGHT byte (bits 1-4). The core
+// writes the AUTO bits: an overflow: auto axis takes a bar only when its
+// content overflows. The engine decides that after a full layout pass, adds
+// the bar to the padding, sets the APPLIED bit, and lays out again
+// (engine-flex.watpart, $settleClassicScrollbars). The core's row diff
+// compares the row without its applied bars and keeps them on a row that
+// did not change (core-transport.watpart).
+export const LAYOUT_NODE_OFFSET_SCROLLBAR_LAYOUT = 0x2A4; // u8 bits 2-7, aliases OVERFLOW_CLIP_BOX
+export const LAYOUT_NODE_OFFSET_SCROLLBAR_STATE = 0x2A5; // u8 bits 1-4, aliases SCROLL_ORIGIN_RIGHT
+export const SCROLLBAR_CLIP_BOX_MASK = 0x03;
+export const SCROLLBAR_ORIGIN_RIGHT_MASK = 0x01;
+export const SCROLLBAR_THICKNESS_SHIFT = 2; // 2 bits: 0 = no bar, 1 = regular, 2 = thin
+export const SCROLLBAR_THICKNESS_MASK = 0x0C;
+export const SCROLLBAR_VERTICAL_LEFT = 0x10; // the vertical bar is on the left (direction: rtl)
+export const SCROLLBAR_BOTH_EDGES = 0x20; // scrollbar-gutter: stable both-edges reserved both sides
+export const SCROLLBAR_VERTICAL_RESERVED = 0x40; // the vertical bar's side is in the padding
+export const SCROLLBAR_HORIZONTAL_RESERVED = 0x80; // the bottom bar is in the padding
+export const SCROLLBAR_VERTICAL_AUTO = 0x02; // overflow-y: auto
+export const SCROLLBAR_HORIZONTAL_AUTO = 0x04; // overflow-x: auto
+export const SCROLLBAR_VERTICAL_APPLIED = 0x08; // the engine added the vertical bar
+export const SCROLLBAR_HORIZONTAL_APPLIED = 0x10; // the engine added the horizontal bar
+// Chromium's macOS classic thickness (scrollbar_theme_mac.cc), CSS px.
+export const SCROLLBAR_REGULAR_THICKNESS = 15;
+export const SCROLLBAR_THIN_THICKNESS = 11;
+// The unicode-bidi keyword in bits 0-3 (UNICODE_BIDI_NORMAL through
+// UNICODE_BIDI_PLAINTEXT). Bit 7 (UNICODE_BIDI_TEXT_ALIGN_LOGICAL) is set
+// when TEXT_ALIGN was resolved from start, end, justify or no value: a
+// unicode-bidi: plaintext container mirrors that alignment on each line
+// whose paragraph direction differs from its own direction.
+export const LAYOUT_NODE_OFFSET_UNICODE_BIDI = 0x2A6; // u8
+export const UNICODE_BIDI_NORMAL = 0;
+export const UNICODE_BIDI_EMBED = 1;
+export const UNICODE_BIDI_ISOLATE = 2;
+export const UNICODE_BIDI_BIDI_OVERRIDE = 3;
+export const UNICODE_BIDI_ISOLATE_OVERRIDE = 4;
+export const UNICODE_BIDI_PLAINTEXT = 5;
+export const UNICODE_BIDI_KEYWORD_MASK = 0x0F;
+export const UNICODE_BIDI_TEXT_ALIGN_LOGICAL = 0x80;
+// 1 when the box's CSS direction is rtl: its inline formatting context
+// starts lines at the line-right edge, resolves text-align start/end, and
+// orders mixed-direction content with the Unicode Bidirectional Algorithm;
+// an inline box with this bit puts its start edges on its right side.
+export const LAYOUT_NODE_OFFSET_INLINE_DIRECTION_RTL = 0x2A7; // u8
+// background-origin (BUG-background-origin-not-modeled, resolved; see
+// activity/reports/REPORT-2026-10-09-resolved-bug-records.md): the box the
 // background POSITIONING area is (gradient geometry, bg-image layer
 // size/position/tile anchor) — independent of BACKGROUND_CLIP, which
 // keeps governing only the clip. 0 = padding-box so a zeroed struct
@@ -824,6 +966,91 @@ export const LAYOUT_NODE_OFFSET_TRANSFORM_KIND = 0x2D5; // u8
 export const LAYOUT_NODE_OFFSET_TRANSFORM_PERCENT = 0x2E8; // f32[4]: ew, eh, fw, fh
 export const TRANSFORM_KIND_RESOLVED = 0;
 export const TRANSFORM_KIND_CSS = 1;
+// Multi-column containers (CSS Multi-column Layout 1). A block container is
+// a multi-column container when its column count is set or its column width
+// is positive. COLUMN_WIDTH shares its bytes with BORDER_SPACING_X: a
+// multi-column container is never a table. COLUMN_GAP holds the used gap in
+// pixels, or -1 for `normal` (1em), plus GRID_COLUMN_GAP_PERCENTAGE as a
+// fraction of the content width.
+export const LAYOUT_NODE_OFFSET_COLUMN_COUNT = 0x2D6; // u8: 0=auto, else the count (clamped to 255)
+export const LAYOUT_NODE_OFFSET_BREAK_INSIDE = 0x2D7; // u8: BREAK_INSIDE_*
+export const LAYOUT_NODE_OFFSET_COLUMN_WIDTH = 0x198; // f32: px; 0=auto (aliases BORDER_SPACING_X)
+export const BREAK_INSIDE_AUTO = 0;
+export const BREAK_INSIDE_AVOID = 1;
+// orphans and widows (CSS Fragmentation 3): the least line boxes a column
+// fragment of a block keeps before and after a break inside it. Inherited
+// integers, default 2, clamped to 1..255. 0x2FB holds
+// LAYOUT_NODE_OFFSET_LINE_BREAK; 0x2FC..0x2FF hold
+// LAYOUT_NODE_OFFSET_PAINT_GEN.
+export const LAYOUT_NODE_OFFSET_ORPHANS = 0x2F8; // u8
+export const LAYOUT_NODE_OFFSET_WIDOWS = 0x2F9; // u8
+// An SVG shape whose fill or stroke is `currentcolor` (CSS Color 4: the
+// keyword computes to itself, so its used value is the shape's own
+// `color`). The shape paints that paint with TEXT_COLOR, which a running
+// `color` animation samples into the shape, rather than SVG_FILL_COLOR or
+// SVG_STROKE_COLOR, which hold the color when the record was written.
+export const LAYOUT_NODE_OFFSET_SVG_PAINT_CURRENT_COLOR = 0x2FA; // u8: SVG_PAINT_CURRENT_COLOR_* bits
+export const SVG_PAINT_CURRENT_COLOR_FILL = 0x01;
+export const SVG_PAINT_CURRENT_COLOR_STROKE = 0x02;
+// line-break (CSS Text 3 §5.3) in bits 0-2, word-break (§5.2) in bits 3-4
+// and text-spacing-trim (CSS Text 4 §9.2) in bits 5-6. All are inherited;
+// the DOM core writes them for every box beside TEXT_BEHAVIOR.
+// word-break: normal sets neither word-break bit; word-break: break-word
+// sets neither and sets TEXT_BEHAVIOR_BREAK_ANYWHERE, as
+// overflow-wrap: anywhere does.
+export const LAYOUT_NODE_OFFSET_LINE_BREAK = 0x2FB; // u8: LINE_BREAK_* | WORD_BREAK_* | TEXT_SPACING_TRIM_*
+export const LINE_BREAK_AUTO = 0;
+export const LINE_BREAK_LOOSE = 1;
+export const LINE_BREAK_NORMAL = 2;
+export const LINE_BREAK_STRICT = 3;
+export const LINE_BREAK_ANYWHERE = 4;
+export const LINE_BREAK_STRICTNESS_MASK = 0x07;
+export const WORD_BREAK_BREAK_ALL = 0x08;
+export const WORD_BREAK_KEEP_ALL = 0x10;
+export const TEXT_SPACING_TRIM_SHIFT = 5;
+export const TEXT_SPACING_TRIM_MASK = 0x60;
+export const TEXT_SPACING_TRIM_NORMAL = 0x00;
+export const TEXT_SPACING_TRIM_SPACE_ALL = 0x20;
+export const TEXT_SPACING_TRIM_SPACE_FIRST = 0x40;
+export const TEXT_SPACING_TRIM_TRIM_START = 0x60;
+// The generation of the node's last paint-only change: a change of fields
+// no layout function reads (the DOM core's EngineFrameFact flag 8). Such a
+// change leaves CHANGED_GEN, the layout's generation, as it was, so every
+// layout cache and the whole-pass reuse keep; paint and damage read the
+// larger of the two. A writer that stamps CHANGED_GEN needs no knowledge of
+// this field. Past the tracked style bytes, like CHANGED_GEN itself.
+export const LAYOUT_NODE_OFFSET_PAINT_GEN = 0x2FC; // u32
+// column-rule and column-fill of a multi-column container. They alias
+// fields that only grid and table boxes read, and the record writer stores
+// them only for a multi-column container, so a grid or table element keeps
+// its own values. COLUMN_RULE_STYLE is a BORDER_STYLE_* value (NONE when
+// unset); COLUMN_RULE_WIDTH is the used width in px, zero for none and
+// hidden; COLUMN_RULE_COLOR is RGBA f32 with currentcolor resolved.
+export const LAYOUT_NODE_OFFSET_COLUMN_RULE_WIDTH = 0x19C; // f32 px (aliases BORDER_SPACING_Y)
+export const LAYOUT_NODE_OFFSET_COLUMN_RULE_COLOR = 0x1CC; // f32[4] (aliases GRID_AUTO_ROWS_MIN..GRID_AUTO_COLS_MAX)
+export const LAYOUT_NODE_OFFSET_COLUMN_RULE_STYLE = 0x270; // u8: BORDER_STYLE_* (aliases GRID_AUTO_ROWS_MIN_TYPE)
+export const LAYOUT_NODE_OFFSET_COLUMN_FILL = 0x271; // u8: COLUMN_FILL_* (aliases GRID_AUTO_ROWS_MAX_TYPE)
+export const COLUMN_FILL_BALANCE = 0;
+export const COLUMN_FILL_AUTO = 1;
+// column-span of any box: an in-flow block-level box with COLUMN_SPAN_ALL
+// whose parent is a multi-column container, or a block in its flow that
+// establishes no formatting context, spans every column and splits the
+// columns into rows above and below it.
+export const LAYOUT_NODE_OFFSET_COLUMN_SPAN = 0xD9; // u8: COLUMN_SPAN_*
+export const COLUMN_SPAN_NONE = 0;
+export const COLUMN_SPAN_ALL = 1;
+// Native appearance (CSS UI 4 §5.1, `appearance`): the form control a box
+// paints as the platform theme does. The low seven bits name the control,
+// NATIVE_APPEARANCE_CHECKED its checked state. A checkbox or radio paints
+// the control in place of the box's background and border; a menulist
+// paints over them. NONE paints the box as CSS alone describes it.
+export const LAYOUT_NODE_OFFSET_NATIVE_APPEARANCE = 0xDA; // u8
+export const NATIVE_APPEARANCE_NONE = 0;
+export const NATIVE_APPEARANCE_CHECKBOX = 1;
+export const NATIVE_APPEARANCE_RADIO = 2;
+export const NATIVE_APPEARANCE_MENULIST = 3;
+export const NATIVE_APPEARANCE_KIND_MASK = 0x7F;
+export const NATIVE_APPEARANCE_CHECKED = 0x80;
 
 // flex-direction values.
 export const FLEX_ROW = 0;
@@ -857,6 +1084,7 @@ export const SIZE_TAG_LENGTH = 1;
 export const SIZE_TAG_PERCENT = 2;
 export const SIZE_TAG_MIN_CONTENT = 3; // width:min-content
 export const SIZE_TAG_MAX_CONTENT = 4; // width:max-content
+export const SIZE_TAG_FIT_CONTENT = 8; // width/height:fit-content
 export const SIZE_TAG_CALC_PAIR = 5; // animation-only px + percentage-fraction pair
 export const SIZE_TAG_COVER = 6; // background-size:cover (P5c)
 export const SIZE_TAG_CONTAIN = 7; // background-size:contain (P5c)
@@ -891,6 +1119,55 @@ export const DISPLAY_TABLE_COLUMN_GROUP = 18;
 export const DISPLAY_TABLE_CAPTION = 19;
 export const DISPLAY_INLINE_FLEX = 20;
 export const DISPLAY_INLINE_GRID = 21; // atomic inline grid container: participates in its parent IFC like inline-block, lays its own children out as grid
+// MathML Core (plans/layout/PLAN-mathml-layout.md). DISPLAY_MATH is an inline
+// math box: atomic inline-level, laid out by the MathML algorithms. A
+// DISPLAY_BLOCK_MATH box is a block-level math root or any math box inside
+// one; LAYOUT_NODE_OFFSET_MATH_KIND names its algorithm.
+export const DISPLAY_MATH = 22;
+export const DISPLAY_BLOCK_MATH = 23;
+
+// MathML layout algorithms, by element (LAYOUT_NODE_OFFSET_MATH_KIND).
+export const MATH_KIND_NONE = 0;
+export const MATH_KIND_ROW = 1; // math, mrow, mstyle, merror, mphantom, semantics, maction, mprescripts, none, and the anonymous mrow of an mtd
+export const MATH_KIND_TOKEN = 2; // mi, mn, mtext, ms
+export const MATH_KIND_OPERATOR = 3; // mo
+export const MATH_KIND_FRACTION = 4;
+export const MATH_KIND_SQRT = 5;
+export const MATH_KIND_ROOT = 6;
+export const MATH_KIND_SUB = 7;
+export const MATH_KIND_SUP = 8;
+export const MATH_KIND_SUBSUP = 9;
+export const MATH_KIND_UNDER = 10;
+export const MATH_KIND_OVER = 11;
+export const MATH_KIND_UNDEROVER = 12;
+export const MATH_KIND_MULTISCRIPTS = 13;
+export const MATH_KIND_SPACE = 14;
+export const MATH_KIND_PADDED = 15;
+export const MATH_KIND_PRESCRIPTS = 16;
+export const MATH_KIND_TABLE = 17; // an mtable (display table): baseline on the math axis
+export const MATH_KIND_CELL = 18; // an mtd (display table-cell): content is an anonymous mrow, centered
+// LAYOUT_NODE_OFFSET_MATH_FLAGS
+export const MATH_FLAG_DISPLAY_STYLE = 0x01; // math-style: normal
+export const MATH_FLAG_SHIFT_COMPACT = 0x02; // math-shift: compact
+export const MATH_FLAG_ROOT = 0x04; // the <math> element
+export const MATH_FLAG_ACCENT = 0x08; // mover/munderover accent="true"
+export const MATH_FLAG_ACCENT_UNDER = 0x10; // munder/munderover accentunder="true"
+export const MATH_FLAG_SPACE_LIKE = 0x20; // mtext or mspace
+export const MATH_FLAG_GROUPING = 0x40; // a grouping element: mrow, mstyle, mphantom, merror, semantics, maction, math
+export const MATH_FLAG_CELL_ROW = 0x80; // an mtd: its content is an anonymous mrow
+// LAYOUT_NODE_OFFSET_MATH_OPERATOR_FLAGS (mo only)
+export const MATH_OPERATOR_STRETCHY = 0x01;
+export const MATH_OPERATOR_SYMMETRIC = 0x02;
+export const MATH_OPERATOR_LARGEOP = 0x04;
+export const MATH_OPERATOR_MOVABLELIMITS = 0x08;
+export const MATH_OPERATOR_VERTICAL = 0x10;
+export const MATH_OPERATOR_HAS_GLYPH = 0x20; // the base code point maps to a glyph of the primary font
+// LAYOUT_NODE_OFFSET_MATH_TAGS: two bits per length, MATH_LENGTH_* values;
+// lspace bits 0-1, rspace 2-3, line thickness or mspace width 4-5, minsize 6-7,
+// maxsize 8-9.
+export const MATH_LENGTH_DEFAULT = 0;
+export const MATH_LENGTH_PX = 1;
+export const MATH_LENGTH_PERCENT = 2;
 
 // Grid track sizing-function kinds. G1 consumes LENGTH/PERCENT; later Grid
 // slices use the remaining canonical wire values without changing the entry.
@@ -1013,7 +1290,11 @@ export const LAYOUT_FLAG_HAS_GRADIENT = 0x0400;
 // 0x0800 and 0x1000 were LAYOUT_FLAG_MARGIN_LEFT_AUTO / _RIGHT_AUTO; the
 // four auto-margin edges moved into LAYOUT_NODE_OFFSET_MARGIN_AUTO when flex
 // §8.1 needed the block pair too (two bits here could not carry four edges).
-// Free bits.
+// A <textarea>: auto width and height resolve from LAYOUT_NODE_OFFSET_TEXTAREA_*.
+export const LAYOUT_FLAG_TEXTAREA = 0x0800;
+// A menulist <select>: its min- and max-content width is its widest line
+// (the widest option label) rounded up to a whole CSS pixel.
+export const LAYOUT_FLAG_MENULIST = 0x1000;
 export const LAYOUT_FLAG_ESTABLISHES_BFC = 0x2000; // overflow!=visible / flow-root: no margin collapse w/ children
 export const LAYOUT_FLAG_SCROLLABLE_OVERFLOW_X = 0x4000;
 export const LAYOUT_FLAG_SCROLLABLE_OVERFLOW_Y = 0x8000;
@@ -1023,6 +1304,12 @@ export const MARGIN_AUTO_TOP = 0x01;
 export const MARGIN_AUTO_RIGHT = 0x02;
 export const MARGIN_AUTO_BOTTOM = 0x04;
 export const MARGIN_AUTO_LEFT = 0x08;
+
+// NODE_INHERITED_MASK bits.
+export const INHERITED_MASK_TEXT_COLOR = 0x01;
+export const INHERITED_MASK_VISIBILITY = 0x02;
+export const INHERITED_MASK_FONT_SIZE = 0x04;
+export const INHERITED_MASK_LINE_HEIGHT = 0x08;
 
 // =======================================================================
 // Command buffer (512 KB at 0x42B40)
@@ -1038,6 +1325,93 @@ export const COMMAND_BUFFER_BASE = 0x001A4840;
 export const COMMAND_BUFFER_SIZE = 0x00080000; // 512 KB
 
 // --- Command opcodes ---
+// Retained raster execution-plan ABI. Every offset is relative to the plan
+// handle; records and payloads therefore remain valid after memory growth.
+export const RASTER_PLAN_ABI_VERSION = 5;
+export const RASTER_PLAN_MAGIC = 0x4C505253; // "SRPL" little-endian
+export const RASTER_PLAN_HEADER_SIZE = 96;
+export const RASTER_PLAN_RECORD_SIZE = 56;
+export const RASTER_PLAN_CLIP_FLOATS = 160;
+export const RASTER_PLAN_CLIP_PATH_MASK_FLOATS = 24;
+export const RASTER_PLAN_CLIP_ENTRY_SIZE = 756;
+export const RASTER_PLAN_NO_CLIP = 0xFFFFFFFF;
+// A host scrollbar row (raster_plan_prepare and raster_plan_rescroll), all
+// f32: the engine node whose CMD_SCROLLBAR marker paints it (-1 for the
+// viewport's), x, y, width, height in viewport CSS px, r, g, b, a, and one
+// corner radius in CSS px. A marker's rows paint back to front.
+export const RASTER_PLAN_SCROLLBAR_ROW_SIZE = 40;
+
+export const RASTER_PLAN_OFFSET_TOTAL_BYTES = 8;
+export const RASTER_PLAN_OFFSET_RECORD_COUNT = 12;
+export const RASTER_PLAN_OFFSET_SOURCE_BYTES = 16;
+export const RASTER_PLAN_OFFSET_RECORD_TABLE = 20;
+export const RASTER_PLAN_OFFSET_RECORD_STRIDE = 24;
+export const RASTER_PLAN_OFFSET_FEATURE_BITS = 28;
+export const RASTER_PLAN_OFFSET_SOURCE_REVISION = 32;
+export const RASTER_PLAN_OFFSET_WIDTH = 36;
+export const RASTER_PLAN_OFFSET_HEIGHT = 40;
+export const RASTER_PLAN_OFFSET_DEVICE_SCALE = 44;
+export const RASTER_PLAN_OFFSET_RENDER_MODE = 48;
+export const RASTER_PLAN_OFFSET_CLIP_TABLE = 52;
+export const RASTER_PLAN_OFFSET_CLIP_COUNT = 56;
+export const RASTER_PLAN_OFFSET_PAYLOAD_REGION = 60;
+export const RASTER_PLAN_OFFSET_PAYLOAD_BYTES = 64;
+export const RASTER_PLAN_OFFSET_VISIBLE_X = 68;
+export const RASTER_PLAN_OFFSET_VISIBLE_Y = 72;
+export const RASTER_PLAN_OFFSET_CULL_WIDTH = 76;
+export const RASTER_PLAN_OFFSET_CULL_HEIGHT = 80;
+export const RASTER_PLAN_FEATURE_RECT_NATIVE = 1 << 0;
+export const RASTER_PLAN_FEATURE_IMAGE_NATIVE = 1 << 1;
+export const RASTER_PLAN_FEATURE_GRADIENT_NATIVE = 1 << 2;
+export const RASTER_PLAN_FEATURE_SHADOW_NATIVE = 1 << 3;
+export const RASTER_PLAN_BOX_SHADOW_INSTANCE_FLOATS = 36;
+export const RASTER_PLAN_IMAGE_INSTANCE_FLOATS = 18;
+export const RASTER_PLAN_GRADIENT_RECORD_BYTES = 48;
+export const RASTER_PLAN_GRADIENT_STOP_BYTES = 48;
+export const RASTER_PLAN_FEATURE_TEXT_NATIVE = 1 << 4;
+export const RASTER_PLAN_FEATURE_SVG_PATH_NATIVE = 1 << 5;
+export const RASTER_PLAN_TEXT_INSTANCE_FLOATS = 20;
+export const RASTER_PLAN_SVG_PATH_INSTANCE_FLOATS = 23;
+export const RASTER_PLAN_FEATURE_GROUP_NATIVE = 1 << 6;
+export const RASTER_PLAN_FEATURE_FILTER_NATIVE = 1 << 7;
+export const RASTER_PLAN_FEATURE_MASK_NATIVE = 1 << 8;
+export const RASTER_PLAN_GROUP_PUSH_FLOATS = 4;
+export const RASTER_PLAN_GROUP_POP_FLOATS = 214;
+export const RASTER_PLAN_FILTER_LIST_OFFSET = 16;
+export const RASTER_PLAN_FILTER_DESCRIPTOR_BYTES = 12;
+export const RASTER_PLAN_FILTER_UNIFORM_SLOT_BYTES = 80;
+export const RASTER_PLAN_PASS_MATRIX = 1;
+export const RASTER_PLAN_PASS_BOX_BLUR_H = 2;
+export const RASTER_PLAN_PASS_BOX_BLUR_V = 3;
+export const RASTER_PLAN_PASS_DROP_SHADOW = 4;
+export const RASTER_PLAN_PASS_MASK_COMBINE = 5;
+export const RASTER_PLAN_RECORD_FLAG_NEEDS_BACKDROP_COPY = 1 << 8;
+
+export const RASTER_PLAN_RECORD_OFFSET_KIND = 0;
+export const RASTER_PLAN_RECORD_OFFSET_FLAGS = 2;
+export const RASTER_PLAN_RECORD_OFFSET_SOURCE = 4;
+export const RASTER_PLAN_RECORD_OFFSET_SOURCE_BYTES = 8;
+export const RASTER_PLAN_RECORD_OFFSET_CLIP = 12;
+export const RASTER_PLAN_RECORD_OFFSET_PAYLOAD = 16;
+export const RASTER_PLAN_RECORD_OFFSET_PAYLOAD_BYTES = 20;
+export const RASTER_PLAN_RECORD_OFFSET_INSTANCE_COUNT = 24;
+export const RASTER_PLAN_RECORD_OFFSET_RESOURCE = 28;
+export const RASTER_PLAN_RECORD_OFFSET_GRADIENT = 32;
+export const RASTER_PLAN_RECORD_OFFSET_GRADIENT_BYTES = 36;
+// The extent of the target a record's draw can write, in target device
+// pixels: f32 minimum x, minimum y, maximum x, maximum y. A drawing record
+// (rect, text, image, box shadow, SVG path) holds the union of its
+// instances' quads grown by one pixel; every other record is unbounded,
+// -Infinity..Infinity (raster-plan.watpart $rasterPlanWriteRecordBounds).
+export const RASTER_PLAN_RECORD_OFFSET_BOUNDS = 40;
+
+export const RASTER_RESOURCE_GLYPH = 1;
+export const RASTER_RESOURCE_PATH = 2;
+export const RASTER_RESOURCE_IMAGE = 3;
+export const RASTER_RESOURCE_GLYPH_ROW_SIZE = 64;
+export const GLYPH_REQUEST_HEADER_SIZE = 8;
+export const GLYPH_REQUEST_ROW_SIZE = 16;
+
 
 export const CMD_RECT = 0x01;
 export const CMD_TEXT = 0x02;
@@ -1090,6 +1464,16 @@ export const CMD_SET_NODE_OFFSET_INDEX = 0x04; // u32
 export const CMD_SET_SCROLL = 0x14;
 export const CMD_SET_SCROLL_SIZE = 8;
 export const CMD_SET_SCROLL_OFFSET_REF = 0x02; // u16: SCROLL_TABLE index
+// Raster-plan-only replay scissor. Payload rows are {x, y, width, height}
+// device-pixel rectangles; this opcode never appears in command bytes.
+export const CMD_DAMAGE = 0x15;
+// A scroll container's scrollbars, in its outline turn under its ancestors'
+// clips (engine-paint.watpart $emitScrollbarMarker): u32 engine node at
+// offset 4, or 0xFFFFFFFF for the viewport's, painted after every layer.
+// The raster plan expands it from the frame's scrollbar rows.
+export const CMD_SCROLLBAR = 0x16;
+export const CMD_SCROLLBAR_SIZE = 8;
+export const CMD_SCROLLBAR_OFFSET_NODE = 0x04; // u32
 
 // --- Rect command (0x01) ---
 // Slice P2: border color is PER SIDE (4 × rgba, top/right/bottom/left) and
@@ -1194,6 +1578,32 @@ export const CMD_RECT_FLAG_TRANSFORM = 0x08;
 // svg_test.js Chrome-oracle cases fail by 380-450 structural px, with the
 // stroke ring landing 1-3.4px off its true edge).
 export const CMD_RECT_FLAG_NO_PIXEL_SNAP = 0x10;
+// SVG shape geometry also carries this one: its edges take the exact
+// pixel-area coverage SVG paint is judged by (test/helpers/svg-truth.js),
+// where a CSS box keeps the smoothstep ramp its Chrome parity was measured
+// with. A smoothstep departs from area coverage by up to 0.096 where an
+// edge runs horizontal or vertical on screen (measured: a rotated circle's
+// topmost and bottommost pixels, 18-21 bytes off the source truth). The
+// raster plan carries it to the rect shader as bit 16 of the styles word.
+export const CMD_RECT_FLAG_AREA_COVERAGE = 0x20;
+// The border ring is an SVG stroke, not a CSS border: its outer and inner
+// contours are the offset curves of the midline (the border box inset by
+// half the border width on every side) at half the border width. For a
+// circular corner that is the CSS construction; for an elliptical one
+// (an ellipse, a rect with rx != ry) the offset of an ellipse is not an
+// ellipse, and the CSS inner contour (radii minus the width) leaves the
+// ring 0.1 device px too thin around ±60° on a 30x45 ellipse stroked 5
+// wide (BUG-svg-tier-a-ellipse-coverage, resolved; see
+// activity/reports/REPORT-2026-10-07-resolved-bug-records.md). The raster plan
+// carries it to the rect shader as bit 17 of the styles word.
+export const CMD_RECT_FLAG_SVG_STROKE = 0x40;
+// A text decoration line: its y is the text's unsnapped baseline plus a
+// whole-CSS-pixel offset, and the raster plan snaps that y to the device
+// pixel grid, round half up, as it snaps the text run's baseline. The line
+// then keeps its place below or through the glyphs at every device scale:
+// Chrome derives each decoration from the rounded text origin, so a box
+// top of 20.5 moves the glyphs and all three decorations together.
+export const CMD_RECT_FLAG_TEXT_BASELINE = 0x80;
 
 // Byte size / gradient-extension offset for a CMD_RECT record, given its
 // two independent flag bits. The ONLY functions that should ever compute
@@ -1223,7 +1633,10 @@ export function cmdRectGradientOffset(hasTransform) {
 // affine mapping that space to screen pixels:
 //   - flags (u8): enabledX (bit 0), enabledY (bit 1), AFFINE (bit 2 — the
 //     entry carries a non-identity paint transform; without it the rect is
-//     already in final screen coordinates and the affine words are zero).
+//     already in final screen coordinates and the affine words are zero),
+//     PATH_MASK (bit 3), AREA (bit 4 — an SVG viewport: an axis-aligned
+//     rect clips each pixel by the area of the rect inside it instead of
+//     the hard pixel-centre test an overflow clip uses).
 //   - x/y/w/h (f32): the clip rect in the entry's LOCAL space (= layout
 //     coordinates when AFFINE is set, screen coordinates otherwise).
 //   - radii (f32[8]): per-corner ELLIPTICAL radii (Slice P2), CSS corner
@@ -1234,10 +1647,11 @@ export function cmdRectGradientOffset(hasTransform) {
 //     AFFINE flag is clear.
 // A pixel is inside the clip state iff it is inside EVERY entry (each
 // evaluated in its own local space via the inverse affine). Entries that
-// share an affine are pre-intersected by the engine at append time
-// ($clipListAppend), so one entry per distinct transform space reaches the
-// wire — the common all-identity case is exactly one entry, matching the
-// pre-redesign single-rect behavior.
+// share an affine (and the same AREA bit) are pre-intersected by the
+// engine at append time ($clipListAppend), so one entry per distinct
+// transform space and clip kind reaches the wire — the common all-identity
+// HTML case is exactly one entry, matching the pre-redesign single-rect
+// behavior.
 export const CMD_PUSH_CLIP_HEADER_SIZE = 4;
 export const CMD_PUSH_CLIP_OFFSET_FLAGS = 0x01; // u8: reserved, 0
 export const CMD_PUSH_CLIP_OFFSET_COUNT = 0x02; // u8: entry count
@@ -1253,6 +1667,10 @@ export const CLIP_ENTRY_FLAG_ENABLED_X = 0x01;
 export const CLIP_ENTRY_FLAG_ENABLED_Y = 0x02;
 export const CLIP_ENTRY_FLAG_AFFINE = 0x04;
 export const CLIP_ENTRY_FLAG_PATH_MASK = 0x08;
+export const CLIP_ENTRY_FLAG_AREA = 0x10;
+// The affine translation is a color glyph's origin, snapped as
+// CMD_SVG_PATH_FLAG_GLYPH_ORIGIN snaps it.
+export const CLIP_ENTRY_FLAG_GLYPH_ORIGIN = 0x20;
 // D2 piece B: the scroll-table index whose offset positions this entry
 // (clip geometry is unshifted like every other payload). Lives in the
 // entry's trailing pad, so CLIP_ENTRY_SIZE is unchanged.
@@ -1304,6 +1722,26 @@ export const CMD_PUSH_OPACITY_FLAG_BLEND_MASK = 0x1E; // bits 1-4
 export const CMD_PUSH_OPACITY_FLAG_MASK = 0x20; // bit 5
 export const CMD_PUSH_OPACITY_OFFSET_SEGMENT_COUNT = 0x02; // u16 (P8, 0 = no filter)
 export const CMD_PUSH_OPACITY_OFFSET_ALPHA = 0x14; // f32
+// u8: the Porter-Duff operator the pop composites the group with, on
+// premultiplied color over the whole target: COMPOSITE_SOURCE_OVER (0)
+// composites with the blend mode; any other reads the target's pixels
+// (a backdrop copy) and replaces them, clip coverage mixing the result
+// with the backdrop. Color glyph composites (COLRv1 PaintComposite) emit
+// them; numbering follows hb_paint_composite_mode_t's Porter-Duff modes.
+export const CMD_PUSH_OPACITY_OFFSET_COMPOSITE = 0x04;
+export const COMPOSITE_SOURCE_OVER = 0;
+export const COMPOSITE_CLEAR = 1;
+export const COMPOSITE_SOURCE = 2;
+export const COMPOSITE_DESTINATION = 3;
+export const COMPOSITE_DESTINATION_OVER = 4;
+export const COMPOSITE_SOURCE_IN = 5;
+export const COMPOSITE_DESTINATION_IN = 6;
+export const COMPOSITE_SOURCE_OUT = 7;
+export const COMPOSITE_DESTINATION_OUT = 8;
+export const COMPOSITE_SOURCE_ATOP = 9;
+export const COMPOSITE_DESTINATION_ATOP = 10;
+export const COMPOSITE_XOR = 11;
+export const COMPOSITE_PLUS = 12;
 // Filter-segment array starts here, CMD_PUSH_OPACITY_SEGMENT_SIZE bytes
 // per entry, SEGMENT_COUNT entries (P8). Every segment is fixed-size
 // (sized to the larger MATRIX variant) regardless of kind — uniform
@@ -1314,11 +1752,14 @@ export const CMD_PUSH_OPACITY_SEGMENT_SIZE = 84; // 4 (header) + 80 (20 f32, MAT
 export const CMD_PUSH_OPACITY_SEGMENT_OFFSET_KIND = 0x00; // u8
 export const CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD = 0x04; // MATRIX: f32[20] row-major 4x5
 // (R0..R3,RC, G..., B..., A...);
-// BLUR: f32 sigma at payload[0];
-// DROP_SHADOW: dx,dy,sigma f32 at
+// BLUR: f32 sigmaX, sigmaY at payload[0..1];
+// DROP_SHADOW: dx,dy,sigmaX f32 at
 // payload[0..2] + color f32[4] at
 // payload[3..6] (mirrors FILTER_POOL's
-// own drop-shadow entry layout)
+// own drop-shadow entry layout) + sigmaY
+// f32 at payload[7]. Lengths are CSS px,
+// already mapped through the element's
+// transform by $composeFilterSegments.
 export const CMD_PUSH_OPACITY_SEGMENT_KIND_MATRIX = 1;
 export const CMD_PUSH_OPACITY_SEGMENT_KIND_BLUR = 2;
 export const CMD_PUSH_OPACITY_SEGMENT_KIND_DROP_SHADOW = 3;
@@ -1463,26 +1904,24 @@ export const MASK_CLIP_NO_CLIP = 3;
 //                     plain rect, no analytic approximation needed)
 //   transform (f32[6]) — only present if flag bit 1 set
 //
-// INSET border-box extension (P3 step 4): appended AFTER the transform
-// block (present or not — see cmdBoxShadowInsetClipOffset() below),
-// only when flag bit 0 (inset) is set. Inset shadows must never paint
-// outside the node's own border box (CSS's own model: the shadow "hole"
-// deflates INTO the box, but the shadow itself is clipped to the box's
-// own outer edge) — the shader needs the box's ORIGINAL (un-spread)
-// rect+radii for this outer clip boundary, separate from the deflated
-// rect above (which is the coverage-inversion boundary, not the clip).
-// Outset shadows have no such requirement (ancestor overflow clip,
-// already carried by every shader's shared clip uniform, is the only
-// boundary they need) — this extension costs nothing for the far more
-// common outset case.
+// Border-box extension: appended AFTER the transform block (present or
+// not — see cmdBoxShadowInsetClipOffset() below), when flag bit 2 is set,
+// which the engine sets on every shadow it emits (bit 0 alone marks the
+// older inset-only form). The node's ORIGINAL (un-spread) rect+radii:
+// an inset shadow is clipped to the box's own outer edge (the deflated
+// rect above is the coverage-inversion boundary, not the clip); an outset
+// shadow is clipped OUT of the border box (css-backgrounds-3 §7.1) —
+// under an opaque background the box covers it anyway, under a
+// translucent one, or while a background-color transition runs, the
+// interior must stay clear.
 //   borderBoxRect (f32[4])  — the node's own x,y,w,h, UNADJUSTED by
 //                             spread (only the offset+spread-adjusted
 //                             rect above reflects spread)
 //   borderBoxRadii (f32[8]) — the node's own per-corner (rx,ry), same
 //                             order as the main radii field, but
 //                             UNADJUSTED by spread's curvature rule
-export const CMD_BOX_SHADOW_SIZE = 72; // no transform, no inset ext
-export const CMD_BOX_SHADOW_SIZE_XFORM = 96; // transform, no inset ext
+export const CMD_BOX_SHADOW_SIZE = 72; // no transform, no border-box ext
+export const CMD_BOX_SHADOW_SIZE_XFORM = 96; // transform, no border-box ext
 export const CMD_BOX_SHADOW_INSET_EXT_SIZE = 48; // borderBoxRect(4)+radii(8) = 12 floats
 export const CMD_BOX_SHADOW_OFFSET_FLAGS = 0x01; // u8
 export const CMD_BOX_SHADOW_OFFSET_X = 0x04; // f32
@@ -1504,15 +1943,16 @@ export const CMD_BOX_SHADOW_INSET_OFFSET_BORDER_BOX_RADII = 0x10; // f32[8]
 
 export const CMD_BOX_SHADOW_FLAG_INSET = 0x01;
 export const CMD_BOX_SHADOW_FLAG_TRANSFORM = 0x02;
+export const CMD_BOX_SHADOW_FLAG_BORDER_BOX = 0x04;
 
-// Byte size / inset-extension offset for a CMD_BOX_SHADOW record, given
-// its two independent flag bits — mirrors cmdRectSize()/
-// cmdRectGradientOffset()'s own "single source of truth" rationale
-// (every reader/writer must agree on these, so derive from here rather
-// than re-deriving inline).
-export function cmdBoxShadowSize(hasTransform, isInset) {
+// Byte size / border-box-extension offset for a CMD_BOX_SHADOW record,
+// given its flag bits — mirrors cmdRectSize()/cmdRectGradientOffset()'s
+// own "single source of truth" rationale (every reader/writer must agree
+// on these, so derive from here rather than re-deriving inline). The
+// extension is present for an inset shadow or a border-box-flagged one.
+export function cmdBoxShadowSize(hasTransform, hasBorderBox) {
   return CMD_BOX_SHADOW_SIZE + (hasTransform ? 24 : 0) +
-    (isInset ? CMD_BOX_SHADOW_INSET_EXT_SIZE : 0);
+    (hasBorderBox ? CMD_BOX_SHADOW_INSET_EXT_SIZE : 0);
 }
 export function cmdBoxShadowInsetClipOffset(hasTransform) {
   return CMD_BOX_SHADOW_OFFSET_XFORM + (hasTransform ? 24 : 0);
@@ -1620,6 +2060,41 @@ export const CMD_IMAGE_FLAG_ABUT_LEFT = 0x08;
 export const CMD_IMAGE_FLAG_ABUT_TOP = 0x10;
 export const CMD_IMAGE_FLAG_ABUT_RIGHT = 0x20;
 export const CMD_IMAGE_FLAG_ABUT_BOTTOM = 0x40;
+// A color glyph bitmap (plans/PLAN-color-glyphs.md slice 2): the command's
+// X, Y, W, H are the glyph's em square above its origin (X, Y + H), the
+// font size W = H, and the index is COLOR_GLYPH_IMAGE_INDEX_BASE + slot.
+// The raster plan places the image from the strike metrics of the image
+// resource (see COLOR_GLYPH_IMAGE_RESOURCE_COUNT) and snaps the origin as
+// CMD_SVG_PATH_FLAG_GLYPH_ORIGIN does when the command has no transform.
+export const CMD_IMAGE_FLAG_GLYPH_BITMAP = 0x80;
+// CMD_IMAGE indices from COLOR_GLYPH_IMAGE_INDEX_BASE up to
+// COLOR_GLYPH_CACHE_INDEX_BASE name color glyph bitmap slots (engine
+// color_glyph_bitmap_*); IMAGE_TABLE indices stay below it.
+export const COLOR_GLYPH_IMAGE_INDEX_BASE = 0x8000;
+// The raster image resource of a glyph bitmap holds three 12-byte records:
+// (width, height, kind) in texels as every image resource, then the image
+// box in ems of the font size relative to the glyph origin, y down:
+// (left, top, width), (height, whole pixel, 0); whole pixel 1 draws the
+// origin at x rounded (sbix), 0 at Skia's quarter-pixel x (CBDT).
+export const COLOR_GLYPH_IMAGE_RESOURCE_COUNT = 3;
+// The color glyph cache (plans/PLAN-color-glyphs.md slice 3): a COLR glyph
+// of axis-aligned, unscaled text is one CMD_IMAGE with
+// CMD_IMAGE_FLAG_GLYPH_BITMAP | CMD_IMAGE_FLAG_PIXELATED whose index is
+// COLOR_GLYPH_CACHE_INDEX_BASE + a cache slot (engine color_glyph_cache_*:
+// a glyph program at one font size and, when it paints the text color,
+// that color). X, Y, W, H are the instance's ink box in CSS px; UV_X,
+// UV_Y are its glyph origin, the translation the glyph's uncached layers
+// carry, which the raster plan snaps as CMD_SVG_PATH_FLAG_GLYPH_ORIGIN;
+// UV_W, UV_H are 0. The host renders each slot once for each device scale
+// into an RGBA atlas page (image index COLOR_GLYPH_CACHE_PAGE_INDEX_BASE +
+// page) and writes the slot's image resource, COLOR_GLYPH_CACHE_RESOURCE_COUNT
+// 12-byte records: (page width, page height, 0), (left, top, width),
+// (height, u, v), (page image index, 0, 0), the entry's box in device
+// pixels from its snapped origin and its texel position in the page.
+export const COLOR_GLYPH_CACHE_INDEX_BASE = 0xC000;
+export const COLOR_GLYPH_CACHE_CAPACITY = 0x3F00;
+export const COLOR_GLYPH_CACHE_PAGE_INDEX_BASE = 0xFF00;
+export const COLOR_GLYPH_CACHE_RESOURCE_COUNT = 4;
 
 // --- SVG path command (0x09, design/svg-rendering.md Tier B) ---
 // A textured quad through the MSDF pipeline, same shader FAMILY as
@@ -1647,20 +2122,25 @@ export const CMD_SVG_PATH_OFFSET_COLOR = 0x14; // f32[4]: fill color, fill-opaci
 export const CMD_SVG_PATH_OFFSET_XFORM = 0x24; // f32[6] (only if flag set)
 
 export const CMD_SVG_PATH_FLAG_TRANSFORM = 0x01;
-// S7 step 2 (Tier B gradients): FILL-only — a stroked path's SECOND
-// CMD_SVG_PATH (the stroke outline) never carries this flag, matching
-// svgFillGradient's own fill-only scope (no svgStrokeGradient concept
-// exists). Same shape as CMD_RECT_FLAG_GRADIENT's own extension (see
-// its own doc comment) — appended AFTER the transform block, present or
-// not, per cmdSvgPathGradientOffset() below.
+// S7 step 2 (Tier B gradients): a fill command carries svgFillGradient, a
+// stroke outline command svgStrokeGradient (the path node's one background
+// layer). Same shape as CMD_RECT_FLAG_GRADIENT's own extension (see its own
+// doc comment) — appended AFTER the transform block, present or not, per
+// cmdSvgPathGradientOffset() below.
 export const CMD_SVG_PATH_FLAG_GRADIENT = 0x02;
+// A color glyph layer (plans/PLAN-color-glyphs.md): the transform's
+// translation is the glyph's origin. The raster plan snaps it to the device
+// pixel Skia draws a color glyph image at: floor(x + 1/8), floor(y + 1/2)
+// (the integer part of Skia's quarter-pixel glyph position; measured
+// against the pinned Chrome 2026-10-05).
+export const CMD_SVG_PATH_FLAG_GLYPH_ORIGIN = 0x04;
 export const CMD_SVG_PATH_GRADIENT_EXT_SIZE = 40;
 export const CMD_SVG_PATH_GRADIENT_OFFSET_KIND = 0x00; // u8
 export const CMD_SVG_PATH_GRADIENT_OFFSET_STOP_COUNT = 0x01; // u8
-export const CMD_SVG_PATH_GRADIENT_OFFSET_FLAGS = 0x02; // u8: bit0=tiled (always 0 for SVG — identity origin)
+export const CMD_SVG_PATH_GRADIENT_OFFSET_FLAGS = 0x02; // u8: bit0=tiled (always 0 for SVG — paint servers pad)
 export const CMD_SVG_PATH_GRADIENT_OFFSET_STOP_OFFSET = 0x04; // u32
 export const CMD_SVG_PATH_GRADIENT_OFFSET_GEOM = 0x08; // f32[4]
-export const CMD_SVG_PATH_GRADIENT_OFFSET_ORIGIN = 0x18; // f32[4] {dx,dy,w,h} — (0,0,rectW,rectH) for SVG
+export const CMD_SVG_PATH_GRADIENT_OFFSET_ORIGIN = 0x18; // f32[4] {dx,dy,w,h}: the fill path's box from the painted box's top-left
 
 // Byte size / gradient-extension offset for a CMD_SVG_PATH record, given
 // its two independent flag bits — same "every reader/writer agrees, no
@@ -1673,6 +2153,36 @@ export function cmdSvgPathSize(hasTransform, hasGradient) {
 export function cmdSvgPathGradientOffset(hasTransform) {
   return CMD_SVG_PATH_OFFSET_XFORM + (hasTransform ? 24 : 0);
 }
+
+// Color glyphs (plans/PLAN-color-glyphs.md, engine-color-glyph.watpart).
+// A CMD_SVG_PATH index from COLOR_GLYPH_PATH_INDEX_BASE up to
+// BUILTIN_PATH_INDEX_BASE names the outline of a color glyph layer: slot
+// (index - base) of the engine's path slots (color_glyph_path_key: font
+// index << 16 | glyph). The host's own SVG path indices stay below the base.
+export const COLOR_GLYPH_PATH_INDEX_BASE = 0x8000;
+// The last CMD_SVG_PATH indices name fixed outlines the engine paints
+// itself: the disclosure triangles of a list marker, pointing right, left
+// and down, in the unit square of the marker's symbol box (Blink's
+// list_marker_painter.cc). The host resolves them without the engine.
+export const BUILTIN_PATH_INDEX_BASE = 0xfffd;
+export const BUILTIN_PATH_DISCLOSURE_RIGHT = 0xfffd;
+export const BUILTIN_PATH_DISCLOSURE_LEFT = 0xfffe;
+export const BUILTIN_PATH_DISCLOSURE_DOWN = 0xffff;
+// The registered hb_font draws outlines at units per em ×
+// FONT_UNIT_SUBDIVISION (engine-constants.watpart $FONT_UNIT_SUBDIVISION).
+export const FONT_UNIT_SUBDIVISION = 512;
+// COLR gradient kinds of a CMD_SVG_PATH gradient extension: geom f32[4] and
+// origin f32[0..1] are an affine (a, b, c, d, e, f) from the position in the
+// painted box to the canonical space, origin f32[2..3] two parameters.
+// 4 linear (t = x), 5 radial (centers (0, 0) and (1, 0), radii r0 r1),
+// 6 concentric radial (radii r0 r1), 7 sweep (start and end angle, radians,
+// counter-clockwise from +x with y up). Kind bit 7 = repeat, bit 6 =
+// reflect.
+export const GRADIENT_KIND_COLR_LINEAR = 4;
+export const GRADIENT_KIND_COLR_RADIAL = 5;
+export const GRADIENT_KIND_COLR_RADIAL_CONCENTRIC = 6;
+export const GRADIENT_KIND_COLR_SWEEP = 7;
+export const GRADIENT_KIND_FLAG_REFLECT = 0x40;
 
 // Shared sizing rules for the JS walker and generated native header. Sizes
 // still come from the maintained helpers above; native generation checks
@@ -1718,7 +2228,7 @@ const commandSizeRules = {
     size: (flags) =>
       cmdBoxShadowSize(
         (flags & CMD_BOX_SHADOW_FLAG_TRANSFORM) !== 0,
-        (flags & CMD_BOX_SHADOW_FLAG_INSET) !== 0,
+        (flags & (CMD_BOX_SHADOW_FLAG_INSET | CMD_BOX_SHADOW_FLAG_BORDER_BOX)) !== 0,
       ),
   },
   [CMD_PUSH_CLIP]: {
@@ -1748,6 +2258,7 @@ const commandSizeRules = {
   [CMD_POP_BLEND_LAYER]: { size: CMD_POP_BLEND_LAYER_SIZE },
   [CMD_POP_BACKGROUND]: { size: CMD_POP_BACKGROUND_SIZE },
   [CMD_SET_NODE]: { size: CMD_SET_NODE_SIZE },
+  [CMD_SCROLLBAR]: { size: CMD_SCROLLBAR_SIZE },
 };
 for (const opcode in commandSizeRules) Object.freeze(commandSizeRules[opcode]);
 export const COMMAND_SIZE_RULES = Object.freeze(commandSizeRules);
@@ -1905,7 +2416,8 @@ export const INTRINSIC_OFFSET_LAYOUT_MAX = 0x0c; // i32: layout-pass max-content
 // allocated block when a container has more in-flow items than the slice
 // holds — a scene within the initial budget allocates nothing. The 65th
 // item used to overrun the line records and drive $layoutFlexItem into
-// unbounded recursion (plans/bugs/BUG-exclusion-level-capacity-trap.md), so
+// unbounded recursion (BUG-exclusion-level-capacity-trap, resolved; see
+// activity/reports/REPORT-2026-10-09-resolved-bug-records.md), so
 // a reader of the slices must take the stride and item budget from
 // flex_scratch_level() / flex_items_per_level() rather than assume these.
 // verifyLayout runs before any layout, so it still compares them.
@@ -1940,7 +2452,7 @@ export const DEBUG_TRACE_MAX = 256;
 // (WAT drives hb_shape directly, so source text has to live in WASM
 // memory too — not just the shaped output).
 //
-// 20 B/node × 4096 nodes = 80 KB:
+// 32 B/node × 2560 nodes = 80 KB:
 //   textOffset  (u32) — byte offset into TEXT_SOURCE_BASE
 //   textLength  (u16) — UTF-8 byte length of this node's text content
 //   glyphOffset (u32) — byte offset into SHAPED_GLYPH_POOL_BASE
@@ -1954,6 +2466,11 @@ export const DEBUG_TRACE_MAX = 256;
 //                       every layout() call even when the shaped
 //                       glyphs are cache-reused)
 //   lineCount   (u16) — number of line-box records
+//   contentHeight (f32) — px below the node's content-box top where its
+//                       last line box ends; written with lineOffset/
+//                       lineCount. The line boxes are scrollable overflow
+//                       even when a fixed height makes the content box
+//                       shorter than they are.
 //
 // validGen (Slice 6's caching field) is NOT here — see TEXT_RUN_VALID_GEN
 // below; it's stored separately so the text/glyph fields stay a clean
@@ -1964,9 +2481,9 @@ export const DEBUG_TRACE_MAX = 256;
 // fields through resetAnalyticalLayoutState before each forced layout.
 
 export const TEXT_RUN_DIR_BASE = 0x00302840;
-export const TEXT_RUN_DIR_SIZE = 0x00014000; // 80 KB (20 B/node × 4096)
+export const TEXT_RUN_DIR_SIZE = 0x00014000; // 80 KB (32 B/node × 2560)
 
-export const TEXT_RUN_ENTRY_SIZE = 28;
+export const TEXT_RUN_ENTRY_SIZE = 32;
 export const TEXT_RUN_OFFSET_TEXT_OFFSET = 0x00; // u32
 export const TEXT_RUN_OFFSET_TEXT_LENGTH = 0x04; // u16
 export const TEXT_RUN_OFFSET_GLYPH_OFFSET = 0x06; // u32
@@ -1976,6 +2493,7 @@ export const TEXT_RUN_OFFSET_LINE_COUNT = 0x10; // u16
 export const TEXT_RUN_OFFSET_HAS_ELLIPSIS = 0x12; // u8; source has one appended ellipsis glyph
 export const TEXT_RUN_OFFSET_LETTER_SPACING = 0x14; // f32 resolved px
 export const TEXT_RUN_OFFSET_SHAPED_LETTER_SPACING = 0x18; // f32 cache key
+export const TEXT_RUN_OFFSET_CONTENT_HEIGHT = 0x1C; // f32 px below the content-box top: last line box bottom
 // design/inline-layout.md: an IFC ROOT (LAYOUT_FLAG_IS_INLINE_CTX) has no
 // text of its own — TEXT_OFFSET/TEXT_LENGTH/GLYPH_OFFSET are dead weight
 // for that node, repurposed as its item-stream span + virtual-glyph-map
@@ -2035,24 +2553,38 @@ export const TEXT_SOURCE_SIZE = 0x00200000;
 // blindly bump-reset every layout() call, or every unchanged text node
 // would re-shape every frame — a real regression from the JS-side
 // shaping cache this replaces (see design/layout-engine.md). Caching is
-// WAT-side, keyed by node index + generation, reusing the EXACT mechanism
-// $computeIntrinsic already uses for its own cache: $layoutText re-shapes
-// a node only when its NODE_CHANGED_GEN exceeds TEXT_RUN_VALID_GEN[node]
-// (text content change bumps changedGen exactly like any other
-// style-byte change, via session.js's existing write-if-changed path);
-// otherwise it reads the run directory's existing glyphOffset/glyphCount
+// WAT-side, keyed by node index + generation. Unlike the intrinsic-size
+// cache, shaped text requires an exact generation match: $layoutText re-shapes
+// a node unless NODE_CHANGED_GEN equals TEXT_RUN_VALID_GEN[node].
+// A standalone analytical layout can replace a render surface's rows with
+// different text at the same indices, then the surface can restore its
+// earlier changed generation. A newer valid generation is not a cache hit.
+// Otherwise it reads the run directory's existing glyphOffset/glyphCount
 // as-is, zero HarfBuzz calls. The bump allocator only advances for
 // NEWLY-shaped or CHANGED runs.
 
 export const SHAPED_GLYPH_POOL_BASE = 0x00DC6000;
 export const SHAPED_GLYPH_POOL_SIZE = 0x00200000;
 
-export const SHAPED_GLYPH_ENTRY_SIZE = 16;
+// 20 B/entry. FONT is the FONT_TABLE index of the face that shaped the
+// glyph: the node's primary face, or a later face of its font stack
+// (plans/PLAN-font-fallback.md). X_ADVANCE is in the subdivided units of
+// the node's primary face for every glyph; $shapeTextRun rescales the
+// advance of a glyph from another face.
+export const SHAPED_GLYPH_ENTRY_SIZE = 20;
 export const SHAPED_GLYPH_OFFSET_ID = 0x00; // u16
 export const SHAPED_GLYPH_OFFSET_X_ADVANCE = 0x02; // i32
 export const SHAPED_GLYPH_OFFSET_FLAGS = 0x06; // u16
 export const SHAPED_GLYPH_OFFSET_CLUSTER_START = 0x08; // u32 UTF-8 byte offset
 export const SHAPED_GLYPH_OFFSET_CLUSTER_END = 0x0C; // u32 UTF-8 byte offset
+export const SHAPED_GLYPH_OFFSET_FONT = 0x10; // u16 FONT_TABLE index
+// text-spacing-trim (src/wasm/engine-han-kerning.watpart): an i16 that
+// holds, in bits 1-15, the advance in font units of the primary face that
+// the 'halt' feature removes from the glyph (negative when 'halt' also
+// moves the glyph left by that amount, as for an opening bracket), and in
+// bit 0 whether shaping removed it. SHAPED_GLYPH_FLAG_HALT tells whether
+// X_ADVANCE has it removed now: a line edge can change that.
+export const SHAPED_GLYPH_OFFSET_HAN_KERNING = 0x12; // i16
 
 export const SHAPED_GLYPH_FLAG_BREAK_AFTER = 0x0001;
 export const SHAPED_GLYPH_FLAG_HANGING = 0x0002; // the break glyph hangs at a line
@@ -2062,6 +2594,7 @@ export const SHAPED_GLYPH_FLAG_HANGING = 0x0002; // the break glyph hangs at a l
 // trailing collapsible space at an IFC item boundary that CSS collapses
 // away — the glyph's advance contributes zero to any width/position sum.
 export const SHAPED_GLYPH_FLAG_COLLAPSED = 0x0004;
+export const SHAPED_GLYPH_FLAG_HALT = 0x0080;
 
 // =======================================================================
 // Text run valid-generation buffer (32 KB at 0x254B40) — Slice 6/6D
@@ -2139,12 +2672,19 @@ export const TEXT_RUN_VALID_GEN_OFFSET_EPOCH = 0x04; // u32
 //
 // All five pools relocated (old slots below are intentional holes, same
 // convention as BG_LAYER_POOL's move) and doubled for D1:
-// 0x003BE840-0x003D6840 (old text-line pool),
-// 0x003E6940-0x003F6940 (old inline-item pool),
+// 0x003BE840-0x003D6840 (old text-line pool; FONT_STACK_TABLE now occupies
+// 0x003BE840-0x003C4840 and MATH_BOX 0x003C4840-0x003CD4F0),
+// 0x003E6940-0x003F6940 (old inline-item pool; LANGUAGE_TABLE now
+// occupies 0x003E6940-0x003E8940 and LANGUAGE_TABLE_FEATURES
+// 0x003E8940-0x003E9140),
 // 0x003F6940-0x00416B40 (old inline glyph map),
 // 0x00416B40-0x0042AB40 (old line-fragment pool),
 // 0x00485520-0x004A5720 (old inline edge map),
-// 0x004A5720-0x004C9720 (old inline state scratch).
+// 0x004AE720-0x004B5520 (unused inline-state scratch),
+// 0x004C9520-0x004C9B20 (old font variation and decoration tables).
+// FONT_TABLE occupies 0x004A5720-0x004AB720, FONT_VARIATION_TABLE
+// 0x004AB720-0x004AC720, FONT_DECORATION_TABLE 0x004AC720-0x004AE720.
+// MULTICOLUMN_FRAGMENT_POOL occupies 0x004B5520-0x004C9520.
 export const TEXT_LINE_POOL_BASE = 0x00FC6000;
 export const TEXT_LINE_POOL_SIZE = 0x00180000;
 
@@ -2172,8 +2712,9 @@ export const TEXT_LINE_OFFSET_AVAIL = 0x14; // f32 (px, band width; F2)
 // Blink's ShapeResult::ComputePositionData character-position cache — the
 // line breaker's fit test runs on these INTEGERS (with a +1 raw-LU
 // epsilon), never on float width comparisons. Transient scratch,
-// rebuilt per $layoutText call; sized to the shaped-glyph pool's own
-// capacity (131072 glyphs) + 1, rounded up to 0x81000 bytes.
+// rebuilt per $layoutText call; sized to the shaped-glyph pool's initial
+// capacity at 16 B/entry (131072 glyphs) + 1, rounded up to 0x81000 bytes.
+// At 20 B/entry the pool holds 104857 glyphs; one run holds at most 65535.
 
 export const TEXT_POS_SCRATCH_BASE = 0x01786000;
 export const TEXT_POS_SCRATCH_SIZE = 0x00081000;
@@ -2213,6 +2754,9 @@ export const INLINE_ITEM_KIND_TEXT = 0;
 export const INLINE_ITEM_KIND_OPEN = 1;
 export const INLINE_ITEM_KIND_CLOSE = 2;
 export const INLINE_ITEM_KIND_ATOMIC = 3;
+// An absolute or fixed box: no glyph; GLYPH_OFFSET is its boundary's
+// glyph-map index, GLYPH_COUNT 0.
+export const INLINE_ITEM_KIND_OUT_OF_FLOW = 4;
 
 // =======================================================================
 // Inline glyph map (131 KB at 0x2D3220) — design/inline-layout.md
@@ -2254,41 +2798,49 @@ export const INLINE_GLYPH_MAP_OFFSET_GLYPH_PTR = 0x04; // u32
 // Bump-allocated per IFC root, reset every layout() call, same
 // reasoning as TEXT_LINE_POOL/INLINE_ITEM_POOL's own resets.
 //
-// Per fragment (20 B): {itemIndex: u16, glyphCount: u16, glyphStart:
-// u32 (virtual glyph index into that item's own span — resolved via
-// INLINE_GLYPH_MAP at paint time), x: f32 (offset within the already
-// text-align-shifted line), width: f32, blockOffset: f32}. I2's
-// blockOffset positions each fragment within the mixed-metrics line box.
-// Glyph count is u16: one fragment is one item's glyphs on one line.
+// Per fragment (24 B): {itemIndex: u32, glyphCount: u16, bidiLevel: u8,
+// visualOrder: u8, glyphStart: u32 (virtual glyph index into that item's
+// own span — resolved via INLINE_GLYPH_MAP at paint time), x: f32 (offset
+// within the already text-align-shifted line), width: f32, blockOffset:
+// f32}. I2's blockOffset positions each fragment within the mixed-metrics
+// line box. Glyph count is u16: one fragment is one item's glyphs on one
+// line. Fragments are in visual order, left to right. visualOrder is 0 on
+// a line laid out in logical order (every bidi level 0, no right-to-left
+// inline box in its IFC). It is 1 on a line laid out by the Unicode
+// Bidirectional Algorithm (src/wasm/engine-bidi.watpart): each fragment
+// is a run of virtual glyphs that ascend left to right at one bidiLevel,
+// and the line's inline edge map entries hold edges by physical side
+// (before = left, after = right).
 // Relocated + doubled for D1 (see the TEXT_LINE_POOL comment).
 export const LINE_FRAGMENT_POOL_BASE = 0x01646000;
 export const LINE_FRAGMENT_POOL_SIZE = 0x00140000;
 export const LINE_FRAGMENT_ENTRY_SIZE = 24;
 export const LINE_FRAGMENT_OFFSET_ITEM_INDEX = 0x00; // u32
 export const LINE_FRAGMENT_OFFSET_GLYPH_COUNT = 0x04; // u16
+export const LINE_FRAGMENT_OFFSET_BIDI_LEVEL = 0x06; // u8: resolved embedding level
+export const LINE_FRAGMENT_OFFSET_VISUAL_ORDER = 0x07; // u8: 1 when laid out in visual order
+// The VISUAL_ORDER value of a visual-order fragment of hanging glyphs
+// (collapsible trailing spaces): zero width, and no inline box's extent.
+export const LINE_FRAGMENT_VISUAL_ORDER_HANGING = 3;
 export const LINE_FRAGMENT_OFFSET_GLYPH_START = 0x08; // u32
 export const LINE_FRAGMENT_OFFSET_X = 0x0C; // f32
 export const LINE_FRAGMENT_OFFSET_WIDTH = 0x10; // f32
 export const LINE_FRAGMENT_OFFSET_BLOCK_OFFSET = 0x14; // f32, relative to line top
 
 // =======================================================================
-// Font table (1536 B) — Slice 6D
+// Font table (24576 B) — Slice 6D
 // =======================================================================
 //
 // A font, for shaping purposes, is a fully-resolved (already variation-
 // instanced, if applicable) hb_font_t living in hb.wasm's own heap —
-// shared by resolved font content, face index, effective variation weight,
-// and italic-face identity, not by authored family aliases. JS resolves
-// each requested family/weight/style at scene setup, canonicalizes equal
-// font bytes, and calls register_font() once per physical instance.
-// register_font does ALL
-// HarfBuzz calls itself (hb_blob_create/hb_face_create/hb_font_create,
-// plus hb_font_set_variations if the face has a wght axis and a non-
-// default weight was requested) — JS's only job is getting the raw font
-// FILE bytes into hb.wasm's memory first (via hb_malloc_for_test's
-// pattern: JS is the only side that can hold a view into both memories).
-// This keeps the variable/static fork exactly where 6A's WAT-to-WAT
-// decision put every other HarfBuzz call: inside WAT, not JS.
+// shared by complete font bytes, face index, weight, width and slant.
+// Authored family aliases do not affect instance identity.
+// JS uploads file bytes. register_font hashes and compares complete bytes,
+// consumes duplicate uploads, and shares one native allocation per file.
+// It derives physical italic metadata from the selected collection face.
+// It creates the HarfBuzz blob, face and variation-instanced font in WAT.
+// A byte-object cache skips uploads for immutable sources. Mutable sources
+// receive a fresh snapshot and native content check.
 //
 // A node's NODE_FONT_INDEX indexes THIS table directly — it is "the Nth
 // registered physical font instance", not "the Nth authored family".
@@ -2301,29 +2853,106 @@ export const LINE_FRAGMENT_OFFSET_BLOCK_OFFSET = 0x14; // f32, relative to line 
 // OpenType scalar metrics through the standalone @sandom/font-metrics package,
 // independently of this table.
 //
-// 24 B/entry × 64 entries = 1536 B. Registration rejects exhaustion before
-// writing; the adjacent image table must never receive font records.
+// 48 B/entry × 512 entries = 24576 B in retired inline-state scratch.
+// Registration rejects exhaustion before writing. FONT_VARIATION_TABLE and
+// FONT_DECORATION_TABLE, indexed by the same font index, follow it with
+// the same capacity. The WPT MathML corpus alone registers 58 font files,
+// and one test process registers every suite's faces, so 64 entries
+// overflowed in a full run.
 
-export const FONT_TABLE_BASE = 0x0042AB40;
-export const FONT_TABLE_SIZE = 0x00000600; // 1536 B (24 B × 64 entries)
-export const FONT_TABLE_ENTRY_SIZE = 24;
-export const FONT_TABLE_MAX_ENTRIES = 64;
+export const FONT_TABLE_BASE = 0x004A5720;
+export const FONT_TABLE_SIZE = 0x00006000;
+export const FONT_TABLE_ENTRY_SIZE = 48;
+export const FONT_TABLE_MAX_ENTRIES = 512;
+
+// Shaping contexts, interned by the DOM core: one entry per distinct pair
+// of a content language (a BCP 47 tag) and a font feature set, appended in
+// first-use order and never removed while the engine lives. NODE_LANGUAGE
+// indexes this table; index 0 is "no language, no features" and its entry
+// stays unused. Entry: byte 0 is the tag length in bytes (0..31; 0 for an
+// entry that only carries features), bytes 1..31 are the tag in ASCII
+// lowercase. 32 B/entry × 256 entries = 8192 B in the old inline-item pool
+// hole. design/text-rendering.md ("Font features") explains the choice.
+export const LANGUAGE_TABLE_BASE = 0x003E6940;
+export const LANGUAGE_TABLE_SIZE = 0x00002000;
+export const LANGUAGE_TABLE_ENTRY_SIZE = 32;
+export const LANGUAGE_TABLE_MAX_ENTRIES = 256;
+export const LANGUAGE_TABLE_TAG_MAX_LENGTH = 31;
+// The font feature set of each LANGUAGE_TABLE entry, at the same index:
+// the OpenType features that font-variant-*, font-kerning and
+// font-feature-settings resolve to, in Blink's order (FontFeatures::
+// Initialize). Entry: the feature block (u32 pointer to `count` pairs
+// {tag u32, value u32}, owned by the DOM core and never freed; 0 for no
+// features), count (u16), and variant count (u16): the first `variant
+// count` pairs come from font-variant-* and font-kerning, the rest from
+// font-feature-settings. With a non-zero letter-spacing the engine drops
+// the variant pairs liga, clig, dlig, hlig and calt and turns liga, clig
+// and calt off, as Blink does. 8 B/entry × 256 entries = 2048 B, after
+// LANGUAGE_TABLE in the same hole.
+export const LANGUAGE_TABLE_FEATURES_BASE = 0x003E8940;
+export const LANGUAGE_TABLE_FEATURES_SIZE = 0x00000800;
+export const LANGUAGE_TABLE_FEATURES_ENTRY_SIZE = 8;
+export const LANGUAGE_TABLE_FEATURES_OFFSET_COUNT = 4;
+export const LANGUAGE_TABLE_FEATURES_OFFSET_VARIANT_COUNT = 6;
 
 // Font decoration metrics, indexed by FONT_TABLE index. JS supplies signed
 // OpenType font units (post underline position/thickness, OS/2 strikeout
 // position/thickness); the engine stores them ×FONT_UNIT_SUBDIVISION (512)
 // to match the shaping scale (see engine.wat's $FONT_UNIT_SUBDIVISION).
-// Kept separate because FONT_TABLE's 24-byte stride is a fixed, full
-// 64-entry allocation.
-export const FONT_DECORATION_TABLE_BASE = 0x004C9720;
+// This separate table holds four signed scalar metrics per instance.
+// 16 B/entry × 512 entries = 8192 B.
+export const FONT_DECORATION_TABLE_BASE = 0x004AC720;
+export const FONT_DECORATION_TABLE_SIZE = 0x00002000;
 export const FONT_DECORATION_TABLE_ENTRY_SIZE = 16;
+// Variation coordinates beyond wght, indexed by FONT_TABLE index: the wdth
+// coordinate (a CSS font-stretch percentage) the instance shapes at, f32,
+// 0 = the font's own default, and the slnt coordinate (the negated CSS
+// oblique angle), f32, always applied (0 is upright; a font without a slnt
+// axis ignores it). Separate for the same reason as the decoration table.
+// 8 B/entry × 512 entries = 4096 B.
+export const FONT_VARIATION_TABLE_BASE = 0x004AB720;
+export const FONT_VARIATION_TABLE_SIZE = 0x00001000;
+export const FONT_VARIATION_TABLE_ENTRY_SIZE = 8;
+export const FONT_VARIATION_OFFSET_WIDTH = 0x00; // f32, wdth coordinate
+export const FONT_VARIATION_OFFSET_SLANT = 0x04; // f32, slnt coordinate
 export const FONT_TABLE_OFFSET_HB_FONT_PTR = 0x00; // i32: hb_font_t* in hb.wasm's memory
 export const FONT_TABLE_OFFSET_UPEM = 0x04; // u32, upem × FONT_UNIT_SUBDIVISION (512)
 export const FONT_TABLE_OFFSET_ASCENDER = 0x08; // i32, subdivided font units (hb_font_get_h_extents)
 export const FONT_TABLE_OFFSET_DESCENDER = 0x0C; // i32, subdivided font units (negative)
 export const FONT_TABLE_OFFSET_LINE_GAP = 0x10; // i32, subdivided font units
-export const FONT_TABLE_OFFSET_WEIGHT = 0x14; // u16, CSS weight; re-applied with opsz before shaping
+export const FONT_TABLE_OFFSET_WEIGHT = 0x14; // u16, CSS weight; re-applied with wdth, slnt and opsz before shaping
 export const FONT_TABLE_OFFSET_X_GLYPH = 0x16; // u16, nominal glyph id for lowercase x
+export const FONT_TABLE_OFFSET_BYTES = 24;
+export const FONT_TABLE_OFFSET_LENGTH = 28;
+export const FONT_TABLE_OFFSET_HASH = 32;
+export const FONT_TABLE_OFFSET_FACE_INDEX = 36;
+export const FONT_TABLE_OFFSET_ITALIC = 40;
+
+// Font stack table (plans/PLAN-font-fallback.md): the authored font stack
+// of a text node, primary face first. Entry: count (u16), then up to
+// FONT_STACK_MAX_FACES FONT_TABLE indices (u16), the primary slot (u16) and
+// the slot block (u32). Equal stacks share one entry; entry 0 is never
+// written (LAYOUT_NODE_OFFSET_FONT_STACK 0 is a stack of the primary face
+// alone). 24 B/entry x 1024 entries = 24576 B in the retired text-line pool.
+// A stack with a unicode-range face (plans/PLAN-font-unicode-range.md) has
+// a slot block instead of the indices: {byte length u32, slot count u32},
+// then slots of FONT_STACK_SLOT_SIZE bytes {font u16 (0xFFFF not loaded),
+// 2 B zero, pair count u32, catalog face ID u32 of an unloaded face, core
+// face number u32, pair offset u32 from the block start}, then the u32
+// {start, end} scalar pairs. The font of the primary slot, when loaded, is
+// the node's primary face (see engine-constants.watpart).
+export const FONT_STACK_TABLE_BASE = 0x003BE840;
+export const FONT_STACK_TABLE_SIZE = 0x00006000;
+export const FONT_STACK_ENTRY_SIZE = 24;
+export const FONT_STACK_MAX_ENTRIES = 1024;
+export const FONT_STACK_MAX_FACES = 8;
+export const FONT_STACK_OFFSET_COUNT = 0x00; // u16
+export const FONT_STACK_OFFSET_FONTS = 0x02; // u16 x FONT_STACK_MAX_FACES
+export const FONT_STACK_OFFSET_PRIMARY = 0x12; // u16 slot index
+export const FONT_STACK_OFFSET_SLOTS = 0x14; // u32 slot block, 0 for none
+export const FONT_STACK_SLOT_HEADER_SIZE = 8;
+export const FONT_STACK_SLOT_SIZE = 20;
+export const FONT_STACK_UNLOADED = 0xFFFF;
 
 // --- Image table (Slice P5a): decoded-image intrinsic size registry ---
 // Mirrors FONT_TABLE's shape exactly: JS decodes image bytes (src/images.js,
@@ -2348,7 +2977,7 @@ export const IMAGE_TABLE_OFFSET_HEIGHT = 0x04; // u32: intrinsic height, px
 // Background-layer pool (P5c) — one fixed-size entry per background-image
 // LAYER (a node can have multiple, CSS list order; bottom layer = LAST in
 // the list per css-backgrounds-3 §3.8). Bump-allocated fresh every
-// emitSceneCommands/renderScene call (NOT cached like the text shaping
+// emitSceneCommands/render call (NOT cached like the text shaping
 // pools above) — layer data is pure per-node style, cheap to recompute,
 // no shaping/measurement work to avoid repeating. LAYOUT_NODE_OFFSET_
 // BG_LAYER_COUNT/BG_LAYERS_OFFSET (P0-reserved) point a node at its span
@@ -2392,22 +3021,33 @@ export const BG_LAYER_MAX_ENTRIES = 1024;
 export const BG_LAYER_OFFSET_IMAGE_INDEX = 0x00; // u16 (0xFFFF = none/gradient layer)
 export const BG_LAYER_OFFSET_SIZE_W_TAG = 0x02; // u8
 export const BG_LAYER_OFFSET_SIZE_H_TAG = 0x03; // u8
-export const BG_LAYER_OFFSET_POSITION_X_TAG = 0x04; // u8
+// A position tag with BG_LAYER_POSITION_TAG_FROM_END set measures its value
+// from the far (right or bottom) edge: the offset is the free space minus
+// the resolved value (`right 10px`, `calc(100% - 10px)`).
+export const BG_LAYER_OFFSET_POSITION_X_TAG = 0x04; // u8: SIZE_TAG_LENGTH/PERCENT, optional FROM_END bit
 export const BG_LAYER_OFFSET_POSITION_Y_TAG = 0x05; // u8
+export const BG_LAYER_POSITION_TAG_FROM_END = 0x80;
 export const BG_LAYER_OFFSET_REPEAT_X = 0x06; // u8: BG_REPEAT_* enum
 export const BG_LAYER_OFFSET_REPEAT_Y = 0x07; // u8: BG_REPEAT_* enum
 export const BG_LAYER_OFFSET_SIZE_W = 0x08; // f32
 export const BG_LAYER_OFFSET_SIZE_H = 0x0C; // f32
 export const BG_LAYER_OFFSET_POSITION_X = 0x10; // f32
 export const BG_LAYER_OFFSET_POSITION_Y = 0x14; // f32
-// Background attachment uses the first byte of the background-only
-// 0x18-0x1B metadata quartet. Mask entries use this byte as mode; the
-// shared draw helper receives the entry but attachment is read only by
-// the background caller.
+// Background attachment, origin and clip use the first three bytes of the
+// background-only 0x18-0x1B metadata quartet. Mask entries use these bytes
+// as mode, composite and origin; the shared draw helper receives the entry
+// but these bytes are read only by the background caller.
 export const BG_LAYER_OFFSET_ATTACHMENT = 0x18; // u8: BG_ATTACHMENT_* enum
 export const BG_ATTACHMENT_SCROLL = 0;
 export const BG_ATTACHMENT_LOCAL = 1;
 export const BG_ATTACHMENT_FIXED = 2;
+// This layer's background-origin (LAYOUT_NODE_OFFSET_BACKGROUND_ORIGIN's
+// encoding: 0 padding-box, 1 border-box, 2 content-box) and
+// background-clip (LAYOUT_NODE_OFFSET_BACKGROUND_CLIP's encoding: 0
+// border-box, 1 padding-box, 2 content-box). The node fields keep the
+// bottom layer's values, which also govern the background color.
+export const BG_LAYER_OFFSET_ORIGIN = 0x19; // u8
+export const BG_LAYER_OFFSET_CLIP = 0x1A; // u8
 export const BG_LAYER_OFFSET_GRADIENT_KIND = 0x1C; // u8: 0=none, else BG_KIND_* (bit7 = repeating)
 // P13: this layer's background-blend-mode (BLEND_* enum, 0 = normal).
 // Existing padding after GRADIENT_KIND, free in BOTH pool entries; a
@@ -2514,7 +3154,7 @@ export const SVG_GEOM_OFFSET_5 = 0x14; // f32
 // gradient (LAYOUT_NODE_OFFSET_STOP_OFFSET/STOP_COUNT, P0-reserved) points
 // at a span of fixed-size entries here — same "pool + per-node span
 // pointer" pattern as SVG_GEOM_POOL/BG_LAYER_POOL just above. Bump-
-// allocated fresh every emitSceneCommands/renderScene call (pure per-node
+// allocated fresh every emitSceneCommands/render call (pure per-node
 // style, cheap to recompute), same lifetime as those two pools.
 //
 // 20 B/entry x 2048 entries = 40960 B. Stop POSITIONS are resolved to 0..1
@@ -2562,7 +3202,7 @@ export const GRADIENT_HUE_NAMES = Object.freeze({
 // (LAYOUT_NODE_OFFSET_SHADOW_OFFSET/SHADOW_COUNT, P0-reserved) points at a
 // span of fixed-size entries here — same "pool + per-node span pointer"
 // pattern as every other P4/P5c/SVG pool above. Bump-allocated fresh every
-// emitSceneCommands/renderScene call. Entries hold the RAW per-shadow CSS
+// emitSceneCommands/render call. Entries hold the RAW per-shadow CSS
 // declaration (offset/blur-radius/spread/color/inset) — the engine reads
 // a span of these at CMD_BOX_SHADOW emission time and resolves the FINAL
 // offset+spread-adjusted rect, spread-adjusted per-corner radii (css-
@@ -2937,6 +3577,20 @@ export const ANIMATION_EVENT_QUEUE_CAPACITY = 256;
 export const ANIMATION_EVENT_QUEUE_SIZE = 0x00000800;
 export const ANIMATION_RESULT_BASE = 0x005576F8;
 export const ANIMATION_RESULT_SIZE = 16;
+// Animated box-shadow spans: one fixed span per animation track, written
+// by the engine's sample write for a box-shadow track (kind 7). The node's
+// SHADOW_OFFSET is repointed at the span (as an offset from
+// SHADOW_POOL_BASE, which is all the paint reads) for the track's life and
+// restored from the track's base at its end. A keyframe list holds at most
+// ANIMATED_SHADOW_MAX_SHADOWS shadows; the shorter list is padded with
+// transparent zero shadows (css-backgrounds-3 §7.1 interpolation).
+// Appended past the old FIXED_REGIONS_END, same rule as the mask pool.
+export const ANIMATED_SHADOW_MAX_SHADOWS = 8;
+export const ANIMATED_SHADOW_SPAN_SIZE = SHADOW_ENTRY_SIZE *
+  ANIMATED_SHADOW_MAX_SHADOWS;
+export const ANIMATED_SHADOW_POOL_BASE = 0x01A47000;
+export const ANIMATED_SHADOW_POOL_SIZE = ANIMATED_SHADOW_SPAN_SIZE *
+  ANIMATION_TABLE_CAPACITY; // 320 B x 256 tracks = 0x14000
 
 // Grid sizing-function entries. Each endpoint carries a primary f32 and a
 // percentage companion so calc(<length> + <percentage>) survives to the axis
@@ -2968,6 +3622,34 @@ export const TABLE_SCRATCH_LEVELS = 8;
 export const TABLE_GRID_BOX_BASE = 0x0071F240;
 export const TABLE_GRID_BOX_SIZE = 0x00008CB0;
 export const TABLE_GRID_BOX_ENTRY_SIZE = 16;
+// A box that is not a table (DISPLAY_TABLE or DISPLAY_INLINE_TABLE) holds
+// its multi-column record in its table-grid slot instead: a fragmented
+// box's fragment count (0 when the box is not fragmented) and the
+// addresses of its first and last fragment entries; a multi-column
+// container's first row entry (engine-multicolumn.watpart).
+export const MULTICOLUMN_RECORD_OFFSET_FRAGMENT_COUNT = 0x00;
+export const MULTICOLUMN_RECORD_OFFSET_FIRST_FRAGMENT = 0x04;
+export const MULTICOLUMN_RECORD_OFFSET_LAST_FRAGMENT = 0x08;
+export const MULTICOLUMN_RECORD_OFFSET_FIRST_ROW = 0x0C;
+// The entries the multi-column records address, in the old inline state
+// scratch hole. Each entry holds the address of the next entry (0 ends
+// the list), then four i32 LayoutUnits: a fragment's border box relative
+// to its box's union border box, or a column row's top and bottom below
+// the container's content box top and its last column. The pool persists
+// across layout() calls and flips with the line pools at layout() entry
+// once past its midpoint; a pass that needs more entries throws (trap
+// site 14). 20 B x 4096 entries.
+export const MULTICOLUMN_FRAGMENT_POOL_BASE = 0x004B5520;
+export const MULTICOLUMN_FRAGMENT_POOL_SIZE = 0x00014000;
+export const MULTICOLUMN_ENTRY_SIZE = 20;
+export const MULTICOLUMN_ENTRY_OFFSET_NEXT = 0x00;
+export const MULTICOLUMN_ENTRY_OFFSET_FRAGMENT_X = 0x04;
+export const MULTICOLUMN_ENTRY_OFFSET_FRAGMENT_Y = 0x08;
+export const MULTICOLUMN_ENTRY_OFFSET_FRAGMENT_WIDTH = 0x0C;
+export const MULTICOLUMN_ENTRY_OFFSET_FRAGMENT_HEIGHT = 0x10;
+export const MULTICOLUMN_ENTRY_OFFSET_ROW_TOP = 0x04;
+export const MULTICOLUMN_ENTRY_OFFSET_ROW_BOTTOM = 0x08;
+export const MULTICOLUMN_ENTRY_OFFSET_ROW_LAST_COLUMN = 0x0C;
 // D1 piece 2: pristine layout-space geometry. layout() snapshots the
 // computed-box records and the table-grid boxes right after the layout
 // recursion, BEFORE the root margin shift, scroll translation, and sticky
@@ -2981,9 +3663,11 @@ export const PRISTINE_TABLE_GRID_BOX_SIZE = 0x00008CB0;
 // D1 piece 3: the layout cache. SUBTREE_INFO holds one bottom-up record
 // per node, rebuilt at every layout() entry: the subtree's max changedGen,
 // its highest node index (subtrees are NOT contiguous index ranges —
-// grandchild blocks interleave), and an eligibility flag (table-family
-// subtrees are excluded: collapsed-border edge records rebuild per pass
-// inside table layout, so a skipped table would paint stale borders).
+// grandchild blocks interleave), an eligibility flag (the node's own call
+// may hit: its subtree is restorable and it is not a table-internal box,
+// which table layout adjusts after the box's own call returns), and a
+// restorable flag (every collapsed table below still has its pristine
+// grid-line positions at the address the collapsed arena gives it now).
 // LAYOUT_CACHE holds one record per node: the constraint-space key of the
 // node's MOST RECENT eligible fresh-site layout, the generations it was
 // stored under, and the margin-report outputs to replay on a hit. Reserved
@@ -2992,6 +3676,23 @@ export const PRISTINE_TABLE_GRID_BOX_SIZE = 0x00008CB0;
 // ancestors may have translated the end-of-pass snapshot after this
 // node's layout returned. Parent placement must not accumulate on reuse.
 // Any non-eligible layout of the node invalidates its record.
+// MathML box results (plans/layout/PLAN-mathml-layout.md): one entry per
+// layout node, written by the engine math layout for every math box. Ascent
+// is the baseline offset from the border-box top and italic correction the
+// MATH table value of a stretched operator, both i32 LayoutUnits. An
+// operator with special shaping (Blink's MathOperatorLayoutAlgorithm) keeps
+// the stretch target its glyph was shaped for, so paint shapes it again.
+// The region follows FONT_STACK_TABLE in the old text-line pool hole (see
+// TEXT_LINE_POOL_BASE).
+export const MATH_BOX_BASE = 0x003C4840;
+export const MATH_BOX_SIZE = 0x00008CB0;
+export const MATH_BOX_ENTRY_SIZE = 16;
+export const MATH_BOX_OFFSET_ASCENT = 0x00; // i32 LayoutUnits
+export const MATH_BOX_OFFSET_ITALIC_CORRECTION = 0x04; // i32 LayoutUnits
+// u32: 1 laid out by math layout this pass, 2 an operator the math painter
+// paints, 4 its stretch axis is inline (horizontal)
+export const MATH_BOX_OFFSET_FLAGS = 0x08;
+export const MATH_BOX_OFFSET_OPERATOR_TARGET = 0x0C; // i32 LayoutUnits
 export const SUBTREE_INFO_BASE = 0x00742500;
 export const SUBTREE_INFO_SIZE = 0x00008CB0;
 export const SUBTREE_INFO_ENTRY_SIZE = 16;
@@ -3009,18 +3710,20 @@ export const LAYOUT_CACHE_ENTRY_SIZE = 128;
 // (pre-existing) box-granularity contract.
 export const PREV_PAINTED_BOX_BASE = 0x00791730;
 export const PREV_PAINTED_BOX_SIZE = 0x00011960;
-// D2 piece B: the per-frame scroll table. One record per layout node
-// index for nodes that are scroll containers: the CUMULATIVE device-px
-// offset applied under that scroller's containing-block-resolved
-// CMD_SET_SCROLL scope (f32 dx, f32 dy — the sum of active ancestor
-// scopes, including this one). Absolute subtrees can adopt their containing
-// block's outer scope; fixed subtrees adopt the zero scope.
-// Entry 0 belongs to the root/no-scroller state and stays zero. Rewritten every
-// emit; a scroll-only frame changes ONLY this table, never command
-// bytes.
-export const SCROLL_TABLE_BASE = 0x007A3090;
+// D2 piece B: the per-frame scroll table of CUMULATIVE device-px offsets
+// (f32 dx, f32 dy - the sum of active ancestor scopes, including this
+// one). Entry 0 belongs to the root/no-scroller state and stays zero;
+// entry node + 1 is a scroll container's CMD_SET_SCROLL scope, resolved
+// by containing block (absolute subtrees can adopt their containing
+// block's outer scope; fixed subtrees adopt the zero scope); the entries
+// from node count + 1 on are sticky scopes, one per sticky node in the
+// order the full walk opens them. Two entries per node and the reserved
+// one. Rewritten every emit; a scroll-only frame changes ONLY this table,
+// never command bytes. It sits after TABLE_SCRATCH; the span
+// [0x007A3090, 0x007A76F0) before SCROLL_LAST_EMITTED is unused.
+export const SCROLL_TABLE_BASE = 0x005DB708;
 export const SCROLL_TABLE_ENTRY_SIZE = 8;
-export const SCROLL_TABLE_SIZE = 0x00004660; // 2251 nodes + reserved entry 0
+export const SCROLL_TABLE_SIZE = 0x00008CB8; // 2 × 2251 nodes + reserved entry 0
 // Separate regions: never borrow live scroll-table rows for emission history,
 // nesting scratch, or scope flags.
 export const SCROLL_LAST_EMITTED_BASE = 0x007A76F0;
@@ -3030,7 +3733,7 @@ export const SCROLL_SAVE_STACK_SIZE = 0x00003000; // 512 × 24-byte frames
 export const SCROLL_SCOPE_FLAGS_BASE = 0x007AED50;
 export const SCROLL_SCOPE_FLAGS_SIZE = 0x000008D0;
 // The repacked tail and collapsed arena remain within the same reservation.
-export const FIXED_REGIONS_END = 0x01A47000;
+export const FIXED_REGIONS_END = 0x01A5B000;
 export const ACTUAL_INITIAL_PAGES = 804; // includes the maximum checked collapsed-edge arena
 // The collapsed-border arena starts exactly at FIXED_REGIONS_END and
 // grows upward into the 804-page reservation. Metadata and original borders
@@ -3064,7 +3767,7 @@ export const DOM_INITIAL_PAGES = 944;
 
 // Sparse paint transactions publish changed command ranges through getters;
 // their private row/range allocations do not occupy fixed-map addresses.
-export const RETAINED_FRAME_ABI_VERSION = 1;
+export const RETAINED_FRAME_ABI_VERSION = 2;
 
 // =======================================================================
 // Verification
@@ -3078,6 +3781,38 @@ export function verifyLayout(wasmExports) {
       RETAINED_FRAME_ABI_VERSION,
     ],
     ["headerBase", wasmExports.header_base(), HEADER_BASE],
+    ["inheritedMaskFontSize", wasmExports.inherited_mask_font_size(), INHERITED_MASK_FONT_SIZE],
+    ["inheritedMaskLineHeight", wasmExports.inherited_mask_line_height(), INHERITED_MASK_LINE_HEIGHT],
+    ["nodeListMarkerOffset", wasmExports.node_list_marker_offset(), LAYOUT_NODE_OFFSET_LIST_MARKER],
+    ["listMarkerOutside", wasmExports.list_marker_outside(), LIST_MARKER_OUTSIDE],
+    ["nodeSvgPaintCurrentColorOffset", wasmExports.node_svg_paint_current_color_offset(), LAYOUT_NODE_OFFSET_SVG_PAINT_CURRENT_COLOR],
+    ["svgPaintCurrentColorFill", wasmExports.svg_paint_current_color_fill(), SVG_PAINT_CURRENT_COLOR_FILL],
+    ["svgPaintCurrentColorStroke", wasmExports.svg_paint_current_color_stroke(), SVG_PAINT_CURRENT_COLOR_STROKE],
+    ["nodeLanguageOffset", wasmExports.node_language_offset(), LAYOUT_NODE_OFFSET_LANGUAGE],
+    ["nodeLineBreakOffset", wasmExports.node_line_break_offset(), LAYOUT_NODE_OFFSET_LINE_BREAK],
+    ["lineBreakStrict", wasmExports.line_break_strict(), LINE_BREAK_STRICT],
+    ["lineBreakAnywhere", wasmExports.line_break_anywhere(), LINE_BREAK_ANYWHERE],
+    ["lineBreakStrictnessMask", wasmExports.line_break_strictness_mask(), LINE_BREAK_STRICTNESS_MASK],
+    ["wordBreakBreakAll", wasmExports.word_break_break_all(), WORD_BREAK_BREAK_ALL],
+    ["wordBreakKeepAll", wasmExports.word_break_keep_all(), WORD_BREAK_KEEP_ALL],
+    ["textSpacingTrimShift", wasmExports.text_spacing_trim_shift(), TEXT_SPACING_TRIM_SHIFT],
+    ["textSpacingTrimMask", wasmExports.text_spacing_trim_mask(), TEXT_SPACING_TRIM_MASK],
+    ["nodeScrollbarLayoutOffset", wasmExports.node_scrollbar_layout_offset(), LAYOUT_NODE_OFFSET_SCROLLBAR_LAYOUT],
+    ["nodeScrollbarStateOffset", wasmExports.node_scrollbar_state_offset(), LAYOUT_NODE_OFFSET_SCROLLBAR_STATE],
+    ["scrollbarThicknessMask", wasmExports.scrollbar_thickness_mask(), SCROLLBAR_THICKNESS_MASK],
+    ["scrollbarVerticalLeft", wasmExports.scrollbar_vertical_left(), SCROLLBAR_VERTICAL_LEFT],
+    ["scrollbarBothEdges", wasmExports.scrollbar_both_edges(), SCROLLBAR_BOTH_EDGES],
+    ["scrollbarVerticalReserved", wasmExports.scrollbar_vertical_reserved(), SCROLLBAR_VERTICAL_RESERVED],
+    ["scrollbarHorizontalReserved", wasmExports.scrollbar_horizontal_reserved(), SCROLLBAR_HORIZONTAL_RESERVED],
+    ["scrollbarVerticalAuto", wasmExports.scrollbar_vertical_auto(), SCROLLBAR_VERTICAL_AUTO],
+    ["scrollbarHorizontalAuto", wasmExports.scrollbar_horizontal_auto(), SCROLLBAR_HORIZONTAL_AUTO],
+    ["scrollbarVerticalApplied", wasmExports.scrollbar_vertical_applied(), SCROLLBAR_VERTICAL_APPLIED],
+    ["scrollbarHorizontalApplied", wasmExports.scrollbar_horizontal_applied(), SCROLLBAR_HORIZONTAL_APPLIED],
+    ["scrollbarRegularThickness", wasmExports.scrollbar_regular_thickness(), SCROLLBAR_REGULAR_THICKNESS],
+    ["scrollbarThinThickness", wasmExports.scrollbar_thin_thickness(), SCROLLBAR_THIN_THICKNESS],
+    ["textSpacingTrimSpaceAll", wasmExports.text_spacing_trim_space_all(), TEXT_SPACING_TRIM_SPACE_ALL],
+    ["textSpacingTrimSpaceFirst", wasmExports.text_spacing_trim_space_first(), TEXT_SPACING_TRIM_SPACE_FIRST],
+    ["textSpacingTrimTrimStart", wasmExports.text_spacing_trim_trim_start(), TEXT_SPACING_TRIM_TRIM_START],
     ["tileConfigBase", wasmExports.tile_config_base(), TILE_CONFIG_BASE],
     ["tileConfigSize", wasmExports.tile_config_size(), TILE_CONFIG_SIZE],
     [
@@ -3104,6 +3839,24 @@ export function verifyLayout(wasmExports) {
       wasmExports.command_buffer_size(),
       COMMAND_BUFFER_SIZE,
     ],
+    ["colorGlyphPathIndexBase", wasmExports.color_glyph_path_index_base(), COLOR_GLYPH_PATH_INDEX_BASE],
+    ["builtinPathIndexBase", wasmExports.builtin_path_index_base(), BUILTIN_PATH_INDEX_BASE],
+    ["listMarkerDisclosureClosed", wasmExports.list_marker_disclosure_closed(), LIST_MARKER_DISCLOSURE_CLOSED],
+    ["listMarkerDisclosureOpen", wasmExports.list_marker_disclosure_open(), LIST_MARKER_DISCLOSURE_OPEN],
+    ["colorGlyphImageIndexBase", wasmExports.color_glyph_image_index_base(), COLOR_GLYPH_IMAGE_INDEX_BASE],
+    ["colorGlyphImageResourceCount", wasmExports.color_glyph_image_resource_count(), COLOR_GLYPH_IMAGE_RESOURCE_COUNT],
+    ["cmdImageFlagGlyphBitmap", wasmExports.cmd_image_flag_glyph_bitmap(), CMD_IMAGE_FLAG_GLYPH_BITMAP],
+    ["colorGlyphCacheIndexBase", wasmExports.color_glyph_cache_index_base(), COLOR_GLYPH_CACHE_INDEX_BASE],
+    ["colorGlyphCacheCapacity", wasmExports.color_glyph_cache_capacity(), COLOR_GLYPH_CACHE_CAPACITY],
+    ["colorGlyphCachePageIndexBase", wasmExports.color_glyph_cache_page_index_base(), COLOR_GLYPH_CACHE_PAGE_INDEX_BASE],
+    ["colorGlyphCacheResourceCount", wasmExports.color_glyph_cache_resource_count(), COLOR_GLYPH_CACHE_RESOURCE_COUNT],
+    ["fontUnitSubdivision", wasmExports.font_unit_subdivision(), FONT_UNIT_SUBDIVISION],
+    ["gradientKindColrLinear", wasmExports.gradient_kind_colr_linear(), GRADIENT_KIND_COLR_LINEAR],
+    ["gradientKindColrSweep", wasmExports.gradient_kind_colr_sweep(), GRADIENT_KIND_COLR_SWEEP],
+    ["gradientKindFlagReflect", wasmExports.gradient_kind_flag_reflect(), GRADIENT_KIND_FLAG_REFLECT],
+    ["cmdSvgPathFlagGlyphOrigin", wasmExports.cmd_svg_path_flag_glyph_origin(), CMD_SVG_PATH_FLAG_GLYPH_ORIGIN],
+    ["clipEntryFlagGlyphOrigin", wasmExports.clip_entry_flag_glyph_origin(), CLIP_ENTRY_FLAG_GLYPH_ORIGIN],
+    ["cmdPushOpacityOffsetComposite", wasmExports.cmd_push_opacity_offset_composite(), CMD_PUSH_OPACITY_OFFSET_COMPOSITE],
     ["glyphBufferBase", wasmExports.glyph_buffer_base(), GLYPH_BUFFER_BASE],
     ["glyphBufferSize", wasmExports.glyph_buffer_size(), GLYPH_BUFFER_SIZE],
     [
@@ -3178,6 +3931,16 @@ export function verifyLayout(wasmExports) {
       TABLE_GRID_BOX_SIZE,
     ],
     [
+      "multicolumnFragmentPoolBase",
+      wasmExports.multicolumn_fragment_pool_base(),
+      MULTICOLUMN_FRAGMENT_POOL_BASE,
+    ],
+    [
+      "multicolumnFragmentPoolSize",
+      wasmExports.multicolumn_fragment_pool_size(),
+      MULTICOLUMN_FRAGMENT_POOL_SIZE,
+    ],
+    [
       "pristineBoxBufferBase",
       wasmExports.pristine_box_buffer_base(),
       PRISTINE_BOX_BUFFER_BASE,
@@ -3212,6 +3975,9 @@ export function verifyLayout(wasmExports) {
       wasmExports.subtree_info_base(),
       SUBTREE_INFO_BASE,
     ],
+    ["mathBoxBase", wasmExports.math_box_base(), MATH_BOX_BASE],
+    ["mathBoxSize", wasmExports.math_box_size(), MATH_BOX_SIZE],
+    ["mathBoxStride", wasmExports.math_box_entry_size(), MATH_BOX_ENTRY_SIZE],
     [
       "subtreeInfoSize",
       wasmExports.subtree_info_size(),
@@ -3342,6 +4108,18 @@ export function verifyLayout(wasmExports) {
       SHAPED_GLYPH_POOL_SIZE,
     ],
     [
+      "shapedGlyphEntrySize",
+      wasmExports.shaped_glyph_entry_size(),
+      SHAPED_GLYPH_ENTRY_SIZE,
+    ],
+    [
+      "shapedGlyphOffsetFont",
+      wasmExports.shaped_glyph_offset_font(),
+      SHAPED_GLYPH_OFFSET_FONT,
+    ],
+    ["shapedGlyphOffsetHanKerning", wasmExports.shaped_glyph_offset_han_kerning(), SHAPED_GLYPH_OFFSET_HAN_KERNING],
+    ["shapedGlyphFlagHalt", wasmExports.shaped_glyph_flag_halt(), SHAPED_GLYPH_FLAG_HALT],
+    [
       "textRunValidGenBase",
       wasmExports.text_run_valid_gen_base(),
       TEXT_RUN_VALID_GEN_BASE,
@@ -3414,6 +4192,54 @@ export function verifyLayout(wasmExports) {
     ["nodeSize", wasmExports.node_size(), LAYOUT_NODE_SIZE],
     ["fontTableBase", wasmExports.font_table_base(), FONT_TABLE_BASE],
     ["fontTableSize", wasmExports.font_table_size(), FONT_TABLE_SIZE],
+    ["fontTableEntrySize", wasmExports.font_table_entry_size(), FONT_TABLE_ENTRY_SIZE],
+    ["fontTableLengthOffset", wasmExports.font_table_length_offset(), FONT_TABLE_OFFSET_LENGTH],
+    ["fontTableHashOffset", wasmExports.font_table_hash_offset(), FONT_TABLE_OFFSET_HASH],
+    ["languageTableBase", wasmExports.language_table_base(), LANGUAGE_TABLE_BASE],
+    ["languageTableSize", wasmExports.language_table_size(), LANGUAGE_TABLE_SIZE],
+    ["languageTableEntrySize", wasmExports.language_table_entry_size(), LANGUAGE_TABLE_ENTRY_SIZE],
+    ["languageTableFeaturesBase", wasmExports.language_table_features_base(), LANGUAGE_TABLE_FEATURES_BASE],
+    ["languageTableFeaturesSize", wasmExports.language_table_features_size(), LANGUAGE_TABLE_FEATURES_SIZE],
+    [
+      "languageTableFeaturesEntrySize",
+      wasmExports.language_table_features_entry_size(),
+      LANGUAGE_TABLE_FEATURES_ENTRY_SIZE,
+    ],
+    [
+      "languageTableFeaturesOffsetCount",
+      wasmExports.language_table_features_offset_count(),
+      LANGUAGE_TABLE_FEATURES_OFFSET_COUNT,
+    ],
+    [
+      "languageTableFeaturesOffsetVariantCount",
+      wasmExports.language_table_features_offset_variant_count(),
+      LANGUAGE_TABLE_FEATURES_OFFSET_VARIANT_COUNT,
+    ],
+    [
+      "fontVariationTableBase",
+      wasmExports.font_variation_table_base(),
+      FONT_VARIATION_TABLE_BASE,
+    ],
+    [
+      "fontVariationTableSize",
+      wasmExports.font_variation_table_size(),
+      FONT_VARIATION_TABLE_SIZE,
+    ],
+    [
+      "fontDecorationTableBase",
+      wasmExports.font_decoration_table_base(),
+      FONT_DECORATION_TABLE_BASE,
+    ],
+    [
+      "fontDecorationTableSize",
+      wasmExports.font_decoration_table_size(),
+      FONT_DECORATION_TABLE_SIZE,
+    ],
+    ["fontStackTableBase", wasmExports.font_stack_table_base(), FONT_STACK_TABLE_BASE],
+    ["fontStackTableSize", wasmExports.font_stack_table_size(), FONT_STACK_TABLE_SIZE],
+    ["fontStackEntrySize", wasmExports.font_stack_entry_size(), FONT_STACK_ENTRY_SIZE],
+    ["fontStackOffsetSlots", wasmExports.font_stack_offset_slots(), FONT_STACK_OFFSET_SLOTS],
+    ["fontStackSlotSize", wasmExports.font_stack_slot_size(), FONT_STACK_SLOT_SIZE],
     ["imageTableBase", wasmExports.image_table_base(), IMAGE_TABLE_BASE],
     ["imageTableSize", wasmExports.image_table_size(), IMAGE_TABLE_SIZE],
     ["bgLayerPoolBase", wasmExports.bg_layer_pool_base(), BG_LAYER_POOL_BASE],
@@ -3490,6 +4316,16 @@ export function verifyLayout(wasmExports) {
     ["keyframePoolBase", wasmExports.keyframe_pool_base(), KEYFRAME_POOL_BASE],
     ["keyframePoolSize", wasmExports.keyframe_pool_size(), KEYFRAME_POOL_SIZE],
     [
+      "animatedShadowPoolBase",
+      wasmExports.animated_shadow_pool_base(),
+      ANIMATED_SHADOW_POOL_BASE,
+    ],
+    [
+      "animatedShadowPoolSize",
+      wasmExports.animated_shadow_pool_size(),
+      ANIMATED_SHADOW_POOL_SIZE,
+    ],
+    [
       "transformComponentPoolBase",
       wasmExports.transform_component_pool_base(),
       TRANSFORM_COMPONENT_POOL_BASE,
@@ -3559,6 +4395,33 @@ export function verifyLayout(wasmExports) {
       wasmExports.animation_result_size(),
       ANIMATION_RESULT_SIZE,
     ],
+    [
+      "rasterPlanAbiVersion",
+      wasmExports.raster_plan_abi_version(),
+      RASTER_PLAN_ABI_VERSION,
+    ],
+    [
+      "rasterPlanHeaderSize",
+      wasmExports.raster_plan_header_size(),
+      RASTER_PLAN_HEADER_SIZE,
+    ],
+    [
+      "rasterPlanRecordSize",
+      wasmExports.raster_plan_record_size(),
+      RASTER_PLAN_RECORD_SIZE,
+    ],
+    [
+      "rasterPlanClipEntrySize",
+      wasmExports.raster_plan_clip_entry_size(),
+      RASTER_PLAN_CLIP_ENTRY_SIZE,
+    ],
+    [
+      "rasterPlanScrollbarRowSize",
+      wasmExports.raster_plan_scrollbar_row_size(),
+      RASTER_PLAN_SCROLLBAR_ROW_SIZE,
+    ],
+    ["glyphRequestHeaderSize", wasmExports.glyph_request_header_size(), GLYPH_REQUEST_HEADER_SIZE],
+    ["glyphRequestRowSize", wasmExports.glyph_request_row_size(), GLYPH_REQUEST_ROW_SIZE],
   ];
 
   const mismatches = [];
@@ -3588,13 +4451,15 @@ export function verifyLayout(wasmExports) {
       TABLE_GRID_BOX_ENTRY_SIZE,
     ],
     ["subtree info", SUBTREE_INFO_SIZE, SUBTREE_INFO_ENTRY_SIZE],
+    ["math boxes", MATH_BOX_SIZE, MATH_BOX_ENTRY_SIZE],
     ["layout cache", LAYOUT_CACHE_SIZE, LAYOUT_CACHE_ENTRY_SIZE],
     ["previous painted boxes", PREV_PAINTED_BOX_SIZE, BOX_SIZE],
     ["scroll data", SCROLL_DATA_BUFFER_SIZE, SCROLL_DATA_ENTRY_SIZE],
+    ["text run directory", TEXT_RUN_DIR_SIZE, TEXT_RUN_ENTRY_SIZE],
     [
       "scroll table",
       SCROLL_TABLE_SIZE - SCROLL_TABLE_ENTRY_SIZE,
-      SCROLL_TABLE_ENTRY_SIZE,
+      SCROLL_TABLE_ENTRY_SIZE * 2,
     ],
     [
       "scroll emission history",

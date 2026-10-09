@@ -2,6 +2,8 @@ import { readBinaryFile } from "../host.js";
 import { installComponentGlobals } from "./component-globals.js";
 import { SDDocument } from "./node.js";
 
+export class InvalidResourceResponseError extends TypeError {}
+
 const textEncoder = new TextEncoder();
 
 async function digest(bytes) {
@@ -48,6 +50,26 @@ function normalizeStylesheets(stylesheets, documentURL) {
   }));
 }
 
+// Every MathML element's unsupported MathML, as recoverable warnings that
+// name the element (plans/layout/PLAN-mathml-layout.md, Acceptance).
+const MATHML_NAMESPACE = "http://www.w3.org/1998/Math/MathML";
+function mathmlDiagnostics(document) {
+  const diagnostics = [];
+  for (const element of document.querySelectorAll("*")) {
+    if (element.namespaceURI !== MATHML_NAMESPACE) continue;
+    for (const { code, message } of element._domCore.mathmlDiagnostics(element._coreHandle)) {
+      diagnostics.push(Object.freeze({
+        code,
+        severity: "warning",
+        recoverable: true,
+        message,
+        owner: Object.freeze({ element: `${element.localName}${element.id ? `#${element.id}` : ""}` }),
+      }));
+    }
+  }
+  return diagnostics;
+}
+
 export async function createPreparedDocument({
   url = "about:blank",
   resolveResource: callerResolveResource = null,
@@ -81,10 +103,8 @@ export async function createPreparedDocument({
     },
   ) => {
     if (released) throw new Error("prepared document has been released");
-    const requestedFinalURL = new URL(
-      requestedURL,
-      resourceBaseURL ?? documentURL,
-    ).href;
+    const baseURL = resourceBaseURL ?? document.baseURI;
+    const requestedFinalURL = new URL(requestedURL, baseURL).href;
     let resource = resourcesByURL.get(requestedFinalURL);
     if (resource) return resource;
 
@@ -101,7 +121,7 @@ export async function createPreparedDocument({
       : callerResolveResource
       ? await callerResolveResource({
         requestedURL: authoredURL,
-        baseURL: resourceBaseURL ?? documentURL,
+        baseURL,
         finalURL: requestedFinalURL,
         kind,
       })
@@ -110,7 +130,9 @@ export async function createPreparedDocument({
         finalURL: requestedFinalURL,
       };
     if (!(resolved?.bytes instanceof Uint8Array)) {
-      throw new TypeError("resolveResource must return Uint8Array bytes");
+      throw new InvalidResourceResponseError(
+        "resolveResource must return Uint8Array bytes",
+      );
     }
     if (
       resolved.ownership !== undefined &&
@@ -162,6 +184,9 @@ export async function createPreparedDocument({
     resolveStylesheet: resolveResource,
     reportException,
   });
+  // Surfaces created directly from this document use the same locator,
+  // ownership and cache as stylesheets and prepared-input operations.
+  document._resolveResource = resolveResource;
   const window = windowTarget === null
     ? null
     : installComponentGlobals(windowTarget, document);
@@ -209,7 +234,11 @@ export async function createPreparedDocument({
       return resourceRecords();
     },
     get diagnostics() {
-      return Object.freeze([...document._styleSystem.resourceDiagnostics]);
+      return Object.freeze([
+        ...document._styleSystem.resourceDiagnostics,
+        ...document._brokenImageDiagnostics.values(),
+        ...mathmlDiagnostics(document),
+      ]);
     },
     async release() {
       if (released) return;

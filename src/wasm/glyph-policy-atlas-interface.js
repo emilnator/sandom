@@ -37,7 +37,7 @@ export const CANONICAL_KEY_SIZE = 24;
 export const CANONICAL_KEY_GLYPH_ID_OFFSET = 0;
 export const CANONICAL_KEY_WEIGHT_OFFSET = 4;
 export const CANONICAL_KEY_OPTICAL_SIZE_OFFSET = 8;
-export const CANONICAL_KEY_MSDF_SIZE_OFFSET = 16;
+export const CANONICAL_KEY_SIZE_CLASS_OFFSET = 16;
 export const CANONICAL_KEY_HASH_OFFSET = 20;
 export const RESIDENCY_SIZE = 96;
 export const RESIDENCY_KEY_OFFSET = 0;
@@ -86,7 +86,7 @@ export function readCanonicalKey(view, pointer) {
     glyphId: view.getUint32(pointer + 0, true),
     weight: view.getFloat32(pointer + 4, true),
     opticalSize: view.getFloat64(pointer + 8, true),
-    msdfSize: view.getUint32(pointer + 16, true),
+    sizeClass: view.getUint32(pointer + 16, true),
     hash: view.getUint32(pointer + 20, true),
   };
 }
@@ -96,7 +96,7 @@ export function writeCanonicalKey(view, pointer, value) {
   view.setUint32(pointer + 0, value.glyphId, true);
   view.setFloat32(pointer + 4, value.weight, true);
   view.setFloat64(pointer + 8, value.opticalSize, true);
-  view.setUint32(pointer + 16, value.msdfSize, true);
+  view.setUint32(pointer + 16, value.sizeClass, true);
   view.setUint32(pointer + 20, value.hash, true);
 }
 export function readResidency(view, pointer) {

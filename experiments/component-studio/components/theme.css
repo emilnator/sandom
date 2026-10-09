@@ -1,0 +1,2 @@
+:root { --primary: #6851d8; --primary-foreground: #ffffff; --ring: #b5a4f4; }
+[data-component] button { border-radius: 12px; }

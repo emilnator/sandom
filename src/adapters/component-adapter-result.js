@@ -79,9 +79,6 @@ function frame(value, name) {
   if (!ArrayBuffer.isView(value.pixels) || value.pixels instanceof DataView) {
     throw new TypeError(`${name}.pixels must be a typed array`);
   }
-  if (value.png !== null && !(value.png instanceof Uint8Array)) {
-    throw new TypeError(`${name}.png must be a Uint8Array or null`);
-  }
   finite(value.width, `${name}.width`);
   finite(value.height, `${name}.height`);
   finite(value.deviceScale, `${name}.deviceScale`);

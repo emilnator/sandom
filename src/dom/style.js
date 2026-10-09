@@ -1,6 +1,7 @@
 // The `style` proxy accepts CSS-shaped property writes and resolves them into
-// the flat fields consumed by the scene writer. Programmatic property writes
-// fail loudly, while parsed declaration lists follow CSS recovery: unsupported
+// the flat fields consumed by the scene writer. Invalid values for supported
+// programmatic properties fail loudly; unknown named-property assignments are
+// CSSOM no-ops. Parsed declaration lists follow CSS recovery: unsupported
 // declarations are discarded and exposed through `style.diagnostics`.
 //
 // serialize.js reads an element's resolved fields via style._fields — a
@@ -9,7 +10,7 @@
 
 import { parseCSSEasing } from "../dom-wasm/easing.js";
 import { sharedDomCore } from "../dom-wasm/core.js";
-import { animationLength as parseAnimationLength, animationProperty } from "../dom-wasm/animation.js";
+import { animationLength as parseAnimationLength, animationLineHeight, animationProperty } from "../dom-wasm/animation.js";
 import { createInlineStyleClass } from "./dom-bindings.generated.js";
 
 // ---- value parsing ----
@@ -23,9 +24,9 @@ import { createInlineStyleClass } from "./dom-bindings.generated.js";
 // (docs/specifications/color-and-image-data.md). The DOM core parses and
 // converts through the shared color kernel; wide-gamut and high-dynamic-
 // range input keeps components below zero and above one; no gamut map and
-// no channel clamp run here. The high-dynamic-range render path converts
-// these values into linear Rec. 2020 at its own boundary
-// (src/render-commands.js). An invalid value throws.
+// no channel clamp run here. Native raster-plan preparation converts these
+// values into linear Rec. 2020 for the high-dynamic-range render path. An
+// invalid value throws.
 export function parseColor(raw) {
   if (raw === undefined || raw === null || raw === "") {
     return { r: 0, g: 0, b: 0, a: 0 };
@@ -110,6 +111,18 @@ export const droppedDeclarations = new Set();
 // explicit methods use the core's custom declaration storage.
 
 
+function parseAnimationTranslate(value) {
+  const slots = sharedDomCore.declarationSlots("translate", String(value));
+  if (!slots?.length || slots[0].kind === 1 || slots[0].value?.x === undefined) {
+    throw new TypeError(`Invalid translate value: ${String(value).trim()}`);
+  }
+  return {
+    kind: "translate",
+    x: slots[0].value.x,
+    y: slots[0].value.y,
+  };
+}
+
 export function canonicalizeAnimationKeyframes(keyframes) {
   if (!Array.isArray(keyframes)) {
     throw new TypeError("keyframes must be an array");
@@ -149,6 +162,10 @@ export function canonicalizeAnimationKeyframes(keyframes) {
         };
       } else if (property.id === 14) {
         canonical[cssName] = { kind: "keyword", keyword: String(value) };
+      } else if (property.id === 25) {
+        canonical[cssName] = animationLineHeight(value);
+      } else if (property.id === 26) {
+        canonical[cssName] = parseAnimationTranslate(value);
       } else {
         canonical[cssName] = parseAnimationLength(value);
       }
@@ -168,12 +185,14 @@ function animationBaseValue(property, value) {
       components: sharedDomCore.transformComponents(value),
     };
   }
+  if (property === "translate") return parseAnimationTranslate(value);
   if (property === "opacity") return { kind: "scalar", value: Number(value) };
   if (property === "backgroundColor") {
     const color = parseColor(value);
     return { kind: "color", value: [color.r, color.g, color.b, color.a] };
   }
   if (property === "visibility") return { kind: "keyword", keyword: value };
+  if (property === "lineHeight" || property === "line-height") return animationLineHeight(value);
   return parseAnimationLength(value);
 }
 
@@ -337,11 +356,14 @@ export function createStyle(element) {
       // a dash-prefixed name is a silent no-op, exactly like a real
       // CSSStyleDeclaration — only setProperty (above) actually sets one.
       if (prop.startsWith("--")) return true;
+      const property = cssPropertyToIDLName(prop);
+      if (target._unsupportedName(property)) return true;
       if (value === "") {
         target.removeProperty(prop);
         return true;
       }
-      const property = cssPropertyToIDLName(prop);
+      // Keep the core's strict check for engine callers. Only the CSSOM named
+      // property setter turns an unknown authored property into a no-op.
       target._element._domCore.styleCheckName(property);
       target._set(property, String(value), "", 0);
       return true;

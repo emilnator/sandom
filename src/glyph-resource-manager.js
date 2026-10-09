@@ -56,8 +56,7 @@ function compareBytes(first, second) {
 // took the identity-hit path, every one then walked the whole face a byte at
 // a time, and that walk was 16% of a CPU profile with an animation running
 // and 20% with none — about 99 MB/s of comparison to confirm what the
-// WeakMap had already answered
-// (plans/bugs/BUG-font-bytes-compared-every-glyph-request.md).
+// WeakMap had already answered.
 function viewCanChangeUnderUs(bytes) {
   const buffer = bytes.buffer;
   if (buffer.resizable || buffer.growable) return true;
@@ -132,6 +131,22 @@ function normalizeRequests(requests) {
         `glyph resource request ${requestIndex} weight must be finite`,
       );
     }
+    const faceIndex = request.faceIndex ?? 0;
+    if (!Number.isInteger(faceIndex) || faceIndex < 0 || faceIndex > 0xFFFFFFFF) {
+      throw new RangeError(`glyph resource request ${requestIndex} faceIndex ${faceIndex} is outside 0..4294967295; select a valid collection face`);
+    }
+    const variationWidth = request.variationWidth ?? 0;
+    if (!Number.isFinite(variationWidth) || variationWidth < 0) {
+      throw new RangeError(
+        `glyph resource request ${requestIndex} variationWidth must be a finite 'wdth' coordinate or 0 for none; got ${request.variationWidth}`,
+      );
+    }
+    const variationSlant = request.variationSlant ?? 0;
+    if (!Number.isFinite(variationSlant)) {
+      throw new RangeError(
+        `glyph resource request ${requestIndex} variationSlant must be a finite 'slnt' coordinate (0 for upright); got ${request.variationSlant}`,
+      );
+    }
     if (
       request.opticalSize !== null && request.opticalSize !== undefined &&
       !Number.isFinite(request.opticalSize)
@@ -151,6 +166,9 @@ function normalizeRequests(requests) {
     }
     return Object.freeze({
       fontBytes: request.fontBytes,
+      faceIndex,
+      variationWidth,
+      variationSlant,
       glyphIds,
       weight: request.weight,
       opticalSize: request.opticalSize ?? null,
@@ -164,7 +182,8 @@ export class GlyphResourceManager {
     maxEntries = DEFAULT_GLYPH_RESOURCE_LIMITS.maxEntries,
     maxBytes = DEFAULT_GLYPH_RESOURCE_LIMITS.maxBytes,
     webGpuGeneratorFactory = createWebGpuMsdfGenerator,
-    glyphAtlasFactory = (fontBytes) => new GlyphAtlas(fontBytes),
+    glyphAtlasFactory = (fontBytes, variationWidth, variationSlant, faceIndex) =>
+      new GlyphAtlas(fontBytes, variationWidth, variationSlant, faceIndex),
   } = {}) {
     validateLimits(maxEntries, maxBytes);
     this.maxEntries = maxEntries;
@@ -248,14 +267,18 @@ export class GlyphResourceManager {
     );
   }
 
-  async _fontRecord(fontBytes) {
+  // One record per collection face and width/slant instance of a font file.
+  async _fontRecord(fontBytes, variationWidth, variationSlant, faceIndex) {
     // The identity cache. A hit means this exact view object produced this
     // record already; whether that is enough depends on whether the bytes
     // behind it can have moved since (see viewCanChangeUnderUs). For the
     // ordinary case — a face the registry loaded into a buffer it owns — the
     // byteLength agreeing is the whole check, and this runs once per glyph
     // request on every frame, so it has to cost nothing.
-    const cachedRecord = this._fontRecordsByObject.get(fontBytes);
+    let recordsByFace = this._fontRecordsByObject.get(fontBytes);
+    let recordsByWidth = recordsByFace?.get(faceIndex);
+    let recordsBySlant = recordsByWidth?.get(variationWidth);
+    const cachedRecord = recordsBySlant?.get(variationSlant);
     if (
       cachedRecord &&
       cachedRecord.fontBytes.byteLength === fontBytes.byteLength &&
@@ -263,6 +286,18 @@ export class GlyphResourceManager {
         compareBytes(cachedRecord.fontBytes, fontBytes))
     ) {
       return cachedRecord;
+    }
+    if (!recordsByFace) {
+      recordsByFace = new Map();
+      this._fontRecordsByObject.set(fontBytes, recordsByFace);
+    }
+    if (!recordsByWidth) {
+      recordsByWidth = new Map();
+      recordsByFace.set(faceIndex, recordsByWidth);
+    }
+    if (!recordsBySlant) {
+      recordsBySlant = new Map();
+      recordsByWidth.set(variationWidth, recordsBySlant);
     }
     const ownedFontBytes = fontBytes.slice();
     const digest = await this._contentDigest(ownedFontBytes);
@@ -272,15 +307,21 @@ export class GlyphResourceManager {
       this._fontRecordsByDigest.set(digest, records);
     }
     for (const record of records) {
+      if (record.faceIndex !== faceIndex) continue;
+      if (record.variationWidth !== variationWidth) continue;
+      if (record.variationSlant !== variationSlant) continue;
       if (!compareBytes(record.fontBytes, ownedFontBytes)) continue;
-      this._fontRecordsByObject.set(fontBytes, record);
+      recordsBySlant.set(variationSlant, record);
       return record;
     }
     const record = {
       contentDigest: digest,
       fontBytes: ownedFontBytes,
+      faceIndex,
+      variationWidth,
+      variationSlant,
       revision: {
-        atlas: this._glyphAtlasFactory(ownedFontBytes),
+        atlas: this._glyphAtlasFactory(ownedFontBytes, variationWidth, variationSlant, faceIndex),
         resourcesBySlot: new Map(),
         pinCount: 0,
         revision: ++this._revisionSequence,
@@ -293,7 +334,7 @@ export class GlyphResourceManager {
       requestAtlases: new Map(),
     };
     records.push(record);
-    this._fontRecordsByObject.set(fontBytes, record);
+    recordsBySlant.set(variationSlant, record);
     return record;
   }
 
@@ -372,7 +413,7 @@ export class GlyphResourceManager {
     if (previousRevision.pinCount > 0) {
       throw new Error("cannot replace a pinned glyph atlas revision");
     }
-    const atlas = this._glyphAtlasFactory(fontRecord.fontBytes);
+    const atlas = this._glyphAtlasFactory(fontRecord.fontBytes, fontRecord.variationWidth, fontRecord.variationSlant, fontRecord.faceIndex);
     const resourcesBySlot = new Map();
     const replacementRevision = {
       atlas,
@@ -521,7 +562,7 @@ export class GlyphResourceManager {
       cached.leaseCount++;
       return cached;
     }
-    const atlas = this._glyphAtlasFactory(fontRecord.fontBytes);
+    const atlas = this._glyphAtlasFactory(fontRecord.fontBytes, fontRecord.variationWidth, fontRecord.variationSlant, fontRecord.faceIndex);
     try {
       for (const descriptor of descriptors) {
         await atlas.copyGlyphFrom(
@@ -744,7 +785,7 @@ export class GlyphResourceManager {
       resolvedRequests.push({
         request,
         requestIndex,
-        fontRecord: await this._fontRecord(request.fontBytes),
+        fontRecord: await this._fontRecord(request.fontBytes, request.variationWidth, request.variationSlant, request.faceIndex),
       });
     }
 
@@ -1150,6 +1191,7 @@ export class GlyphResourceManager {
           [...pinnedRevisions].map((revision) => revision.revision),
         ),
         glyphPerformance: acquisitionPerformance,
+        get active() { return !released; },
         releaseSourcePins,
         release: () => {
           if (released) return;
@@ -1203,6 +1245,8 @@ export class GlyphResourceManager {
         GLYPH_RESOURCE_FORMAT_VERSION,
         backendIdentity,
         fontObjectIdentity,
+        request.variationWidth,
+        request.variationSlant,
         request.weight,
         request.opticalSize,
         request.devicePixelSize,

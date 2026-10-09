@@ -14,7 +14,7 @@
 // refresh rule: the DOM core reports growth synchronously after the
 // growing call (src/dom-wasm/core.js observeMemoryGrowth); every module
 // holding a long-lived view registers one listener (this loader's own
-// bytes/u32/f32, src/scene-renderer.js, src/session.js, src/animations.js).
+// bytes/u32/f32, src/scene-renderer.js, src/animations.js).
 
 import { RENDERER_CORE_HB_IMPORTS } from './renderer-core-binary.js';
 import { readBinaryFile } from '../host.js';
@@ -35,9 +35,11 @@ export const HB_BASE_BYTES = ACTUAL_INITIAL_PAGES * 65536;
 // The engine's fail-loud nets are `unreachable`, which carries no message:
 // a caller saw only `RuntimeError: unreachable` and had to disassemble the
 // wasm offsets to learn which guard fired (that is how
-// plans/bugs/BUG-exclusion-level-capacity-trap.md and
-// BUG-element-from-point-traps-on-live-document.md were filed — same
-// signature, no name). The engine writes $trapSite plus, for a capacity
+// BUG-exclusion-level-capacity-trap and
+// BUG-element-from-point-traps-on-live-document were filed — same
+// signature, no name; both resolved, see
+// activity/reports/REPORT-2026-10-09-resolved-bug-records.md). The engine
+// writes $trapSite plus, for a capacity
 // net, the observed value and the budget it exceeded; the layout entry
 // points read them back out here and rethrow a named error. Keep in step
 // with $trapSite's own doc comment in engine.wat.
@@ -54,7 +56,50 @@ const TRAP_SITE_NAMES = new Map([
   [10, "inline-state scratch exhausted"],
   [11, "flex items past this level's record budget"],
   [12, "flex scratch ungrowable"],
+  [13, "layout-cache hit on a collapsed table with moved pristine positions"],
+  [14, "multi-column fragment pool exhausted"],
+  [15, "color glyph paint operation without a command"],
+  [16, "command buffer exhausted by color glyph commands"],
+  [17, "color glyph path slots exhausted"],
+  [18, "color glyph bitmap slots exhausted"],
 ]);
+
+// Trap site 15 carries the glyph in trap_value and the operation in
+// trap_limit (engine-color-glyph.watpart $COLOR_GLYPH_OP_*): from 100 a
+// composite mode, from 356 a CBDT image format, 400 an sbix graphic type.
+const COLOR_GLYPH_OPERATION_NAMES = new Map([
+  [3, "color without a clip glyph"],
+  [4, "gradient without a clip glyph"],
+  [5, "radial_gradient"],
+  [6, "sweep_gradient"],
+  [7, "image"],
+  [8, "unbalanced transform, clip or group"],
+]);
+const COMPOSITE_MODE_NAMES = [
+  "CLEAR", "SRC", "DEST", "SRC_OVER", "DEST_OVER", "SRC_IN", "DEST_IN", "SRC_OUT",
+  "DEST_OUT", "SRC_ATOP", "DEST_ATOP", "XOR", "PLUS", "SCREEN", "OVERLAY", "DARKEN",
+  "LIGHTEN", "COLOR_DODGE", "COLOR_BURN", "HARD_LIGHT", "SOFT_LIGHT", "DIFFERENCE",
+  "EXCLUSION", "MULTIPLY", "HSL_HUE", "HSL_SATURATION", "HSL_COLOR", "HSL_LUMINOSITY",
+];
+
+function trapMessage(name, site, observed, limit) {
+  if (site === 15) {
+    const operation = limit === 400
+      ? "an sbix graphic type other than 'png ' (and 'dupe')"
+      : limit >= 356
+      ? `CBDT image format ${limit - 356} (only the PNG formats 17, 18 and 19 have a command)`
+      : limit >= 100
+      ? `pop_group with composite mode ${COMPOSITE_MODE_NAMES[limit - 100] ?? limit - 100}`
+      : COLOR_GLYPH_OPERATION_NAMES.get(limit) ?? `operation ${limit}`;
+    return `sandom engine trap in ${name}: color glyph ${observed} paints ${operation}, ` +
+      "which no command expresses (trap site 15); see plans/PLAN-color-glyphs.md";
+  }
+  return `sandom engine trap in ${name}: ${
+    TRAP_SITE_NAMES.get(site) ?? "unnamed guard"
+  } (trap site ${site}${
+    limit === 0 ? "" : `, observed ${observed}, budget ${limit}`
+  })`;
+}
 
 function attributeEngineTraps(exports) {
   const attributed = { ...exports };
@@ -69,14 +114,7 @@ function attributeEngineTraps(exports) {
         if (site === 0) throw error;
         const observed = exports.trap_value();
         const limit = exports.trap_limit();
-        throw new Error(
-          `sandom engine trap in ${name}: ${
-            TRAP_SITE_NAMES.get(site) ?? "unnamed guard"
-          } (trap site ${site}${
-            limit === 0 ? "" : `, observed ${observed}, budget ${limit}`
-          })`,
-          { cause: error },
-        );
+        throw new Error(trapMessage(name, site, observed, limit), { cause: error });
       }
     };
   }
@@ -180,6 +218,63 @@ async function initializeEngine(core, harfbuzzBytes) {
   for (let index = 0; index < RENDERER_CORE_HB_IMPORTS.length; index++) {
     allocator.renderer_hb_table.set(index, hb.exports[RENDERER_CORE_HB_IMPORTS[index]]);
   }
+  const glyphHarfBuzzImports = [
+    "hb_font_get_face",
+    "hb_draw_funcs_create",
+    "hb_draw_funcs_set_move_to_func",
+    "hb_draw_funcs_set_line_to_func",
+    "hb_draw_funcs_set_quadratic_to_func",
+    "hb_draw_funcs_set_cubic_to_func",
+    "hb_draw_funcs_set_close_path_func",
+    "hb_font_draw_glyph",
+    "hb_font_get_glyph_h_advance",
+    "hb_ot_var_get_axis_infos",
+  ];
+  for (let index = 0; index < glyphHarfBuzzImports.length; index++) {
+    allocator.glyph_hb_table.set(index, hb.exports[glyphHarfBuzzImports[index]]);
+  }
+  const callbackBase = hb.exports.__indirect_function_table.length;
+  const outlineCallbacks = [
+    "glyph_outline_move_to",
+    "glyph_outline_line_to",
+    "glyph_outline_quadratic_to",
+    "glyph_outline_cubic_to",
+    "glyph_outline_close_path",
+  ];
+  hb.exports.__indirect_function_table.grow(outlineCallbacks.length);
+  for (let index = 0; index < outlineCallbacks.length; index++) {
+    hb.exports.__indirect_function_table.set(
+      callbackBase + index,
+      allocator[outlineCallbacks[index]],
+    );
+  }
+  // Color glyph callbacks, in the order color_glyph_initialize expects.
+  const colorGlyphCallbackBase = hb.exports.__indirect_function_table.length;
+  const colorGlyphCallbacks = [
+    "color_glyph_draw_move_to",
+    "color_glyph_draw_line_to",
+    "color_glyph_draw_quadratic_to",
+    "color_glyph_draw_cubic_to",
+    "color_glyph_paint_push_transform",
+    "color_glyph_paint_pop_transform",
+    "color_glyph_paint_push_clip_glyph",
+    "color_glyph_paint_push_clip_rectangle",
+    "color_glyph_paint_pop_clip",
+    "color_glyph_paint_color",
+    "color_glyph_paint_image",
+    "color_glyph_paint_linear_gradient",
+    "color_glyph_paint_radial_gradient",
+    "color_glyph_paint_sweep_gradient",
+    "color_glyph_paint_push_group",
+    "color_glyph_paint_pop_group",
+  ];
+  hb.exports.__indirect_function_table.grow(colorGlyphCallbacks.length);
+  for (let index = 0; index < colorGlyphCallbacks.length; index++) {
+    hb.exports.__indirect_function_table.set(
+      colorGlyphCallbackBase + index,
+      allocator[colorGlyphCallbacks[index]],
+    );
+  }
   const observed = observeMemoryGrowth(memory, allocator, () => core.notifyGrowth());
   const measurement = globalThis[Symbol.for("sandom.domCore.measurement")];
   const exports = attributeEngineTraps(
@@ -188,6 +283,8 @@ async function initializeEngine(core, harfbuzzBytes) {
 
   exports.init();
   verifyLayout(exports);
+  exports.glyph_outline_initialize(callbackBase);
+  exports.color_glyph_initialize(colorGlyphCallbackBase);
 
   const engine = {
     memory,
@@ -202,8 +299,9 @@ async function initializeEngine(core, harfbuzzBytes) {
     core,
     // The one refresh rule: register a listener that re-derives every
     // long-lived view over the shared memory. Fired synchronously after
-    // the core or engine call that grew it returns.
-    onMemoryGrowth(listener) { core.onMemoryGrowth(listener); },
+    // the core or engine call that grew it returns. Returns the function
+    // that removes the listener (DomCore.onMemoryGrowth).
+    onMemoryGrowth(listener) { return core.onMemoryGrowth(listener); },
   };
   core.onMemoryGrowth(() => {
     engine.bytes = new Uint8Array(memory.buffer);

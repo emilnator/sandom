@@ -1,6 +1,16 @@
 import { scheduleMutationObservers } from "../dom/mutation-observer.js";
 import { instantiateRendererCore } from "../wasm/renderer-core-binary.js";
 import {
+  ANIMATION_RECORD_SIZE, LAYOUT_NODE_SIZE,
+  LAYOUT_NODE_OFFSET_BORDER_BOTTOM, LAYOUT_NODE_OFFSET_BORDER_LEFT,
+  LAYOUT_NODE_OFFSET_BORDER_RIGHT, LAYOUT_NODE_OFFSET_BORDER_TOP,
+  LAYOUT_NODE_OFFSET_BOX_SIZING, LAYOUT_NODE_OFFSET_MARGIN_BOTTOM,
+  LAYOUT_NODE_OFFSET_MARGIN_LEFT, LAYOUT_NODE_OFFSET_MARGIN_RIGHT,
+  LAYOUT_NODE_OFFSET_MARGIN_TOP, LAYOUT_NODE_OFFSET_POSITION,
+  LAYOUT_NODE_OFFSET_SHADOW_COUNT, LAYOUT_NODE_OFFSET_SHADOW_OFFSET,
+  POSITION_ABSOLUTE, SHADOW_POOL_BASE, SHADOW_ENTRY_SIZE,
+} from "../wasm/layout.js";
+import {
   coreTransportPoolKinds,
   EngineFrameInputSize,
   EngineFrameResolutionSize,
@@ -21,7 +31,8 @@ const applyNative = Reflect.apply;
 // site. CSS Cascade 4 §4.2 drops such a declaration and keeps the rest of
 // the rule; a failure anywhere else in the same apply path is an internal
 // defect and must reach the caller
-// (plans/bugs/BUG-style-resolution-swallows-internal-errors.md). The mark
+// (BUG-style-resolution-swallows-internal-errors, resolved; see
+// activity/reports/REPORT-2026-10-09-resolved-bug-records.md). The mark
 // rides on the exception the CSSOM and `animate()` are specified to throw,
 // so those surfaces keep their TypeError/RangeError.
 const authorValueRejection = Symbol("sandom.authorValueRejection");
@@ -78,6 +89,15 @@ export function observeMemoryGrowth(memory, exports, notify) {
   }
   return Object.freeze(wrapped);
 }
+
+// Cascade item pseudo-element kinds, indexed by the native discriminator.
+const PSEUDO_ELEMENT_NAMES = Object.freeze([
+  null,
+  "::before",
+  "::after",
+  "::unsupported",
+  "::selection",
+]);
 
 const ERROR_NAMES = new Map([
   [5, "HierarchyRequestError"],
@@ -196,23 +216,29 @@ function transformComponent(name, valueKind, a, b, c, d) {
   }
 }
 
+// Explicit disposal unregisters these tokens (`DomCore.dispose`), so a
+// finalizer only ever releases a handle the core still holds. A handle can
+// carry several registrations at once (`finalizerRegistrations`); each one
+// owns one retain, and only the last one drops the handle's cached state.
 const wrapperFinalizer = typeof FinalizationRegistry === "function"
-  ? new FinalizationRegistry(({ coreReference, handle }) => {
+  ? new FinalizationRegistry(({ coreReference, handle, reference }) => {
     const core = coreReference.deref();
     if (!core) return;
-    core.wrapperByHandle.delete(handle);
-    core.nodeTypes.delete(handle);
-    try {
-      core.exports.node_release(handle);
-    } catch {
-      // A finalizer can run after its document has been disposed.
+    if (core.wrapperByHandle.get(handle) === reference) {
+      core.wrapperByHandle.delete(handle);
     }
+    const registration = core.finalizerRegistrations.get(handle);
+    registration.count -= 1;
+    if (registration.count === 0) {
+      core.finalizerRegistrations.delete(handle);
+      core.nodeTypes.delete(handle);
+    }
+    core.status("node_release", handle);
   })
   : null;
 
 const EDGE_SIDES = ["top", "right", "bottom", "left"];
 const FIELD_MEMBERS = {
-  outline: ["width", "style", "color"],
   borderRadius: ["topLeft", "topRight", "bottomRight", "bottomLeft"],
   overflowClipMargin: ["visualBox", "offset"],
   scrollSnapType: ["axis", "strictness"],
@@ -235,11 +261,7 @@ const documentFinalizer = typeof FinalizationRegistry === "function"
   ? new FinalizationRegistry(({ coreReference, handle }) => {
     const core = coreReference.deref();
     if (!core) return;
-    try {
-      core.dispose(handle);
-    } catch {
-      // The document was disposed explicitly.
-    }
+    core.dispose(handle);
   })
   : null;
 
@@ -457,12 +479,13 @@ export class DomCoreComputedCustomProperties {
 export function createAllocatorCore() {
   const instance = instantiateRendererCore();
   const memory = instance.exports.memory;
-  const listeners = [];
+  const listeners = new Set();
   return Object.freeze({
     memory,
     rawExports: instance.exports,
     onMemoryGrowth(listener) {
-      listeners.push(listener);
+      listeners.add(listener);
+      return () => listeners.delete(listener);
     },
     notifyGrowth() {
       for (const listener of listeners) listener();
@@ -474,7 +497,7 @@ export class DomCore {
   constructor() {
     const instance = instantiateRendererCore();
     this.memory = instance.exports.memory;
-    this.growthListeners = [];
+    this.growthListeners = new Set();
     // Raw exports bind HarfBuzz's allocator directly; host calls go through
     // growth-observing wrappers so no caller reads a detached view.
     this.rawExports = instance.exports;
@@ -506,9 +529,13 @@ export class DomCore {
   }
 
   // The one refresh rule: a listener re-derives every long-lived view over
-  // the shared memory; fired synchronously after the growing call.
+  // the shared memory; fired synchronously after the growing call. The
+  // returned function removes the listener. An owner that ends before the
+  // core calls it when it ends; until then the listener's closure retains
+  // the owner, and everything the owner references, for the core's life.
   onMemoryGrowth(listener) {
-    this.growthListeners.push(listener);
+    this.growthListeners.add(listener);
+    return () => this.growthListeners.delete(listener);
   }
 
   refreshBytes() {
@@ -516,47 +543,6 @@ export class DomCore {
       this.bytes = new Uint8Array(this.memory.buffer);
     }
     return this.bytes;
-  }
-
-  frameOverlayDamage(frame, previous, next, scale, originX, originY) {
-    const pointer = this.exports.abi_allocate(272);
-    const view = new DataView(this.refreshBytes().buffer);
-    for (const [index, descriptor] of [previous, next].entries()) {
-      const at = pointer + index * 136;
-      view.setUint32(at, descriptor ? 1 : 0, true);
-      if (!descriptor) continue;
-      let offset = at + 8;
-      for (const rectangle of [descriptor.track, descriptor.thumb]) {
-        for (const name of ["x", "y", "width", "height"]) {
-          view.setFloat64(offset, rectangle[name], true);
-          offset += 8;
-        }
-      }
-      for (const color of [descriptor.colors.track, descriptor.colors.thumb]) {
-        for (const name of ["r", "g", "b", "a"]) {
-          view.setFloat64(offset, color[name], true);
-          offset += 8;
-        }
-      }
-    }
-    const measurement = globalThis[FRAME_MEASUREMENT];
-    if (measurement) {
-      measurement.record({
-        category: "damage",
-        operation: "frame_overlay_damage",
-        direction: "host-to-core",
-        bytes: 272,
-      });
-    }
-    return this.status(
-      "frame_overlay_damage",
-      frame,
-      pointer,
-      pointer + 136,
-      scale,
-      originX,
-      originY,
-    );
   }
 
   frameDamageRectangles(frame) {
@@ -582,6 +568,23 @@ export class DomCore {
         height: view.getFloat64(at + 24, true),
       };
     });
+  }
+
+  // The used caret-color of an element: its caret-color, or its own color
+  // for `auto`. { r, g, b, a } in 0..1.
+  styleUsedCaretColor(handle) {
+    this.status("style_used_caret_color", handle);
+    const view = new DataView(
+      this.refreshBytes().buffer,
+      this.exports.abi_output_pointer(),
+      32,
+    );
+    return {
+      r: view.getFloat64(0, true),
+      g: view.getFloat64(8, true),
+      b: view.getFloat64(16, true),
+      a: view.getFloat64(24, true),
+    };
   }
 
   frameDamageTiles(frame, width, height, tileSize) {
@@ -846,6 +849,22 @@ export class DomCore {
     );
   }
 
+  // The first syntax diagnostic of the last XML parse, or null when it was
+  // well formed. The readers neither begin an operation nor rotate state.
+  xmlParseDiagnostic() {
+    const line = this.exports.xml_parse_error_line();
+    if (line === 0) return null;
+    const pointer = this.exports.xml_parse_error_pointer();
+    return {
+      line,
+      column: this.exports.xml_parse_error_column(),
+      message: this.decoder.decode(this.refreshBytes().subarray(
+        pointer,
+        pointer + this.exports.xml_parse_error_length(),
+      )),
+    };
+  }
+
   isXmlDocument(documentHandle) {
     return this.status("document_is_xml", documentHandle) === 1;
   }
@@ -993,13 +1012,14 @@ export class DomCore {
     this.status("node_detach_shadow_root", hostHandle);
   }
 
-  // Decode core-owned resource usages in CSS order. Device acquisition is
+  // Decode core-owned resource usages in CSS order for the element
+  // (pseudo 0), its ::before (1) or its ::after (2). Device acquisition is
   // separate; these IDs remain stable across builds and shared renderers.
-  sceneResourceLayers(handle) {
-    const count = this.status("scene_resource_layers", handle);
+  sceneResourceLayers(handle, pseudo) {
+    const count = this.status("scene_resource_layers", handle, pseudo);
     const layers = new Array(count);
     for (let index = 0; index < count; index += 1) {
-      const resource = this.handle("scene_resource_layer", handle, index);
+      const resource = this.handle("scene_resource_layer", handle, pseudo, index);
       layers[index] = resource === 0n ? {} : {
         src: this.resourceKey(resource),
         resourceIdentifier: this.resourceId(resource),
@@ -1009,7 +1029,12 @@ export class DomCore {
   }
 
   wrapperCache(handle) {
-    const documentHandle = this.handle("node_owner_document", handle);
+    return this.documentWrapperCache(
+      this.handle("node_owner_document", handle),
+    );
+  }
+
+  documentWrapperCache(documentHandle) {
     let cache = this.wrapperCaches.get(documentHandle);
     if (!cache) {
       cache = new Map();
@@ -1017,17 +1042,42 @@ export class DomCore {
     }
     return cache;
   }
+
+  // A node's wrapper cache entry lives under its current owner document:
+  // `dispose` cancels the finalizers of exactly the handles the core frees,
+  // so an adopted node's entry moves with it (callback record kind 4).
+  moveWrapperCacheEntry(handle, oldDocumentHandle, newDocumentHandle) {
+    const priorCache = this.wrapperCaches.get(oldDocumentHandle);
+    const reference = priorCache?.get(handle);
+    if (!reference) return;
+    priorCache.delete(handle);
+    this.documentWrapperCache(newDocumentHandle).set(handle, reference);
+  }
+
   // Every live wrapper by handle, across documents: the lookup a scene
   // serialization makes per node must not cost a core call (the owner
   // document) each. Handles are unique per node lifetime (a slot
   // generation in the high bits), so a stale entry can only miss.
   wrapperByHandle = new Map();
 
+  // Unregister token per finalizer-registered handle (node wrappers and
+  // document wrappers): `dispose` must cancel finalization even for a
+  // wrapper that is already unreachable but not yet finalized. A collected
+  // wrapper's WeakRef clears before its finalizer runs, so `wrapperFor` can
+  // wrap the same handle again (with its own retain) while the first
+  // registration is still pending: every registration of a handle shares
+  // the handle's token, and `count` tracks how many are outstanding.
+  finalizerRegistrations = new Map();
+  documentFinalizerTokens = new Map();
+
   registerDocumentWrapper(wrapper, handle) {
-    documentFinalizer?.register(wrapper, {
+    if (!documentFinalizer) return;
+    const token = {};
+    this.documentFinalizerTokens.set(handle, token);
+    documentFinalizer.register(wrapper, {
       coreReference: new WeakRef(this),
       handle,
-    }, wrapper);
+    }, token);
   }
 
   registerWrapper(wrapper, handle, retained = true) {
@@ -1037,12 +1087,25 @@ export class DomCore {
     this.wrapperByHandle.set(handle, reference);
     this.wrapperCache(handle).set(handle, reference);
     if (wrapperFinalizer && retained) {
+      let registration = this.finalizerRegistrations.get(handle);
+      if (!registration) {
+        registration = { token: {}, count: 0 };
+        this.finalizerRegistrations.set(handle, registration);
+      }
+      registration.count += 1;
       wrapperFinalizer.register(
         wrapper,
-        { coreReference: new WeakRef(this), handle },
-        wrapper,
+        { coreReference: new WeakRef(this), handle, reference },
+        registration.token,
       );
     }
+  }
+
+  cancelFinalizer(handle) {
+    const registration = this.finalizerRegistrations.get(handle);
+    if (!registration) return;
+    this.finalizerRegistrations.delete(handle);
+    wrapperFinalizer.unregister(registration.token);
   }
 
   handleForWrapper(wrapper) {
@@ -1056,13 +1119,6 @@ export class DomCore {
     const cache = this.wrapperCache(handle);
     const existing = cache.get(handle)?.deref();
     if (existing) return existing;
-    for (const priorCache of this.wrapperCaches.values()) {
-      const adopted = priorCache.get(handle)?.deref();
-      if (!adopted) continue;
-      priorCache.delete(handle);
-      cache.set(handle, new WeakRef(adopted));
-      return adopted;
-    }
     if (!this.wrapperFactory) {
       throw new Error(`No wrapper factory for DOM core handle ${handle}`);
     }
@@ -1074,10 +1130,6 @@ export class DomCore {
 
   nodesEqual(leftHandle, rightHandle) {
     return this.status("node_is_equal", leftHandle, rightHandle) === 1;
-  }
-
-  unregisterWrapper(wrapper) {
-    wrapperFinalizer?.unregister(wrapper);
   }
 
   // A node's type never changes; the first read is the last core call.
@@ -1436,7 +1488,7 @@ export class DomCore {
         let outcome = 0;
         let message = "";
         try {
-          registry.fontFamilyKeyForCssValue(family);
+          registry.fontStackKeysForCssValue(family);
         } catch (error) {
           failure = error;
           outcome = error instanceof Error ? 1 : 2;
@@ -1514,6 +1566,20 @@ export class DomCore {
       );
     }
     return Object.freeze(diagnostics);
+  }
+
+  // An element's unsupported MathML (mathml.watpart): its name when it is
+  // outside MathML Core, then each presentation attribute Sandom ignores.
+  mathmlDiagnostics(handle) {
+    const diagnostics = [];
+    for (let index = 0; ; index++) {
+      const kind = this.status("mathml_diagnostic_at", handle, index);
+      if (kind === 0) return diagnostics;
+      diagnostics.push({
+        code: kind === 1 ? "mathml-unsupported-element" : "mathml-unsupported-attribute",
+        message: this.outputString(),
+      });
+    }
   }
 
   createStylesheet() {
@@ -1662,9 +1728,7 @@ export class DomCore {
       selectors[index] = {
         selectorText: slice(start, end),
         matchSelector: slice(start, view.getUint32(at + 8, true)),
-        pseudoElement: [null, "::before", "::after", "::unsupported"][
-          view.getUint32(at + 12, true)
-        ],
+        pseudoElement: PSEUDO_ELEMENT_NAMES[view.getUint32(at + 12, true)],
         specificity: [
           view.getUint32(at + 16, true),
           view.getUint32(at + 20, true),
@@ -1711,6 +1775,9 @@ export class DomCore {
       environment.reducedMotion ? 1 : 0,
       { srgb: 0, p3: 1, rec2020: 2 }[environment.colorGamut] ?? 0,
       environment.dynamicRange === "high" ? 1 : 0,
+      environment.hoverCapability === "none" ? 0 : 1,
+      { none: 0, coarse: 1, fine: 2 }[environment.pointerAccuracy] ?? 2,
+      environment.scrollbarStyle === "classic" ? 1 : 0,
     );
   }
 
@@ -1746,7 +1813,7 @@ export class DomCore {
       entryIndex: this.status("cascade_plan_item_field", plan, index, 0),
       shape: shapeFlags & 7,
       forPart: (shapeFlags & 8) !== 0,
-      pseudoElement: [null, "::before", "::after", "::unsupported"][
+      pseudoElement: PSEUDO_ELEMENT_NAMES[
         this.status("cascade_plan_item_field", plan, index, 2)
       ],
       usesHover: (stateFlags & 1) !== 0,
@@ -2000,6 +2067,54 @@ export class DomCore {
     };
   }
 
+  // Every URL that CSS text names, with its escapes decoded by the core's
+  // tokenizer: each url() and the string that an @import names. `start`
+  // and `end` are the UTF-16 offsets of the whole token, from `url(`
+  // through its `)`, or the quoted string.
+  cssURLs(text) {
+    const source = this.encoder.encode(String(text));
+    const count = this.status("css_url_tokens", ...this.byteInput(source, true));
+    const pointer = this.exports.abi_output_pointer();
+    const length = this.exports.abi_output_length();
+    const records = this.refreshBytes().slice(pointer, pointer + length);
+    const view = new DataView(records.buffer);
+    // The records count UTF-8 bytes; every byte that does not continue a
+    // sequence is one UTF-16 code unit, and a four-byte sequence is two.
+    let byteOffset = 0;
+    let textOffset = 0;
+    const textOffsetOf = (target) => {
+      for (; byteOffset < target; byteOffset++) {
+        const byte = source[byteOffset];
+        if ((byte & 0xc0) !== 0x80) textOffset += byte >= 0xf0 ? 2 : 1;
+      }
+      return textOffset;
+    };
+    const urls = new Array(count);
+    let offset = 0;
+    for (let index = 0; index < count; index++) {
+      const start = textOffsetOf(view.getUint32(offset, true));
+      const end = textOffsetOf(view.getUint32(offset + 4, true));
+      const urlLength = view.getUint32(offset + 8, true);
+      urls[index] = {
+        start,
+        end,
+        url: this.decoder.decode(records.subarray(offset + 12, offset + 12 + urlLength)),
+      };
+      offset += 12 + urlLength;
+    }
+    return urls;
+  }
+
+  // The ranges of an @font-face unicode-range descriptor value as a
+  // Uint32Array of {start, end} scalar pairs, sorted and disjoint, or null
+  // for an invalid descriptor, which Chrome ignores.
+  fontUnicodeRanges(text) {
+    const count = this.status("font_unicode_range_parse", ...this.input(text));
+    if (count < 0) return null;
+    const pointer = this.exports.abi_output_pointer();
+    return new Uint32Array(this.refreshBytes().buffer.slice(pointer, pointer + count * 8));
+  }
+
   cascadePlanCreate() {
     return this.status("cascade_plan_create");
   }
@@ -2144,6 +2259,15 @@ export class DomCore {
 
   sceneResourceNode(node) {
     return this.handle("scene_resource_node", node);
+  }
+
+  // The URL that an SVG element's fill (which 0) or stroke (which 1) names
+  // as its paint server, escapes decoded, or null when that paint names
+  // none (SceneBuildBox.host bits 4 and 8).
+  sceneSvgPaintServer(node, which) {
+    return this.status("scene_svg_paint_server", node, which)
+      ? this.outputString()
+      : null;
   }
 
   resourceEngineCreate() {
@@ -2306,17 +2430,114 @@ export class DomCore {
     }
     return records;
   }
+  // The shared-memory path stays wholly native. An isolated renderer transports
+  // the same raw ABI bytes, never decoded CSS values or a second style store.
+  captureComputedSample(engine, owner, identity, node, index, track, property, time) {
+    let record = engine.exports.layout_buffer_base() + index * LAYOUT_NODE_SIZE;
+    let shadows = 0;
+    if (engine.memory !== this.memory) {
+      const source = new DataView(engine.memory.buffer);
+      const shadowLength = property.kind === 7
+        ? source.getUint8(record + LAYOUT_NODE_OFFSET_SHADOW_COUNT) * SHADOW_ENTRY_SIZE
+        : 0;
+      shadows = shadowLength
+        ? SHADOW_POOL_BASE + source.getUint32(record + LAYOUT_NODE_OFFSET_SHADOW_OFFSET, true)
+        : 0;
+      const bytes = new Uint8Array(ANIMATION_RECORD_SIZE + LAYOUT_NODE_SIZE + shadowLength);
+      bytes.set(new Uint8Array(engine.memory.buffer, track, ANIMATION_RECORD_SIZE));
+      bytes.set(new Uint8Array(engine.memory.buffer, record, LAYOUT_NODE_SIZE), ANIMATION_RECORD_SIZE);
+      if (shadowLength) bytes.set(new Uint8Array(engine.memory.buffer, shadows, shadowLength),
+        ANIMATION_RECORD_SIZE + LAYOUT_NODE_SIZE);
+      const [pointer] = this.byteInput(bytes);
+      track = pointer;
+      record = pointer + ANIMATION_RECORD_SIZE;
+      shadows = record + LAYOUT_NODE_SIZE;
+    }
+    this.status("computed_samples_capture", owner, identity, node, index,
+      track, record, shadows, property.kind, property.valueOffset,
+      property.tagOffset ?? 0, property.percentageOffset ?? 0, time);
+  }
+  // Capture the layout-used values CSSOM exposes for ::before and ::after
+  // boxes (scene box kinds 14 and 15). The snapshot is renderer-owned like
+  // sampled animation values; the native view accepts it only while the
+  // element's cascade generation still matches. `generatedRows` lists the
+  // scene's rows of those boxes (a serialized scene carries them); without
+  // it every row's kind is read.
+  captureComputedPseudos(engine, owner, nodes, elements, boxes, generatedRows) {
+    this.status("computed_pseudos_clear", owner);
+    const view = new DataView(engine.memory.buffer);
+    const base = engine.exports.layout_buffer_base();
+    const rows = generatedRows ?? nodes.keys();
+    for (const index of rows) {
+      const kind = nodes[index]._coreBox & 0xff;
+      if (kind !== 14 && kind !== 15) continue;
+      const ownerIndex = nodes[index].generatedOwnerIndex;
+      const element = elements[ownerIndex];
+      if (!element || element._domCore !== this) continue;
+      const record = base + index * LAYOUT_NODE_SIZE;
+      // Absolute generated boxes are the layout-used CSSOM case. Relative
+      // and in-flow pseudos retain their ordinary computed inset keywords.
+      if (view.getUint8(record + LAYOUT_NODE_OFFSET_POSITION) !== POSITION_ABSOLUTE) {
+        continue;
+      }
+      // Read after the position: a frame's box list makes a box on its
+      // first read.
+      const box = boxes[index];
+      const containingBox = boxes[ownerIndex];
+      if (!box || !containingBox) continue;
+      const containingRecord = base + ownerIndex * LAYOUT_NODE_SIZE;
+      const marginTop = view.getFloat32(record + LAYOUT_NODE_OFFSET_MARGIN_TOP, true);
+      const marginRight = view.getFloat32(record + LAYOUT_NODE_OFFSET_MARGIN_RIGHT, true);
+      const marginBottom = view.getFloat32(record + LAYOUT_NODE_OFFSET_MARGIN_BOTTOM, true);
+      const marginLeft = view.getFloat32(record + LAYOUT_NODE_OFFSET_MARGIN_LEFT, true);
+      const paddingTopEdge = containingBox.y +
+        view.getFloat32(containingRecord + LAYOUT_NODE_OFFSET_BORDER_TOP, true);
+      const paddingRightEdge = containingBox.x + containingBox.w -
+        view.getFloat32(containingRecord + LAYOUT_NODE_OFFSET_BORDER_RIGHT, true);
+      const paddingBottomEdge = containingBox.y + containingBox.h -
+        view.getFloat32(containingRecord + LAYOUT_NODE_OFFSET_BORDER_BOTTOM, true);
+      const paddingLeftEdge = containingBox.x +
+        view.getFloat32(containingRecord + LAYOUT_NODE_OFFSET_BORDER_LEFT, true);
+      const contentBox = view.getUint8(record + LAYOUT_NODE_OFFSET_BOX_SIZING) === 0;
+      this.status(
+        "computed_pseudo_capture",
+        owner,
+        element._coreHandle,
+        kind - 13,
+        contentBox ? box.cw : box.w,
+        contentBox ? box.ch : box.h,
+        box.y - marginTop - paddingTopEdge,
+        paddingRightEdge - box.x - box.w - marginRight,
+        paddingBottomEdge - box.y - box.h - marginBottom,
+        box.x - marginLeft - paddingLeftEdge,
+      );
+    }
+  }
+
+
+  remapComputedSamples(owner, indexMap) {
+    const pointer = this.status("abi_allocate", indexMap.size * 8);
+    const view = new DataView(this.refreshBytes().buffer);
+    let offset = pointer;
+    for (const [previous, next] of indexMap) {
+      view.setUint32(offset, previous, true);
+      view.setUint32(offset + 4, next, true);
+      offset += 8;
+    }
+    this.status("computed_samples_remap", owner, pointer, indexMap.size);
+  }
 
   // Resolve the current cascade result for an element. Returns the computed
   // declarations (var() substituted, CSS-wide keywords applied) and the
   // element's computed custom properties. A stored resolution supplies the
   // inherited custom properties of its children.
   computedStyleResolve(handle, parentHandle, store) {
+    const mode = store === true ? 1 : store === false ? 0 : store;
     const count = this.status(
       "computed_style_resolve",
       handle,
       parentHandle ?? 0n,
-      store ? 1 : 0,
+      mode,
     );
     const declarations = new Array(count);
     for (let index = 0; index < count; index += 1) {
@@ -2328,7 +2549,7 @@ export class DomCore {
     // A stored resolution reads its custom properties from the element on
     // demand; a transient one is decoded now, before the next resolution
     // replaces it.
-    const customProperties = store
+    const customProperties = mode === 1
       ? new DomCoreComputedCustomProperties(this, handle)
       : this.readCurrentCustomProperties();
     return { declarations, customProperties };
@@ -2423,26 +2644,24 @@ export class DomCore {
     return requests;
   }
 
-  // The CSS font-family value of a family entry (1-based, from a box's
-  // packed face); the renderer keys it through its own registry.
-  fontFamilyCss(family) {
-    return this.string("font_family_css_at", family);
-  }
 
-  // Registers the engine font index of a face (a family's CSS value, the
-  // empty value for the default family; CSS weight; style index) for the
-  // record writer.
-  setFontFace(css, weight, style, fontIndex) {
-    this.status("font_face_set", ...this.input(css), weight, style, fontIndex);
-  }
 
-  setFontFamily(cssValue, key, zeroAdvanceRatio) {
-    this.status(
-      "font_family_set",
-      ...this.input(cssValue),
-      ...this.input(key ?? ""),
-      zeroAdvanceRatio,
-    );
+  // keys: the authored stack of cssValue, one key of each available
+  // family in authored order; empty when no family matches.
+  setFontFamily(cssValue, keys, zeroAdvanceRatio) {
+    const css = this.input(cssValue);
+    const inputs = keys.map((key) => this.input(key));
+    let rows = 0;
+    if (inputs.length !== 0) {
+      rows = this.exports.abi_allocate(inputs.length * 8);
+      if (!rows) this.throwIfError();
+      const view = new DataView(this.refreshBytes().buffer);
+      inputs.forEach(([pointer, length], index) => {
+        view.setUint32(rows + index * 8, pointer, true);
+        view.setUint32(rows + index * 8 + 4, length, true);
+      });
+    }
+    this.status("font_family_set", ...css, rows, inputs.length, zeroAdvanceRatio);
   }
 
   clearFontFamilies() {
@@ -2573,15 +2792,24 @@ export class DomCore {
   }
 
   // Lowers every row of the last build into a retained publication and
-  // returns its handle. The caller releases it (engineRecordRelease).
+  // returns its handle. The caller releases it (engineRecordRelease). A
+  // failure carries `sceneRow`, the index of the build row that failed.
   engineRecordPublish(rootHandle, viewportWidth, viewportHeight) {
-    const handle = this.status(
-      "engine_record_publish",
+    const native = this.exports;
+    const handle = applyNative(native.engine_record_publish, native, [
       rootHandle,
       viewportWidth,
       viewportHeight,
-    );
-    if (handle === 0) this.throwIfError();
+    ]);
+    if (native.abi_error_kind() !== 0) {
+      const sceneRow = native.abi_error_detail_a();
+      try {
+        this.throwIfError();
+      } catch (error) {
+        error.sceneRow = sceneRow;
+        throw error;
+      }
+    }
     return handle;
   }
 
@@ -2642,6 +2870,17 @@ export class DomCore {
       pointer,
       pointer + this.exports.abi_output_length(),
     );
+  }
+
+  // The geometry of a rect, circle, ellipse or line box whose record the
+  // core lowered to a path (its stroke names a paint server): six f32s in
+  // the order engine_record_svg_shape_geometry gives, or null for a record
+  // that keeps its own shape.
+  engineSvgShapeGeometry(stableId, sourceRevision) {
+    this.status("engine_record_capture", stableId, sourceRevision);
+    if (this.status("engine_record_svg_shape_geometry") === 0) return null;
+    const pointer = this.exports.abi_output_pointer();
+    return new Float32Array(this.refreshBytes().slice(pointer, pointer + 24).buffer);
   }
 
   // The native SVG path request of a path box: the lowered path bytes, its
@@ -3045,8 +3284,14 @@ export class DomCore {
   styleInvalidate(documentHandle) {
     this.status("document_style_invalidate", documentHandle);
   }
-  stateInvalidate(elementHandle, ownOnly) {
-    this.status("element_state_invalidate", elementHandle, ownOnly ? 1 : 0);
+  // ownOnly: an ancestor reporting its own :focus-within. pointerState: the
+  // change is :hover or :active (element_state_invalidate flags 1 and 2).
+  stateInvalidate(elementHandle, ownOnly, pointerState) {
+    this.status(
+      "element_state_invalidate",
+      elementHandle,
+      (ownOnly ? 1 : 0) | (pointerState ? 2 : 0),
+    );
   }
 
   // The elements under a root whose stored scroll-snap-type is not none.
@@ -3131,8 +3376,30 @@ export class DomCore {
     this.exports.callback_records_acknowledge();
     scheduleMutationObservers(this);
     for (const record of records) {
+      if (record.kind === 4) {
+        this.moveWrapperCacheEntry(
+          record.target,
+          record.relatedA,
+          record.relatedB,
+        );
+      }
+    }
+    for (const record of records) {
       if (record.kind === 6) {
         this.slotChangeHandler?.(this.wrapperFor(record.target));
+      }
+    }
+    // Details toggle tasks the operation queued (details.watpart). The
+    // entries are copied before wrapperFor can reenter the core.
+    const toggleCount = this.exports.details_toggle_take();
+    if (toggleCount !== 0) {
+      const toggleView = new DataView(this.memory.buffer, this.exports.abi_output_pointer(), toggleCount * 16);
+      const toggles = Array.from({ length: toggleCount }, (_, index) => [
+        toggleView.getBigUint64(index * 16, true),
+        toggleView.getUint32(index * 16 + 8, true) !== 0,
+      ]);
+      for (const [handle, wasOpen] of toggles) {
+        this.detailsToggleHandler?.(this.wrapperFor(handle), wasOpen);
       }
     }
     return records;
@@ -3143,9 +3410,16 @@ export class DomCore {
       this,
       documentHandle,
     );
+    const documentToken = this.documentFinalizerTokens.get(documentHandle);
+    if (documentToken) {
+      this.documentFinalizerTokens.delete(documentHandle);
+      documentFinalizer.unregister(documentToken);
+    }
+    this.cancelFinalizer(documentHandle);
     for (const handle of this.wrapperCaches.get(documentHandle)?.keys() ?? []) {
       this.wrapperByHandle.delete(handle);
       this.nodeTypes.delete(handle);
+      this.cancelFinalizer(handle);
     }
     this.wrapperCaches.delete(documentHandle);
     this.status("document_dispose", documentHandle);

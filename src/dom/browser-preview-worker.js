@@ -59,7 +59,6 @@ self.onmessage = async (event) => {
           viewportWidth: width,
           viewportHeight: height,
           deviceScale,
-          encodePixels: null,
           presentFrame(rendered) {
             if (presenter === null) {
               presenter = createCanvasPresenter({

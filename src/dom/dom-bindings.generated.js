@@ -587,14 +587,15 @@ export function installDocumentBindings(runtime, prototype) {
       let mode = this._domCore["documentMode"](this._coreHandle);
       return runtime["compatibilityMode"](mode);
     },
+    get scrollingElement() {
+      return runtime["documentScrollingElement"](this);
+    },
     get title() {
-      let element = this._domCore["selectorQuery"](this._coreHandle, "title");
-      return runtime["documentTitleText"](element);
+      return runtime["documentTitleText"](this);
     },
     set title(value) {
       let text = String(value);
-      let element = this._domCore["selectorQuery"](this._coreHandle, "title");
-      runtime["setDocumentTitleText"](this, element, text);
+      runtime["setDocumentTitleText"](this, text);
     },
     importNode(node, deep = false) {
       return this["_transportImportNode"](node, deep);
@@ -644,6 +645,7 @@ export function installDocumentBindings(runtime, prototype) {
   Object.defineProperty(binding, "getComputedStyle", {"enumerable": false});
   Object.defineProperty(binding, "hasFocus", {"enumerable": false});
   Object.defineProperty(binding, "compatMode", {"enumerable": false});
+  Object.defineProperty(binding, "scrollingElement", {"enumerable": false});
   Object.defineProperty(binding, "title", {"enumerable": false});
   Object.defineProperty(binding, "importNode", {"enumerable": false});
   Object.defineProperty(binding, "adoptNode", {"enumerable": false});
@@ -660,6 +662,7 @@ export function installDocumentBindings(runtime, prototype) {
   delete descriptors["activeElement"].set;
   delete descriptors["styleSheets"].set;
   delete descriptors["compatMode"].set;
+  delete descriptors["scrollingElement"].set;
   Object.defineProperties(prototype, descriptors);
   return prototype;
 }
@@ -1260,9 +1263,6 @@ export function createFrameBindings(runtime) {
     },
     frame_damage_rect(handle, kind, x, y, width, height) {
       return runtime["status"]("frame_damage_rect", handle, kind, x, y, width, height);
-    },
-    frame_overlay_damage(handle, a, b, scale, originX, originY) {
-      return runtime["status"]("frame_overlay_damage", handle, a, b, scale, originX, originY);
     },
     frame_damage_export(handle) {
       return runtime["status"]("frame_damage_export", handle);
@@ -1960,6 +1960,9 @@ export function createLayoutGeometryBindings(runtime) {
     getBoundingClientRect(node, options) {
       return runtime["queryRect"](node, options);
     },
+    getClientRects(node, options) {
+      return runtime["queryClientRects"](node, options);
+    },
     elementFromPoint(root, x, y, options) {
       return runtime["queryHit"](root, x, y, options);
     },
@@ -2152,6 +2155,22 @@ export function installInputActivationBindings(runtime, prototype) {
   return prototype;
 }
 
+export function installFormSubmissionBindings(runtime, prototype) {
+  const binding = {
+    requestSubmit(submitter = undefined) {
+      runtime["requestSubmit"](this, submitter);
+    },
+    submit() {
+      runtime["runInputActivation"](this, 5);
+    },
+  };
+  Object.defineProperty(binding, "requestSubmit", {"enumerable": false});
+  Object.defineProperty(binding, "submit", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
 export function createElementFamily(runtime) {
   return {
     prototypeFor(localName, namespaceURI) {
@@ -2163,6 +2182,7 @@ export function createElementFamily(runtime) {
             case "template": return runtime.SDHTMLTemplateElement.prototype;
             case "button": return runtime.SDHTMLButtonElement.prototype;
             case "canvas": return runtime.SDHTMLCanvasElement.prototype;
+            case "form": return runtime.SDHTMLFormElement.prototype;
             case "input": return runtime.SDHTMLInputElement.prototype;
             case "select": return runtime.SDHTMLSelectElement.prototype;
             case "script": return runtime.SDHTMLScriptElement.prototype;
@@ -2182,6 +2202,7 @@ export function createElementFamily(runtime) {
             case "template": return new runtime.SDHTMLTemplateElement("template", namespaceURI, document);
             case "button": return new runtime.SDHTMLButtonElement("button", document);
             case "canvas": return new runtime.SDHTMLCanvasElement("canvas", document);
+            case "form": return new runtime.SDHTMLFormElement("form", document);
             case "input": return new runtime.SDHTMLInputElement("input", document);
             case "select": return new runtime.SDHTMLSelectElement("select", document);
             case "script": return new runtime.SDHTMLScriptElement("script", document);
@@ -2285,20 +2306,20 @@ export function installShadowMarkupBindings(runtime, prototype) {
 export function installElementScrollBindings(runtime, prototype) {
   const binding = {
     get scrollLeft() {
-      return this._scrollLeft;
+      return this._cssomScrollLeft;
     },
     set scrollLeft(value) {
       let setPosition = this._setScrollPosition;
       let left = runtime["normalizeScrollProperty"](value);
-      let top = this._requestedScrollTop;
+      let top = this._cssomRequestedScrollTop;
       runtime["applyScrollPosition"](this, setPosition, left, top, "property");
     },
     get scrollTop() {
-      return this._scrollTop;
+      return this._cssomScrollTop;
     },
     set scrollTop(value) {
       let setPosition = this._setScrollPosition;
-      let left = this._requestedScrollLeft;
+      let left = this._cssomRequestedScrollLeft;
       let top = runtime["normalizeScrollProperty"](value);
       runtime["applyScrollPosition"](this, setPosition, left, top, "property");
     },
@@ -2421,6 +2442,24 @@ export function createInputBindings(runtime) {
     },
     resolveCursor(root, x, y) {
       return runtime["resolveCursor"](root, x, y);
+    },
+    insertText(root, text, options = {}) {
+      return runtime["insertText"](root, text, options);
+    },
+    deleteSelection(root, options = {}) {
+      return runtime["deleteSelection"](root, options);
+    },
+    selectAll(root, options = {}) {
+      return runtime["selectAll"](root, options);
+    },
+    copy(root, options = {}) {
+      return runtime["copy"](root, options);
+    },
+    cut(root, options = {}) {
+      return runtime["cut"](root, options);
+    },
+    paste(root, text, options = {}) {
+      return runtime["paste"](root, text, options);
     },
   };
   return binding;
@@ -2714,8 +2753,7 @@ export function installElementGeometryBindings(runtime, prototype) {
     getClientRects() {
       let connected = this.isConnected;
       if (!(connected)) return [];
-      let rectangle = this["getBoundingClientRect"]();
-      return [rectangle];
+      return runtime["getClientRects"](this, this._resolvedLayoutOptions);
     },
     get offsetWidth() {
       return runtime["offsetWidth"](this, this._resolvedLayoutOptions);
@@ -2810,6 +2848,44 @@ export function installElementAnimationBindings(runtime, prototype) {
     },
   };
   Object.defineProperty(binding, "animate", {"enumerable": false});
+  Object.defineProperty(binding, "getAnimations", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installCSSAnimationBindings(runtime, prototype) {
+  const binding = {
+    get animationName() {
+      return this._cssAnimationName;
+    },
+  };
+  Object.defineProperty(binding, "animationName", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["animationName"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installCSSTransitionBindings(runtime, prototype) {
+  const binding = {
+    get transitionProperty() {
+      return this._transitionProperty;
+    },
+  };
+  Object.defineProperty(binding, "transitionProperty", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["transitionProperty"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installDocumentAnimationBindings(runtime, prototype) {
+  const binding = {
+    getAnimations() {
+      return runtime["documentAnimations"](this);
+    },
+  };
   Object.defineProperty(binding, "getAnimations", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
   Object.defineProperties(prototype, descriptors);

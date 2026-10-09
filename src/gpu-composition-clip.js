@@ -3,6 +3,7 @@ export const MAX_SHADER_CLIP_ENTRIES = 8;
 // Packs the fixed shader clip tail shared by Sandom command rendering and the
 // focused compositor. Each entry is five vec4f values.
 export function clipUniformFloats(clipState) {
+  if (clipState.packedFloats) return clipState.packedFloats;
   const entries = clipState.entries;
   if (entries.length > MAX_SHADER_CLIP_ENTRIES) {
     throw new Error(

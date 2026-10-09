@@ -8,13 +8,14 @@ import {
   createComponentEnvironment,
   normalizeComponentEnvironmentOptions,
 } from "./component-environment.js";
-import { createSandomDOM } from "./dom.js";
+import { createSandomDOM } from "./sandom-dom.js";
 import { normalizeInputBatch } from "./interaction.js";
 import { createPreparedDocument } from "./prepared-document.js";
 import { SandomViewport } from "./viewport.js";
 import { buildAccessibilitySnapshot } from "./accessibility.js";
 import { prepareNativeWebgl2Host } from "../native-webgl2-adapter.js";
-import { createSceneRendererForCurrentModule } from "../scene-renderer.js";
+import { createSceneRenderer } from "../scene-renderer.js";
+import { validateClosedRecord } from "../closed-record.js";
 
 function positiveDimension(value, name) {
   const number = Number(value);
@@ -64,13 +65,27 @@ function collectCleanupError(errors, error) {
   errors.push(...(error instanceof AggregateError ? error.errors : [error]));
 }
 
+const COMPONENT_OPTION_NAMES = new Set([
+  "mount",
+  "width",
+  "height",
+  "deviceScale",
+  "ready",
+  "url",
+  "stylesheets",
+  "graphicsBackend",
+  "presentFrame",
+  "display",
+  "reportException",
+  "environment",
+  "resolveResource",
+]);
+
 export async function renderComponent(
   options,
   { createSandomDOM: createRuntimeDOM = createSandomDOM, core, fontRegistry } = {},
 ) {
-  if (!options || typeof options !== "object" || Array.isArray(options)) {
-    throw new TypeError("renderComponent options must be an object");
-  }
+  validateClosedRecord(options, COMPONENT_OPTION_NAMES, "renderComponent options");
   if (typeof options.mount !== "function") {
     throw new TypeError("renderComponent mount must be a function");
   }
@@ -282,15 +297,14 @@ export async function renderComponent(
       ...(displayDynamicRange === "high"
         ? { renderMode: "high-dynamic-range" }
         : {}),
-      // Presentation delivery (zero-copy): the surface hands each composed
-      // frame to presentFrame as the renderer's texture image plus device
-      // (webgpu) or as an explicit pixel frame (the webgl2 fallback),
-      // skipping CPU readback for texture frames. Pixels stay available on
-      // demand through session.render({ pixels: true }).
+      // Presentation delivery (zero-copy): every frame is the renderer's
+      // texture image plus device (webgpu) or an explicit pixel frame (the
+      // webgl2 fallback). Pixels are an explicit request through
+      // session.render({ pixels: true }).
       presentFrame,
       createPersistentRenderer: (rendererOptions) =>
-        (document._sandomSceneRendererRuntime?.createSceneRendererForCurrentModule ??
-          createSceneRendererForCurrentModule)({
+        (document._sandomSceneRendererRuntime?.createSceneRenderer ??
+          createSceneRenderer)({
           ...rendererOptions,
           graphicsDevice: document._preferredCanvasDevice ?? undefined,
         }),
@@ -354,11 +368,6 @@ export async function renderComponent(
           ? identifyNode(document._focusedElement)
           : null,
       }, {
-        // The surface's PNG accessor is non-enumerable (lazy encode), so
-        // the spread above did not copy it; forward it without resolving.
-        png: {
-          get: () => frame.png,
-        },
         accessibility: {
           enumerable: true,
           get: () => resolveAccessibility().snapshot,
@@ -481,7 +490,7 @@ export async function renderComponent(
       return result;
     };
 
-    const renderCurrentSurface = async ({ pixelReadback = false } = {}) => {
+    const renderCurrentSurface = async ({ pixels = false } = {}) => {
       surface.stop();
       await surface.whenIdle();
       // Input handlers schedule follow-up work on zero-delay tasks (Radix
@@ -490,7 +499,7 @@ export async function renderComponent(
       // provide that turn by accident; a retained delivery has none.
       await new Promise((resolve) => setTimeout(resolve, 0));
       try {
-        const render = () => surface.renderNow({ pixelReadback });
+        const render = () => surface.renderNow({ pixels });
         const frame = firstFrameRecorded
           ? await recordSpan("capture or inspection", render)
           : await recordSpan(
@@ -585,7 +594,7 @@ export async function renderComponent(
           );
         }
         return runOperation(() =>
-          renderCurrentSurface({ pixelReadback: request.pixels === true })
+          renderCurrentSurface({ pixels: request.pixels === true })
         );
       },
       inspect(request = {}) {
@@ -597,6 +606,14 @@ export async function renderComponent(
         return runOperation(async () => {
           const frame = await renderCurrentSurface();
           return frame.inspection;
+        });
+      },
+      // The display-list artifact of the current frame: every paint command
+      // with its geometry, and each text command's glyphs, font and color.
+      displayList() {
+        return runOperation(async () => {
+          await renderCurrentSurface();
+          return await surface.createDisplayListArtifact();
         });
       },
       dispatch(records, request = {}) {

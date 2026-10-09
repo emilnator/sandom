@@ -1,9 +1,8 @@
-import { renderScenePixels } from "../scene-renderer.js";
+import { createRenderSurface as createDOMRenderSurface } from "./render-surface.js";
 import { CustomElementRegistry } from "./custom-elements.js";
 import { markHostEventListener } from "./events.js";
 import { SDDocument } from "./node.js";
 import { isStyleDeclaration, supportsStyleProperty } from "./style.js";
-import { serializeToScene } from "./serialize.js";
 
 const MEMBERS = Object.freeze({
   document: {
@@ -193,7 +192,6 @@ export function createMothershipBackend({
   viewportW = 1280,
   viewportH = 720,
   glyphResourceManager,
-  onSnapshotPerformance,
 } = {}) {
   if (typeof reportException !== "function") {
     throw new TypeError("createMothershipBackend requires reportException");
@@ -208,8 +206,9 @@ export function createMothershipBackend({
   // resolves through the document's layout options. Without this, every
   // read answered the 1280x720 default whatever viewport the embedder
   // passed, while the render path laid out against the real viewport
-  // (BUG-drone-cannot-measure-its-viewport.md). A supplied document
-  // keeps the options its own host installed.
+  // (BUG-drone-cannot-measure-its-viewport, resolved; see
+  // activity/reports/REPORT-2026-10-09-resolved-bug-records.md). A supplied
+  // document keeps the options its own host installed.
   document._layoutOptions ??= { viewportW, viewportH };
   let customElementResolver = null;
   if (!document.documentElement) {
@@ -280,59 +279,17 @@ export function createMothershipBackend({
     return runHostOperation(action, reactionContext);
   };
 
-  async function renderSnapshot(
-    root,
-    {
-      viewportW: overrideWidth,
-      viewportH: overrideHeight,
-      deviceScale = 1,
-    } = {},
-  ) {
-    const width = overrideWidth ?? viewportW;
-    const height = overrideHeight ?? viewportH;
-    const serializationStartedAt = onSnapshotPerformance
-      ? performance.now()
-      : 0;
-    const serialized = serializeToScene(root, {
-      viewportWidth: width,
-      viewportHeight: height,
+  // The render entry: one retained surface per viewport environment. The
+  // pod cap renders with surface.renderNow() (GPU texture frame) or
+  // surface.renderNow({ pixels: true }) (CPU readback) and keeps the
+  // surface across mutations; every later frame costs what changed.
+  function createRenderSurface(root, options = {}) {
+    return createDOMRenderSurface(root, {
+      viewportWidth: viewportW,
+      viewportHeight: viewportH,
+      ...(glyphResourceManager === undefined ? {} : { glyphResourceManager }),
+      ...options,
     });
-    const { nodes, indexOf, canvasBackground, imageSources } = serialized;
-    const serializationFinishedAt = onSnapshotPerformance
-      ? performance.now()
-      : 0;
-    const {
-      pixels,
-      width: renderedWidth,
-      height: renderedHeight,
-      boxes,
-      performance: rendererPerformance,
-    } = await renderScenePixels(
-      { width, height, nodes, imageSources },
-      deviceScale,
-      {
-        glyphResourceManager,
-        // CSS canvas background (html/body propagation, css2 §14.2):
-        // clears the whole raster target, not just the source box.
-        ...(canvasBackground !== null ? { background: canvasBackground } : {}),
-      },
-    );
-    if (onSnapshotPerformance) {
-      onSnapshotPerformance(Object.freeze({
-        serializationMilliseconds: serializationFinishedAt -
-          serializationStartedAt,
-        rasterizationMilliseconds: performance.now() -
-          serializationFinishedAt,
-        glyphs: rendererPerformance.glyphs,
-      }));
-    }
-    return {
-      pixels,
-      width: renderedWidth,
-      height: renderedHeight,
-      deviceScale,
-      layout: { boxes, indexOf, serialized, publication: serialized.publication },
-    };
   }
 
   const backend = {
@@ -512,7 +469,7 @@ export function createMothershipBackend({
     inspectCustomElementOperations() {
       return customElements.inspectHostOperations();
     },
-    renderSnapshot,
+    createRenderSurface,
   };
   return backend;
 }

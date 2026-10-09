@@ -274,11 +274,13 @@ async function start(message) {
     { applyWebComponentInstance },
     { createPresentationDelivery, probeExtendedRange },
     { loadFont },
+    { installFontSetFallbackFamilies },
   ] = await Promise.all([
     import("./dom.js"),
     import(message.contractModule),
     import("./session-presentation.js"),
     import("../font-registry.js"),
+    import("../system-fonts.js"),
   ]);
   screen = message.canvas;
   screen.width = message.width * message.deviceScale;
@@ -292,8 +294,11 @@ async function start(message) {
   // component module import; a face already loaded in this realm is a
   // cache hit (fonts are retained across warm re-mounts by design). A
   // failed load leaves the cache so the next start retries it.
-  const fontsLoaded = Promise.all(
-    (message.fonts ?? []).map(({ family, url }) => {
+  // The Noto fallback families of the sandom-fonts set
+  // (plans/PLAN-fallback-font-coverage.md) paint each script that the
+  // caller's faces do not cover; a face loads when a text needs it.
+  const fontsLoaded = Promise.all([
+    ...(message.fonts ?? []).map(({ family, url }) => {
       const face = `${family}\u0000${url}`;
       let loading = loadedSessionFonts.get(face);
       if (loading === undefined) {
@@ -303,7 +308,8 @@ async function start(message) {
       }
       return loading;
     }),
-  ).then(() => step("fonts loaded"));
+    installFontSetFallbackFamilies(),
+  ]).then(() => step("fonts loaded"));
   // Zero-copy presentation onto the transferred canvas: the shared
   // presentation-delivery module (./session-presentation.js) presents
   // each presentFrame delivery - the renderer's live GPU texture through

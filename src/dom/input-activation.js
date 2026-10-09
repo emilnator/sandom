@@ -43,10 +43,14 @@ export function runInputActivation(node, operation) {
           target.click();
         } else if (action === 13) {
           target.toggleAttribute("open");
-        } else if (action === 14) {
-          // A plain Event: oldState/newState would not survive the backend's
-          // record-based listener delivery, and the state is on the element.
-          dispatchEvent(target, createEvent("toggle", { bubbles: false }));
+        } else if (action === 15) {
+          const submitter = core.wrapperFor(relatedHandle);
+          if (!dispatchEvent(target, createEvent("submit", { bubbles: true, cancelable: true, submitter }))) outcome = 1;
+        } else if (action === 16) {
+          // The submission reached navigation, which Sandom does not
+          // perform: the document stays as it is, and says so.
+          const detail = Object.freeze({ submitter: core.wrapperFor(relatedHandle) });
+          dispatchEvent(target, createEvent("sandom-form-submission", { bubbles: true, composed: true, detail }));
         } else {
           throw new Error("Unknown native activation action");
         }
@@ -62,4 +66,19 @@ export function runInputActivation(node, operation) {
     // the original host exception after a failed action.
     core.exports.input_activation_release(handle);
   }
+}
+
+// HTMLFormElement.requestSubmit: a submitter must be a submit button whose
+// form owner is this form; without one, the form submits itself.
+export function requestSubmit(form, submitter = null) {
+  const core = form._domCore;
+  if (submitter !== null) {
+    if (submitter?._domCore !== core || !core.status("input_control_submit_button", submitter._coreHandle)) {
+      throw new TypeError("requestSubmit: the submitter is not a submit button");
+    }
+    if (core.handle("input_control_form", submitter._coreHandle) !== form._coreHandle) {
+      throw new DOMException("requestSubmit: the submitter is not owned by this form", "NotFoundError");
+    }
+  }
+  runInputActivation(submitter ?? form, 4);
 }

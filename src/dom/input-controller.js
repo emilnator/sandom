@@ -1,17 +1,34 @@
 import { createInputBindings } from "./dom-bindings.generated.js";
-import { createEvent, dispatchEvent as dispatchSandomEvent } from "./events.js";
+import { createEvent, dispatchEvent as dispatchSandomEvent, SDDataTransfer } from "./events.js";
+import { runInputActivation } from "./input-activation.js";
 import { scrollByChained } from "./scroll-interaction.js";
 import { scrollScrollbar } from "./scroll-core.js";
+import { scrollbarAtPoint } from "./presented-frame.js";
 
 const measurementSymbol = Symbol.for("sandom.domCore.measurement");
 const encoder = new TextEncoder();
-const EVENTS = [null, "pointerout", "pointerleave", "pointerover", "pointerenter", "mouseout", "mouseleave", "mouseover", "mouseenter", "pointerdown", "mousedown", "pointermove", "mousemove", "pointerup", "mouseup", "pointercancel", "lostpointercapture", "gotpointercapture", "wheel", "keydown", "keyup", "compositionstart", "compositionupdate", "compositionend", "beforeinput", "input", "change"];
-const INPUT_TYPES = [null, "deleteContentBackward", "deleteContentForward", "insertLineBreak", "insertText", "insertCompositionText", "insertReplacementText"];
+const EVENTS = [null, "pointerout", "pointerleave", "pointerover", "pointerenter", "mouseout", "mouseleave", "mouseover", "mouseenter", "pointerdown", "mousedown", "pointermove", "mousemove", "pointerup", "mouseup", "pointercancel", "lostpointercapture", "gotpointercapture", "wheel", "keydown", "keyup", "compositionstart", "compositionupdate", "compositionend", "beforeinput", "input", "change", "copy", "cut", "paste"];
+const INPUT_TYPES = [null, "deleteContentBackward", "deleteContentForward", "insertLineBreak", "insertText", "insertCompositionText", "insertReplacementText", "insertFromPaste", "insertFromDrop", "deleteByCut"];
+const INSERT_TEXT_TYPES = ["insertText", "insertReplacementText", "insertFromPaste", "insertFromDrop"];
+const DELETE_SELECTION_TYPES = ["deleteContentBackward", "deleteContentForward", "deleteByCut"];
 const SOURCES = [null, "property", "scroll", "scrollTo", "scrollBy", "wheel", "keyboard", "pointer", "snap", "anchor", "scrollIntoView", "resize", "scrollbar", "momentum"];
 const SELECTION_DIRECTIONS = ["none", "forward", "backward"];
 const stateFinalizer = typeof FinalizationRegistry === "function"
   ? new FinalizationRegistry(({ core, handle }) => core.status("input_state_release", handle))
   : null;
+// Text editing follows Chrome on one platform (plans/dom/PLAN-platform-
+// editing-behavior.md): its key bindings and its caret motion rules. The
+// code is the input state's platform in the DOM core.
+const EDITING_PLATFORMS = Object.freeze({ mac: 0, windows: 1, linux: 2 });
+
+// The platform of the host process: macOS for darwin, Windows for windows,
+// Linux for every other system.
+export function hostEditingPlatform() {
+  const system = globalThis.Deno?.build?.os ?? globalThis.process?.platform;
+  if (system === "darwin") return "mac";
+  if (system === "windows" || system === "win32") return "windows";
+  return "linux";
+}
 
 function invoke(core, operation, ...args) {
   const result = core.exports[operation](...args);
@@ -26,6 +43,7 @@ function invoke(core, operation, ...args) {
     if (code === 5) throw new Error("Composition end requires an active composition");
     if (code === 6 || code === 7) throw new Error(`No ${code === 7 ? "vertical" : "horizontal"} scrollbar exists for the element`);
     if (code === 8) throw new Error("Text composition requires an enabled focused text control");
+    if (code === 9) throw new Error("A text edit cannot run during an active text composition: end it with compositionEnd first");
     core.throwIfError();
   }
   return result;
@@ -77,6 +95,37 @@ function encodeRecords(core, root, records) {
   return [pointer, length];
 }
 
+function documentOf(root) {
+  return root.nodeType === 9 ? root : root.ownerDocument;
+}
+
+// The text an edit of this input type inserts; deletes insert nothing.
+function insertedText(inputType, record) {
+  if (inputType >= 4 && inputType <= 8) return record.key ?? record.text ?? record.value;
+  return inputType === 3 ? "\n" : null;
+}
+
+function inputTypeCode(operation, inputType, allowed) {
+  if (!allowed.includes(inputType)) {
+    throw new RangeError(`${operation}: unknown inputType ${String(inputType)}; use one of ${allowed.join(", ")}`);
+  }
+  return INPUT_TYPES.indexOf(inputType);
+}
+
+// Action19 names where copied text comes from; see $inputClipboardDefault.
+function clipboardText(action, record, target, root) {
+  if (action.aux === 0) {
+    return record.clipboardData.types.includes("text/plain") ? record.clipboardData.getData("text/plain") : null;
+  }
+  if (action.aux === 1) return target.value.slice(action.a, action.b);
+  if (action.aux === 2) {
+    const text = documentOf(root).getSelection().toString();
+    return text === "" ? null : text;
+  }
+  if (action.aux === 3) return null;
+  throw new Error(`Unknown native clipboard text source ${action.aux}`);
+}
+
 function readAction(core) {
   const pointer = core.exports.abi_output_pointer();
   const view = new DataView(core.refreshBytes().buffer, pointer, 80);
@@ -106,19 +155,27 @@ function eventFor(action, record, relatedTarget) {
     Object.assign(fields, modifiers, { data: action.aux & 512 ? "" : record.text });
   } else if (action.event === 24 || action.event === 25) {
     const inputType = action.aux & 255;
-    Object.assign(fields, { inputType: INPUT_TYPES[inputType], data: inputType >= 4 ? record.key ?? record.text ?? record.value : inputType === 3 ? "\n" : null, isComposing: Boolean(action.aux & 256) });
+    Object.assign(fields, { inputType: INPUT_TYPES[inputType], data: insertedText(inputType, record), isComposing: Boolean(action.aux & 256) });
+  } else if (action.event >= 27 && action.event <= 29) {
+    fields.clipboardData = record.clipboardData;
   }
   return createEvent(type, fields);
 }
 
-export function createInputController(document, layoutOptions) {
+export function createInputController(layoutOptions, editingPlatform) {
+  if (!Object.hasOwn(EDITING_PLATFORMS, editingPlatform)) {
+    throw new RangeError(
+      `editingPlatform must be "mac", "windows" or "linux", got ${JSON.stringify(editingPlatform)}`,
+    );
+  }
+  const platform = EDITING_PLATFORMS[editingPlatform];
   const states = new WeakMap();
   function stateFor(node) {
     const owner = node.nodeType === 9 ? node : node.ownerDocument;
     let state = states.get(owner);
     if (!state) {
       const core = owner._domCore;
-      state = { core, handle: invoke(core, "input_state_create", owner._coreHandle), root: node };
+      state = { core, handle: invoke(core, "input_state_create", owner._coreHandle, platform), root: node };
       states.set(owner, state);
       stateFinalizer?.register(state, { core, handle: state.handle });
     }
@@ -134,6 +191,9 @@ export function createInputController(document, layoutOptions) {
     const results = new Array(records.length);
     const viewportResults = new Set();
     let scrollbarChanged = false;
+    let valueChanged = false;
+    let copiedText = null;
+    let scrolled = false;
     try {
       for (;;) {
         const actionCode = invoke(core, "input_batch_next", batch);
@@ -165,7 +225,7 @@ export function createInputController(document, layoutOptions) {
             case 4: target.click(); break;
             case 5: target.setSelectionRange(action.a, action.b, SELECTION_DIRECTIONS[action.c]); break;
             case 6: {
-              const selection = (root.nodeType === 9 ? root : root.ownerDocument).getSelection();
+              const selection = documentOf(root).getSelection();
               const mode = action.aux === 3
                 ? invoke(core, "input_pointer_selection_mode", selection._handle, action.target)
                 : action.aux;
@@ -176,7 +236,7 @@ export function createInputController(document, layoutOptions) {
             }
             case 7:
               if (action.target === 0n) viewportResults.add(index);
-              scrollByChained(surface, snapshot, target ?? surface?.viewport, action.a, action.b, SOURCES[action.aux]);
+              scrolled = scrollByChained(surface, snapshot, target ?? surface?.viewport, action.a, action.b, SOURCES[action.aux]).scrolled || scrolled;
               break;
             case 8:
               if (action.target === 0n) viewportResults.add(index);
@@ -196,24 +256,31 @@ export function createInputController(document, layoutOptions) {
               const value = core.string("input_batch_edit_value", batch);
               if (action.aux & 2048) target._setUserEditedValue(value, action.a, action.b);
               else {
-                const type = action.aux & 255;
-                const data = type >= 4 ? record.key ?? record.text ?? record.value : type === 3 ? "\n" : "";
-                target._setUserEditedValue(value.slice(0, action.a) + data + value.slice(action.b), action.c);
+                const next = value.slice(0, action.a) + (insertedText(action.aux & 255, record) ?? "") + value.slice(action.b);
+                if (next !== value) valueChanged = true;
+                target._setUserEditedValue(next, action.c);
               }
               break;
             }
             case 14: target._notifyMutation("state", action.aux === 1 ? "selected" : "checked"); break;
-            case 15: hooks.beforeRecord?.(record, index); break;
+            case 15:
+              scrolled = false;
+              hooks.beforeRecord?.(record, index);
+              break;
             case 16: {
               const result = record.kind === "pointer-leave" ? null : target ?? (viewportResults.has(index) ? surface?.viewport : null);
               results[index] = result;
-              hooks.afterRecord?.(record, index, result);
+              hooks.afterRecord?.(record, index, result, scrolled);
               break;
             }
             case 17:
               target._pointerController = pointerController;
               target._layoutOptions = layoutOptions;
               break;
+            case 18: documentOf(root).getSelection().selectAllChildren(target); break;
+            case 19: copiedText = clipboardText(action, record, target, root); break;
+            // Implicit submission of a form without a default button.
+            case 20: runInputActivation(target, 4); break;
             default: throw new Error(`Unknown native input action ${action.action}`);
           }
         } catch (error) {
@@ -222,7 +289,7 @@ export function createInputController(document, layoutOptions) {
         }
         invoke(core, "input_batch_resume", batch, token, outcome);
       }
-      return { results, scrollbarChanged };
+      return { results, scrollbarChanged, valueChanged, copiedText };
     } finally {
       core.status("input_batch_release", batch);
     }
@@ -231,10 +298,56 @@ export function createInputController(document, layoutOptions) {
     const state = stateFor(root);
     state.root = root;
     const requiresSnapshot = records.some((record) => record.kind.startsWith("pointer-") || record.kind === "wheel");
-    const snapshot = snapshotFor(root, requiresSnapshot);
+    const snapshot = hooks.snapshot ?? snapshotFor(root, requiresSnapshot);
+    if (snapshot && snapshot.geometryCore !== state.core) {
+      throw new TypeError("Input snapshot must use the document's DOM core.");
+    }
     const [pointer, length] = encodeRecords(state.core, root, records);
-    const batch = invoke(state.core, "input_batch_begin", state.handle, snapshot?.geometryHandle ?? 0n, pointer, length, records.length);
-    return runOwned(state, root, snapshot, batch, records, hooks).results;
+    // The surface's touch-panning opt-in travels with the batch; the engine
+    // decides whether a drag pans.
+    const touchPanning = root._renderSurface?._touchPanning ? 1 : 0;
+    const batch = invoke(state.core, "input_batch_begin", state.handle, snapshot?.geometryHandle ?? 0n, pointer, length, records.length, touchPanning);
+    const results = runOwned(state, root, snapshot, batch, records, hooks).results;
+    // The engine knows which CSS cursor belongs at a document point. A host
+    // that named an element for it gets the answer applied there, so the
+    // pointer over text is a text cursor without every interactive host
+    // resolving and assigning it again.
+    const surface = root._renderSurface;
+    if (surface?._cursorTarget && snapshot) {
+      for (let index = records.length - 1; index >= 0; index--) {
+        const record = records[index];
+        if (typeof record.x !== "number" || typeof record.y !== "number") {
+          continue;
+        }
+        surface._applyCursor(record.x, record.y);
+        break;
+      }
+    }
+    // The scrollbar under the pointer shows an overlay bar and holds it
+    // shown (plans/PLAN-native-scrollbars.md, decision 2); a pointer that
+    // goes down on a thumb presses it until the pointer goes up.
+    const pointerRecord = records.findLast((record) => record.kind.startsWith("pointer-"));
+    if (surface && pointerRecord) {
+      const positioned = (record) => record.kind !== "pointer-leave" && snapshot &&
+        typeof record.x === "number" && typeof record.y === "number";
+      let pressed;
+      for (const record of records) {
+        if (record.kind === "pointer-down" && positioned(record)) {
+          const bar = scrollbarAtPoint(snapshot, record.x, record.y);
+          pressed = bar && record.x >= bar.thumb.x && record.x < bar.thumb.x + bar.thumb.width &&
+              record.y >= bar.thumb.y && record.y < bar.thumb.y + bar.thumb.height
+            ? bar
+            : null;
+        } else if (record.kind === "pointer-up" || record.kind === "pointer-cancel") {
+          pressed = null;
+        }
+      }
+      surface._noteScrollbarPointer(
+        positioned(pointerRecord) ? scrollbarAtPoint(snapshot, pointerRecord.x, pointerRecord.y) : null,
+        pressed,
+      );
+    }
+    return results;
   }
   const pointerController = {
     capture(element, pointerId) {
@@ -253,6 +366,17 @@ export function createInputController(document, layoutOptions) {
     },
   };
   function one(root, record) { return dispatchBatch(root, [record])[0]; }
+  // Host editing commands: 1 text edit (code = input type), 2 select all,
+  // 3 clipboard (code 1 copy, 2 cut, 3 paste). The engine owns every
+  // default; see $inputEditPrepare.
+  function edit(root, operation, target, command, code, text, record) {
+    if (typeof text !== "string") throw new TypeError(`${operation}: text must be a string, received ${typeof text}`);
+    if (typeof target?._coreHandle !== "bigint") throw new TypeError(`${operation}: target must be a Sandom node, received ${String(target)}`);
+    const state = stateFor(root);
+    state.root = root;
+    const batch = invoke(state.core, "input_edit_begin", state.handle, target._coreHandle, root._coreHandle, command, code, ...state.core.input(text));
+    return runOwned(state, root, snapshotFor(root, false), batch, [record]);
+  }
   const runtime = {
     pointerController,
     dispatchInputRecords: dispatchBatch,
@@ -296,6 +420,28 @@ export function createInputController(document, layoutOptions) {
       const code = state.core.status("input_key_code", ...state.core.input(key));
       const batch = invoke(state.core, "input_pointer_scrollbar_key_begin", state.handle, snapshot.geometryHandle, element?._coreHandle ?? 0n, orientation === "vertical" ? 1 : 0, code);
       return runOwned(state, root, snapshot, batch, [{ kind: "scrollbar-key", key }]).scrollbarChanged;
+    },
+    insertText(root, text, { inputType = "insertText", target = root.ownerDocument?._focusedElement ?? root.ownerDocument?.activeElement ?? root } = {}) {
+      const code = inputTypeCode("insertText", inputType, INSERT_TEXT_TYPES);
+      return edit(root, "insertText", target, 1, code, text, { kind: "text-edit", text }).valueChanged;
+    },
+    deleteSelection(root, { inputType = "deleteContentBackward", target = root.ownerDocument?._focusedElement ?? root.ownerDocument?.activeElement ?? root } = {}) {
+      const code = inputTypeCode("deleteSelection", inputType, DELETE_SELECTION_TYPES);
+      return edit(root, "deleteSelection", target, 1, code, "", { kind: "text-edit", text: "" }).valueChanged;
+    },
+    selectAll(root, { target = root.ownerDocument?._focusedElement ?? root.ownerDocument?.activeElement ?? root } = {}) {
+      edit(root, "selectAll", target, 2, 0, "", { kind: "select-all" });
+    },
+    copy(root, { target = root.ownerDocument?._focusedElement ?? root.ownerDocument?.activeElement ?? root } = {}) {
+      return edit(root, "copy", target, 3, 1, "", { kind: "clipboard", clipboardData: new SDDataTransfer() }).copiedText;
+    },
+    cut(root, { target = root.ownerDocument?._focusedElement ?? root.ownerDocument?.activeElement ?? root } = {}) {
+      return edit(root, "cut", target, 3, 2, "", { kind: "clipboard", clipboardData: new SDDataTransfer() }).copiedText;
+    },
+    paste(root, text, { target = root.ownerDocument?._focusedElement ?? root.ownerDocument?.activeElement ?? root } = {}) {
+      const clipboardData = new SDDataTransfer();
+      if (typeof text === "string") clipboardData.setData("text/plain", text);
+      return edit(root, "paste", target, 3, 3, text, { kind: "clipboard", text, clipboardData }).valueChanged;
     },
   };
   return { ...runtime, ...createInputBindings(runtime) };

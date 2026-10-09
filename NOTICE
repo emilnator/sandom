@@ -14,8 +14,9 @@ customary attribution or as separately authorized by DevBlanket AB.
 
 Unicode data in the DOM WebAssembly core
 
-The generated DOM case-mapping tables derive from Unicode 17.0.0 data in
-tools/unicode/. Those data and derived tables retain the following terms:
+The generated DOM case-mapping tables and the renderer's bidirectional class
+and bracket tables derive from Unicode 17.0.0 data in tools/unicode/. Those
+data and derived tables retain the following terms:
 
 UNICODE LICENSE V3
 

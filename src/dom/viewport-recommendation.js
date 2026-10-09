@@ -427,12 +427,19 @@ export async function recommendViewportFromInspection(
   });
 }
 
-export async function recommendViewport(preparedInput, options = {}) {
+// `scrollbarStyle` selects the scrollbar style of every analytical trial
+// (plans/PLAN-native-scrollbars.md, decision 1); the other options go to
+// recommendViewportFromInspection.
+export async function recommendViewport(
+  preparedInput,
+  { scrollbarStyle = "overlay", ...options } = {},
+) {
   return await recommendViewportFromInspection(
     (viewport) =>
       inspectPreparedInput(preparedInput, {
         mode: "analytical-layout",
         viewport,
+        scrollbarStyle,
       }),
     options,
   );

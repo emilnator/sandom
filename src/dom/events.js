@@ -503,6 +503,63 @@ export class SDFocusEvent extends Event {
   }
 }
 
+// A DataTransfer's text data store. Formats compare ASCII-case-insensitively;
+// "text" names text/plain and "url" names text/uri-list, read back as its
+// first URL.
+function dataTransferFormat(format) {
+  const normalized = String(format).replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+  if (normalized === "text") return ["text/plain", false];
+  if (normalized === "url") return ["text/uri-list", true];
+  return [normalized, false];
+}
+
+export class SDDataTransfer {
+  #data = new Map();
+  get types() {
+    return Object.freeze([...this.#data.keys()]);
+  }
+  getData(format) {
+    const [type, firstURL] = dataTransferFormat(format);
+    const data = this.#data.get(type) ?? "";
+    if (!firstURL) return data;
+    return data.split(/\r\n|\n|\r/).find((line) => line !== "" && !line.startsWith("#")) ?? "";
+  }
+  setData(format, data) {
+    const [type] = dataTransferFormat(format);
+    this.#data.delete(type);
+    this.#data.set(type, String(data));
+  }
+  clearData(format) {
+    if (format === undefined) this.#data.clear();
+    else this.#data.delete(dataTransferFormat(format)[0]);
+  }
+}
+
+export class SDClipboardEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    defineEventFields(this, { clipboardData: null, ...init });
+  }
+}
+
+// A form's submit event; submitter is the button that submitted it, null
+// when the form submitted itself.
+export class SDSubmitEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    defineEventFields(this, { submitter: null, ...init });
+  }
+}
+
+// HTML's ToggleEvent: the state a details element or popover had before a
+// toggle and the state it has after it, "open" or "closed".
+export class SDToggleEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    defineEventFields(this, { oldState: String(init.oldState ?? ""), newState: String(init.newState ?? "") });
+  }
+}
+
 export class SDPointerEvent extends SDMouseEvent {}
 
 export function createEvent(type, init = {}, fields = {}) {
@@ -524,6 +581,15 @@ export function createEvent(type, init = {}, fields = {}) {
   }
   if (String(type).startsWith("pointer")) {
     return new SDPointerEvent(type, nativeInit);
+  }
+  if (type === "copy" || type === "cut" || type === "paste") {
+    return new SDClipboardEvent(type, nativeInit);
+  }
+  if (type === "submit") {
+    return new SDSubmitEvent(type, nativeInit);
+  }
+  if (type === "toggle" || type === "beforetoggle") {
+    return new SDToggleEvent(type, nativeInit);
   }
   if (
     String(type).startsWith("mouse") || type === "click" ||
@@ -581,6 +647,10 @@ export function eventIntrinsics(event) {
       "animationName",
       "elapsedTime",
       "pseudoElement",
+      "clipboardData",
+      "oldState",
+      "newState",
+      "submitter",
     ]
   ) {
     if (name in event) intrinsics[name] = event[name];

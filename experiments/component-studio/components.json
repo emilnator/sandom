@@ -1,0 +1,11 @@
+{
+  "format": "sandom/component-project",
+  "version": 1,
+  "name": "Acme interface components",
+  "stylesheet": "components/theme.css",
+  "components": [
+    { "name": "ActionButton", "module": "components/action-button.js", "schema": "components/action-button.schema.json" },
+    { "name": "NotificationSwitch", "module": "components/notification-switch.js", "schema": "components/notification-switch.schema.json" },
+    { "name": "SearchField", "module": "components/search-field.js", "schema": "components/search-field.schema.json" }
+  ]
+}

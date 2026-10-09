@@ -1,22 +1,26 @@
 import { serializeToScene } from "./serialize.js";
+import { InvalidResourceResponseError } from "./prepared-document.js";
+import { validateClosedRecord } from "../closed-record.js";
 import {
-  createSceneRendererForCurrentModule,
+  createSceneRenderer,
+  engineCounters,
   layoutTreeBoxes,
-  renderScenePixels,
 } from "../scene-renderer.js";
 import {
   deliverRenderingObservers,
   documentHasRenderingObservers,
 } from "./rendering-observers.js";
-import { encodePNG } from "../output/png.js";
 import {
   animationsForElement,
   createDOMAnimation,
+  CSSTransition,
   takePendingAnimations,
 } from "./animation.js";
 import { createEvent, dispatchEvent } from "./events.js";
 import { SandomViewport } from "./viewport.js";
 import { computeScrollbars, snapshotScrollbars } from "./scrollbars.js";
+import { paintScrollbars } from "./scrollbar-paint.js";
+import { assertScrollbarStyle, ScrollbarVisibility } from "./scrollbar-visibility.js";
 import { sampleScrollTimeline } from "./scroll-timeline.js";
 import {
   NativeScrollCapture,
@@ -29,13 +33,18 @@ import {
   scrollState,
   withScrollGeometry,
 } from "./scroll-core.js";
-import { BOX_SNAPSHOT, releaseBoxSnapshot } from "../dom-wasm/geometry-wire.js";
+import {
+  BOX_SNAPSHOT,
+  boxesReadOnly,
+  freezeBoxes,
+  releaseBoxSnapshot,
+} from "../dom-wasm/geometry-wire.js";
 import { buildInteractionSnapshot } from "./presented-frame.js";
 import {
-  caretRectangle,
   keptTextGeometryFor,
-  selectionRectangles,
+  sameTextGeometryValues,
   selectionRectanglesForText,
+  ShiftedTextGeometry,
   uniqueCaretStops,
 } from "./geometry.js";
 import { resolvedElementFields } from "./style.js";
@@ -48,7 +57,50 @@ import {
 import { normalizeOffsets } from "../animations.js";
 import { instantiate as instantiateMotionCapture } from "../wasm/motion-capture-binary.js";
 import { createFrameBindings } from "./dom-bindings.generated.js";
-import { geometryBox } from "./geometry.js";
+import { flatTreeParent, shadowIncludingParent } from "./shadow.js";
+
+// Rendered text in a shadow tree under the surface root is document text:
+// it paints in the flat tree, so it takes the text cursor and selection.
+function isShadowIncludingInclusiveDescendant(node, ancestor) {
+  for (let current = node; current !== null; current = shadowIncludingParent(current)) {
+    if (current === ancestor) return true;
+  }
+  return false;
+}
+
+// The same question for many nodes under one ancestor: a walk stops at the
+// first node an earlier walk passed, and every node it passes takes the
+// answer, so a frame's text owners cost one walk per distinct ancestor
+// rather than one per text operation.
+function shadowIncludingInclusiveDescendantTest(ancestor) {
+  const verdicts = new Map([[ancestor, true]]);
+  const walked = [];
+  return (node) => {
+    let verdict = false;
+    for (let current = node; current !== null; current = shadowIncludingParent(current)) {
+      const known = verdicts.get(current);
+      if (known !== undefined) {
+        verdict = known;
+        break;
+      }
+      walked.push(current);
+    }
+    for (const passed of walked) verdicts.set(passed, verdict);
+    walked.length = 0;
+    return verdict;
+  };
+}
+
+// The stage counter of each reason a restyled frame's geometry was built
+// instead of derived from the presented frame's (presented-frame.js).
+const restyleRefusalCounters = Object.freeze({
+  viewport: "geometryRestyleRefusedViewport",
+  text: "geometryRestyleRefusedText",
+  tree: "geometryRestyleRefusedTree",
+  rows: "geometryRestyleRefusedRows",
+  fragments: "geometryRestyleRefusedFragments",
+});
+
 const requestHostAnimationFrame =
   typeof globalThis.requestAnimationFrame === "function"
     ? globalThis.requestAnimationFrame.bind(globalThis)
@@ -79,14 +131,73 @@ function freezeMotionValue(value) {
   return value;
 }
 
-// The caret is ink the document specifies: `caret-color` when authored,
-// otherwise the element's own `color` (CSS `caret-color: auto` is
-// currentColor). A hardcoded black caret disappears on any dark control.
-const OPAQUE_BLACK = Object.freeze({ r: 0, g: 0, b: 0, a: 1 });
-function caretPaintColor(element) {
-  const fields = resolvedElementFields(element);
-  const color = fields.caretColor ?? fields.color ?? OPAQUE_BLACK;
-  return typeof color === "object" && color !== null ? color : OPAQUE_BLACK;
+// Chrome 151's active selection background, measured through the oracle:
+// over white, rgb(46, 55, 100) and rgb(40, 160, 90) the selected band
+// composites to rgb(179, 215, 254), rgb(95, 135, 192) and rgb(93, 177, 188),
+// which is rgb(128, 188, 253) at alpha 153/255 (the platform highlight
+// blended with white) painted behind unchanged glyphs. The same colour
+// paints in <input> and <textarea>. An unfocused page paints
+// rgb(196, 196, 196) at the same alpha; a Sandom document has no inactive
+// window state, so its selection is always the active one.
+const DEFAULT_SELECTION_BACKGROUND = Object.freeze({
+  r: 128 / 255,
+  g: 188 / 255,
+  b: 253 / 255,
+  a: 153 / 255,
+});
+const DEFAULT_SELECTION_PAINT = Object.freeze({
+  background: DEFAULT_SELECTION_BACKGROUND,
+  color: null,
+});
+// The selection paint of text whose originating element is `element`: the
+// element's ::selection highlight when any rule on its chain declares a
+// background or colour, otherwise the default highlight over the text's
+// own colour. A null background paints no band; a null colour keeps the
+// glyphs' own.
+function selectionPaint(element) {
+  if (element?.nodeType !== 1) return DEFAULT_SELECTION_PAINT;
+  const highlight = element.ownerDocument._styleSystem.selectionHighlight(
+    element,
+  );
+  if (!highlight.authored) return DEFAULT_SELECTION_PAINT;
+  return { background: highlight.backgroundColor, color: highlight.color };
+}
+
+// The pseudo-class states whose change only restyles: the scene build
+// reads no other state of them. Checkedness and selectedness are not
+// among them (a menulist's label is its selected option's), nor are
+// custom states and definedness.
+const RESTYLE_STATES = new Set([
+  "hover",
+  "active",
+  "focus",
+  "focus-within",
+]);
+
+// The frameStageCounters counter of each engine_record_restyle refusal,
+// by its result.
+const SCENE_RESTYLE_REFUSALS = [
+  undefined,
+  "sceneRestyleRefusedBuild",
+  "sceneRestyleRefusedList",
+  "sceneRestyleRefusedGeneration",
+  "sceneRestyleRefusedOverflow",
+  "sceneRestyleRefusedRoot",
+  "sceneRestyleRefusedContents",
+  "sceneRestyleRefusedStructure",
+];
+
+// A caret blinks, and the blink is the engine's, not a host timer: half a
+// second shown, half a second hidden, which is what every browser does
+// (Chrome's `kCaretBlinkInterval`). Activity restarts the cycle shown, so
+// the caret is never invisible at the moment it moves — a caret that
+// vanished mid-word would read as a dropped keystroke.
+const CARET_BLINK_MILLISECONDS = 500;
+function caretVisibleInPhase(anchorMilliseconds, timeMilliseconds) {
+  if (anchorMilliseconds === null) return true;
+  const elapsed = timeMilliseconds - anchorMilliseconds;
+  if (!(elapsed > 0)) return true;
+  return Math.floor(elapsed / CARET_BLINK_MILLISECONDS) % 2 === 0;
 }
 
 function motionValueSignature(value) {
@@ -350,11 +461,16 @@ function createMotionModel(surface) {
 
   for (const [element, timings] of surface._transitionRecords) {
     for (const [propertyName, timing] of timings) {
-      const delayMilliseconds = Number(timing.delay ?? 0);
-      const durationMilliseconds = Number(timing.duration ?? 0);
+      // The track's timing at inspection: a paused transition's start
+      // follows the clock, so its local time holds.
+      const animation = timing.animation;
+      const startTimeMilliseconds = animation._value(6);
+      const delayMilliseconds = animation._value(8);
+      const durationMilliseconds = animation._value(7);
+      const progressing = animation._trackAdvances();
       const effectIndex = exports.motion_add_effect(
-        1,
-        timing.startTimeMilliseconds,
+        progressing ? 1 : 0,
+        startTimeMilliseconds,
         delayMilliseconds,
         durationMilliseconds,
         1,
@@ -367,7 +483,7 @@ function createMotionModel(surface) {
       }
       const endTime = exports.motion_effect_end(effectIndex);
       const activeTimeMilliseconds = surface.currentTime -
-        timing.startTimeMilliseconds - delayMilliseconds;
+        startTimeMilliseconds - delayMilliseconds;
       const phase = activeTimeMilliseconds < 0
         ? "before"
         : activeTimeMilliseconds < durationMilliseconds
@@ -379,23 +495,25 @@ function createMotionModel(surface) {
         propertyNames: Object.freeze([propertyName]),
         animationName: "",
         effectOrder: effects.length,
-        startTimeMilliseconds: timing.startTimeMilliseconds,
+        startTimeMilliseconds,
         delayMilliseconds,
         durationMilliseconds,
         iterationCount: 1,
         endTimeMilliseconds: endTime,
         keyframeOffsets: Object.freeze([0, 1]),
-        keyframes: normalizeMotionKeyframes([{ offset: 0 }, { offset: 1 }]),
+        keyframes: normalizeMotionKeyframes([
+          { offset: 0, [propertyName]: timing.startValue },
+          { offset: 1, [propertyName]: timing.endValue },
+        ]),
         direction: "normal",
         fill: "none",
         easing: timing.easing ?? "linear",
         composite: "replace",
-        playState: "running",
-        playbackRate: 1,
+        playState: animation.playState,
+        playbackRate: animation.playbackRate,
         timeline: "time",
         phase,
-        localTimeMilliseconds: surface.currentTime -
-          timing.startTimeMilliseconds,
+        localTimeMilliseconds: surface.currentTime - startTimeMilliseconds,
         activeTimeMilliseconds,
         iterationIndex: phase === "active" ? 0 : null,
         iterationProgress: phase === "active" && durationMilliseconds > 0
@@ -407,7 +525,7 @@ function createMotionModel(surface) {
       }));
       scheduleEffects.push({
         effectIndex,
-        progressing: true,
+        progressing,
         external: false,
         keyframes: [{ offset: 0 }, { offset: 1 }],
         discrete: propertyName === "visibility",
@@ -444,6 +562,16 @@ function describeRoot(root) {
   if (!root._domCore) return "an object that is not a DOM node";
   return NODE_DESCRIPTIONS[root.nodeType] ?? `a node of type ${root.nodeType}`;
 }
+// The document whose stylesheets style a surface root: the root itself for a
+// document, else its owner document, whether or not the root is attached.
+function surfaceDocument(root) {
+  const document = root.nodeType === 9 ? root : root.ownerDocument;
+  if (!document) {
+    throw new Error(`render surface: root <${root.nodeName}> has no owner document, so no stylesheet can reach it`);
+  }
+  return document;
+}
+
 // A surface renders one element's box tree. A document is the root a host
 // rendering a whole page has, so it resolves to its document element — which
 // is also what makes a host-owned top element unnecessary. Anything else is
@@ -470,6 +598,34 @@ function resolveSurfaceRoot(root, operation) {
   }
   return root;
 }
+
+// A broken image paints nothing, as in Chrome. The document keeps one
+// recoverable diagnostic for each URL, owner and property; a prepared
+// document gives it to the host with its font diagnostics.
+const GENERATED_BOX_PSEUDO_ELEMENTS = { 14: "::before", 15: "::after" };
+function recordBrokenImageDiagnostic(element, node, property, requestedURL, failure, error) {
+  const document = element.ownerDocument;
+  const pseudoElement = GENERATED_BOX_PSEUDO_ELEMENTS[node._coreBox & 0xff] ?? "";
+  const ownerElement = `${element.localName}${element.id ? `#${element.id}` : ""}${pseudoElement}`;
+  const requestedFinalURL = URL.parse(requestedURL, document.baseURI)?.href ?? requestedURL;
+  const key = `${requestedFinalURL} ${ownerElement} ${property}`;
+  if (document._brokenImageDiagnostics.has(key)) return;
+  const cause = error.cause ?? error;
+  const causeMessage = cause?.message ?? String(cause);
+  document._brokenImageDiagnostics.set(key, Object.freeze({
+    code: "image-resource-broken",
+    severity: "warning",
+    recoverable: true,
+    message: `Image ${requestedFinalURL} for ${property} of ${ownerElement} failed to ${
+      failure === "fetch" ? "load" : "decode"
+    } and paints nothing: ${causeMessage}`,
+    failure,
+    owner: Object.freeze({ element: ownerElement, property }),
+    resource: Object.freeze({ kind: "image", requestedFinalURL }),
+    cause: Object.freeze({ name: cause?.name ?? "Error", message: causeMessage }),
+  }));
+}
+
 export function createRenderSurface(root, options = {}) {
   return new DOMRenderSurface(root, options);
 }
@@ -623,36 +779,127 @@ function pixelsDifferInRectangles(previous, current, width, rectangles) {
   return false;
 }
 
+// The node at each scene row of a serialization, built once per index map:
+// every frame that reuses the scene (scroll-only, transform-only, clean)
+// shares the serialization's map and so shares this array. Frozen: it is
+// published as the surface's elementAtIndex.
+const nodesAtRowByIndexMap = new WeakMap();
+function nodesAtRow(serialized) {
+  let nodes = nodesAtRowByIndexMap.get(serialized.indexOf);
+  if (nodes === undefined) {
+    nodes = new Array(serialized.nodes.length).fill(null);
+    for (const [node, index] of serialized.indexOf) nodes[index] = node;
+    Object.freeze(nodes);
+    nodesAtRowByIndexMap.set(serialized.indexOf, nodes);
+  }
+  return nodes;
+}
+
+const SURFACE_OPTION_NAMES = new Set([
+  "viewportWidth",
+  "viewportHeight",
+  "deviceScale",
+  "viewport",
+  "now",
+  "requestFrame",
+  "cancelFrame",
+  "createPersistentRenderer",
+  "initializePersistentRenderer",
+  "renderMode",
+  "renderPrecision",
+  "background",
+  "resolveResource",
+  "presentFrame",
+  "capturePaintArtifact",
+  "textSelection",
+  "graphicsBackend",
+  "glyphResourceManager",
+  "frameTransaction",
+  "cursorTarget",
+  "touchPanning",
+  "textThickening",
+  "scrollbarStyle",
+]);
+
 class DOMRenderSurface {
-  constructor(root, {
-    viewportWidth = 1280,
-    viewportHeight = 720,
-    deviceScale = 1,
-    viewport = null,
-    now = () => performance.now(),
-    requestFrame = requestHostAnimationFrame,
-    cancelFrame = cancelHostAnimationFrame,
-    renderPixels = renderScenePixels,
-    usePersistentRenderer = renderPixels === renderScenePixels,
-    layoutScene = layoutTreeBoxes,
-    // The default persistent renderer shares this module realm's
-    // scene-renderer runtime: one WASM engine, glyph manager, and WebGPU
-    // device across every surface, with a per-surface renderer + render
-    // context. Callers needing full isolation (fresh engine + device) pass
-    // createPersistentSceneRenderer here explicitly.
-    createPersistentRenderer = createSceneRendererForCurrentModule,
-    initializePersistentRenderer = true,
-    encodePixels = undefined,
-    renderMode = undefined,
-    renderPrecision = undefined,
-    resolveResource = null,
-    presentFrame = null,
-    capturePaintArtifact = false,
-    textSelection = true,
-    graphicsBackend = "auto",
-    glyphResourceManager = null,
-    frameTransaction = null,
-  } = {}) {
+  constructor(root, options = {}) {
+    validateClosedRecord(options, SURFACE_OPTION_NAMES, "render surface options");
+    const {
+      viewportWidth = 1280,
+      viewportHeight = 720,
+      deviceScale = 1,
+      viewport = null,
+      now = () => performance.now(),
+      requestFrame = requestHostAnimationFrame,
+      cancelFrame = cancelHostAnimationFrame,
+      // The persistent renderer shares the document runtime's scene
+      // renderer (one WASM engine, glyph manager, and WebGPU device across
+      // every surface of that runtime) with a per-surface renderer and
+      // render context. Callers needing full isolation (fresh engine and
+      // device) pass createPersistentSceneRenderer here explicitly.
+      createPersistentRenderer = null,
+      initializePersistentRenderer = true,
+      renderMode = undefined,
+      renderPrecision = undefined,
+      background = undefined,
+      resolveResource = null,
+      presentFrame = null,
+      capturePaintArtifact = false,
+      textSelection = true,
+      graphicsBackend = "auto",
+      glyphResourceManager = null,
+      frameTransaction = null,
+      // An element whose `style.cursor` follows the document under the
+      // pointer. Every flat-canvas host wants this; a host that projects
+      // the document into a scene resolves cursors itself, because the
+      // point has to be unprojected first, and passes nothing here.
+      cursorTarget = null,
+      // A primary touch-pointer drag pans the scroll container under it.
+      // Off by default: a drag never scrolls, whatever the pointer type. A
+      // host turns it on when the device takes touch input.
+      touchPanning = false,
+      // Optional glyph thickening in device pixels, per ink polarity
+      // (design/text-rendering.md, "Glyph edge coverage"). Unset draws the
+      // exact outline.
+      textThickening = undefined,
+      // "overlay" (the default) or "classic"
+      // (plans/PLAN-native-scrollbars.md, decision 1). An overlay bar takes
+      // no layout space and shows only while the scroller moves or the
+      // pointer is in it; a classic bar is always shown and takes its
+      // thickness from the scroller's content box.
+      scrollbarStyle = "overlay",
+    } = options;
+    this.scrollbarStyle = assertScrollbarStyle(scrollbarStyle, "render surface options");
+    if (typeof touchPanning !== "boolean") {
+      throw new TypeError(
+        `render surface options: touchPanning must be a boolean, received ${String(touchPanning)}`,
+      );
+    }
+    // The raster backdrop belongs to the surface, not the root's box.
+    // Keep one snapshot for every frame, including dirty-tile and resize frames.
+    this._background = undefined;
+    if (background !== undefined) {
+      const { r, g, b, a } = background ?? {};
+      if (
+        !Number.isFinite(r) || !Number.isFinite(g) ||
+        !Number.isFinite(b) || !Number.isFinite(a) || a < 0 || a > 1
+      ) {
+        throw new TypeError(
+          "render surface options: background requires finite r, g, b, a components with alpha between 0 and 1",
+        );
+      }
+      this._background = Object.freeze({ r, g, b, a });
+    }
+    this._textThickening = undefined;
+    if (textThickening !== undefined) {
+      const { darkInk, lightInk } = textThickening ?? {};
+      if (!(darkInk >= 0) || !(lightInk >= 0) || !Number.isFinite(darkInk) || !Number.isFinite(lightInk)) {
+        throw new TypeError(
+          `render surface options: textThickening requires finite, non-negative darkInk and lightInk device pixels, received ${JSON.stringify(textThickening)}`,
+        );
+      }
+      this._textThickening = Object.freeze({ darkInk, lightInk });
+    }
     root = resolveSurfaceRoot(root, "createRenderSurface");
     if (root.parentElement) {
       const documentElement = root.ownerDocument?.documentElement;
@@ -676,9 +923,12 @@ class DOMRenderSurface {
     this.viewport._surface = this;
     this.viewport.root = root;
     const ownerDocument = root.ownerDocument;
+    // The scrollbar style is part of the style environment: a classic bar
+    // takes layout space, so a change re-lowers every record.
     ownerDocument?._styleSystem?.setEnvironment({
       viewportWidth: this.viewport.width,
       viewportHeight: this.viewport.height,
+      scrollbarStyle: this.scrollbarStyle,
     });
     if (ownerDocument?._reevaluateMediaQueryLists) {
       // Component documents keep single-valued window semantics
@@ -723,22 +973,28 @@ class DOMRenderSurface {
       );
     }
     surfaceRegistry.set(this._environmentKey, this);
+    // Every live surface over a tree of this document, attached to it or
+    // not: a stylesheet change reaches each one (SDDocument._invalidateStyles).
+    this._document = surfaceDocument(root);
+    (this._document._liveRenderSurfaces ??= new Set()).add(this);
     this._now = now;
     this._requestFrame = requestFrame;
     this._cancelFrame = cancelFrame;
-    this._renderPixels = renderPixels;
-    this._usesDefaultRenderer = usePersistentRenderer;
     this._glyphResourceManager = glyphResourceManager;
-    this._encodePixels = encodePixels === undefined
-      ? ownerDocument._sandomSceneRendererRuntime?.codecRuntime?.encodePNG ??
-        encodePNG
-      : encodePixels;
+    const sceneRendererRuntime = ownerDocument?._sandomSceneRendererRuntime ??
+      null;
+    const persistentRendererFactory = createPersistentRenderer ??
+      sceneRendererRuntime?.createSceneRenderer ?? createSceneRenderer;
+    const layoutScene = sceneRendererRuntime?.layoutTreeBoxes ??
+      layoutTreeBoxes;
+    this._engineCounters = sceneRendererRuntime?.engineCounters ??
+      engineCounters;
     if (presentFrame !== null && typeof presentFrame !== "function") {
       throw new TypeError("presentFrame must be a function or null");
     }
     this._presentFrame = presentFrame;
     this._persistentRenderer = null;
-    this._createPersistentRenderer = createPersistentRenderer;
+    this._createPersistentRenderer = persistentRendererFactory;
     this._persistentRendererOptions = Object.freeze({
       graphicsBackend,
       ...(renderMode === undefined ? {} : { renderMode }),
@@ -746,9 +1002,8 @@ class DOMRenderSurface {
       ...(glyphResourceManager === null ? {} : { glyphResourceManager }),
     });
     this._animationEventUnsubscribe = null;
-    this._persistentRendererPromise =
-      this._usesDefaultRenderer && initializePersistentRenderer
-        ? createPersistentRenderer({
+    this._persistentRendererPromise = initializePersistentRenderer
+      ? persistentRendererFactory({
           width: this.viewport.width,
           height: this.viewport.height,
           deviceScale: this.viewport.deviceScale,
@@ -756,85 +1011,57 @@ class DOMRenderSurface {
         }).then((renderer) => {
           this._persistentRenderer = renderer;
           this._animationEventUnsubscribe = renderer.onAnimationEvent(
-            (record) => {
-              const element =
-                (this._eventElementAtIndex ?? this._elementAtIndex)[
-                  record.nodeIndex
-                ];
-              if (!element) {
-                throw new RangeError(
-                  `No DOM element for animated layout index ${record.nodeIndex}`,
-                );
-              }
-              const matchingAnimation =
-                this._animationCancelingThroughEngine?._animationId ===
-                    record.animationId
-                  ? this._animationCancelingThroughEngine
-                  : this._animations.find((animation) =>
-                    animation._animationId === record.animationId
-                  );
-              const transitionTiming = this._transitionTimings.get(element)
-                ?.get(
-                  record.propertyName,
-                );
-              const elapsedTime = matchingAnimation
-                ? matchingAnimation._elapsedTimeForEvent(record.type)
-                : record.type === "transitionend"
-                ? (transitionTiming?.duration ?? 0) / 1000
-                : Math.max(0, -(transitionTiming?.delay ?? 0)) / 1000;
-              const feedback = matchingAnimation?._beginEngineLifecycle(record);
-              if (matchingAnimation && !feedback) return;
-              try {
-                dispatchEvent(
-                  element,
-                  createEvent(record.type, {
-                    bubbles: true,
-                    propertyName: record.propertyName,
-                    animationName: matchingAnimation?._cssAnimationName ?? "",
-                    elapsedTime,
-                    pseudoElement: "",
-                  }),
-                );
-              } finally {
-                if (feedback) {
-                  matchingAnimation._completeEngineLifecycle(feedback);
-                }
-              }
-              if (
-                record.type === "transitionend" ||
-                record.type === "transitioncancel"
-              ) {
-                const timings = this._transitionTimings.get(element);
-                if (timings?.delete(record.propertyName)) {
-                  const records = this._transitionRecords.get(element);
-                  records?.delete(record.propertyName);
-                  if (records?.size === 0) {
-                    this._transitionRecords.delete(element);
-                  }
-                  if (this._activeTransitionCount > 0) {
-                    this._activeTransitionCount--;
-                  }
-                }
-              }
-            },
+            (record) => this._dispatchEngineAnimationEvent(record),
           );
           return renderer;
         })
         : null;
-    this._resolveResource = resolveResource;
+    this._resolveResource = resolveResource ?? ownerDocument?._resolveResource ?? null;
+    this.imageLoadFailures = new Map();
+    this._onImageLoadError = ({ node, property, requestedURL, failure, error }) => {
+      if (error.cause instanceof InvalidResourceResponseError) {
+        throw error.cause;
+      }
+      // A ::before or ::after box has no element handle: its owner is the
+      // box at generatedOwnerIndex. A layout pass outside a render frame has
+      // no element index; the scene renderer reports the cached failure
+      // again on the next frame, which records it.
+      const element = node._coreHandle === undefined
+        ? this._eventElementAtIndex?.[node.generatedOwnerIndex]
+        : this._eventElementAtIndex?.find((candidate) =>
+          candidate?._coreHandle === BigInt(node._coreHandle)
+        );
+      if (!element) return;
+      recordBrokenImageDiagnostic(element, node, property, requestedURL, failure, error);
+      if (property !== "src") return;
+      const previous = this.imageLoadFailures.get(element);
+      if (previous?.resourceIdentifier === node.resourceIdentifier) return;
+      this.imageLoadFailures.set(element, Object.freeze({
+        requestedURL,
+        resourceIdentifier: node.resourceIdentifier,
+        error,
+      }));
+      dispatchEvent(element, createEvent("error"));
+    };
     this._capturePaintArtifact = capturePaintArtifact;
     this._textSelectionEnabled = Boolean(textSelection);
-    this._layoutTreeBoxes = (scene) => {
+    this._touchPanning = touchPanning;
+    this._layoutTreeBoxes = async (scene, svgImageTimings = null) => {
       this._stageCounters.layoutPasses++;
       // Over the tree this surface renders, under its own claim: the
       // engine relayouts only the rows whose records changed and keeps the
       // rows for the frame that follows (scene-renderer's syncLayoutWrite).
       const engineWriteOwner = this._persistentRenderer?.engineWriteToken ??
         null;
-      return layoutScene(scene, {
+      const boxes = await layoutScene(scene, {
         resolveResource: this._resolveResource,
+        onImageLoadError: this._onImageLoadError,
+        svgImageTimings,
         ...(engineWriteOwner === null ? {} : { engineWriteOwner }),
       });
+      this._stageCounters.nodesLaidOut +=
+        this._engineCounters().layoutComputeCount;
+      return boxes;
     };
     // Permanent frame-stage counters (presented-frame refactor verification
     // contract): a scroll-only frame MUST NOT advance serializations or
@@ -844,10 +1071,109 @@ class DOMRenderSurface {
       serializations: 0,
       layoutPasses: 0,
       scrollOnlyFrames: 0,
+      // Scroll-only frames whose presented geometry was derived from the
+      // previous frame's instead of walking the tree again.
+      geometrySuccessorFrames: 0,
+      // Frames whose presented geometry was derived from the previous
+      // frame's after a restyle that inserted, removed and laid out no row
+      // (geometry_restyle_successor), the element records whose facts
+      // those derivations built again, and the derivations that walked the
+      // flat tree to prove it unchanged (their predecessor was not proven).
+      geometryRestyleFrames: 0,
+      geometryRestyleRecordsRebuilt: 0,
+      geometryRestyleTreeWalks: 0,
+      // The work of every derived geometry snapshot (scroll and restyle
+      // successors): elements resolved, records copied with the record
+      // pages they shared with the predecessor, records derived, and box
+      // rows compared with the records (none when the frame presents the
+      // predecessor's box snapshot).
+      geometrySuccessorElementsResolved: 0,
+      geometrySuccessorRecordsCopied: 0,
+      geometrySuccessorRecordsDerived: 0,
+      geometrySuccessorBoxRowsRead: 0,
+      // Restyle derivations refused, by reason; each such frame built its
+      // geometry. Viewport: another viewport size, scale or viewport row.
+      // Text: text geometry other than the previous frame's (translations
+      // aside). Tree, rows, fragments: the core found another flat tree,
+      // another row, or another fragment count.
+      geometryRestyleRefusedViewport: 0,
+      geometryRestyleRefusedText: 0,
+      geometryRestyleRefusedTree: 0,
+      geometryRestyleRefusedRows: 0,
+      geometryRestyleRefusedFragments: 0,
       retainedTransformFrames: 0,
       retainedCleanFrames: 0,
+      // Frames that restyled the retained publication in place instead of
+      // building the scene (frame mode 4, engine_record_restyle), and the
+      // mode 4 frames that built it, by reason. Mutation: a mutation since
+      // the last frame other than a RESTYLE_STATES state change. Viewport:
+      // another viewport size or scale than the retained scene's. The
+      // others are the core's refusals: build (the publication is not the
+      // last scene build's), list (the restyle list describes another
+      // publication), generation (cascade, font table or face index),
+      // overflow (of the restyle list), root (the root or a child of it
+      // restyled), contents (a restyled display: contents element) and
+      // structure (a record changed more than paint-only properties, or a
+      // pseudo-element started or stopped generating content). Rows read:
+      // the publication rows those restyles read the serial of (the rows of
+      // the restyled elements and of the descendants they changed).
+      sceneRestyleFrames: 0,
+      sceneRestyleRowsRead: 0,
+      sceneRestyleRefusedMutation: 0,
+      sceneRestyleRefusedViewport: 0,
+      sceneRestyleRefusedBuild: 0,
+      sceneRestyleRefusedList: 0,
+      sceneRestyleRefusedGeneration: 0,
+      sceneRestyleRefusedOverflow: 0,
+      sceneRestyleRefusedRoot: 0,
+      sceneRestyleRefusedContents: 0,
+      sceneRestyleRefusedStructure: 0,
       retainedDeliveries: 0,
       deliveredFrames: 0,
+      // Snap applications that walked the tree for snap containers.
+      snapTreeWalks: 0,
+      // Reused text geometry entries a frame wrote a translation into. A
+      // frame that scrolls only the viewport shifts the reused geometry as
+      // a whole and writes only its text controls' entries.
+      translatedTextGeometryEntries: 0,
+      // Work counters, totals over the surface's frames. Restyles are the
+      // core's element and pseudo-element records resolved during a frame;
+      // scene rows those of the frame's scene builds, lowered rows those its
+      // publications lowered anew; changed rows the engine rows the renderer
+      // published; nodes laid out those every layout pass computed; command
+      // bytes those a paint walk wrote; retained patches the nodes whose
+      // paint fields a retained transaction changed; command blocks the
+      // blocks it emitted again and spliced in, block commands the commands
+      // in them. Commands decoded are the commands the renderer read for the
+      // paint artifact, the text geometry, the glyph and path resources and
+      // the highlighted stream; replanned ranges and commands those the
+      // raster plan planned again (a preparation or a rescroll plans the
+      // whole stream as one range). Text batches are the
+      // text preparations the renderer ran, text rows the rows they
+      // prepared; kept and rebuilt text runs the republished rows whose run
+      // a patch kept or re-prepared. Raster damage is the device pixels the
+      // raster painted, damage selections the frames whose raster replayed
+      // the plan's damage selection (raster_plan_select).
+      elementsRestyled: 0,
+      pseudoElementsRestyled: 0,
+      sceneRowsBuilt: 0,
+      rowsLowered: 0,
+      rowsChanged: 0,
+      nodesLaidOut: 0,
+      paintWalks: 0,
+      commandBytesEmitted: 0,
+      retainedCommandPatches: 0,
+      commandBlocksEmitted: 0,
+      blockCommandsEmitted: 0,
+      commandsDecoded: 0,
+      rasterPlanRangesReplanned: 0,
+      rasterPlanCommandsReplanned: 0,
+      textBatchesPrepared: 0,
+      textRowsPrepared: 0,
+      textRunsKept: 0,
+      textRunsRebuilt: 0,
+      rasterDamagePixels: 0,
+      rasterDamageSelections: 0,
       currentStage: "idle",
     };
     this._frameListeners = [];
@@ -867,9 +1193,22 @@ class DOMRenderSurface {
     this._lastRendered = null;
     this._indexOfElement = new Map();
     this._elementAtIndex = [];
+    this._computedSamples = root._domCore.status("computed_samples_create");
     this._lastBoxes = [];
-    this._documentSelectionRects = [];
     this._presentedFrame = null;
+    // The element whose cursor follows the document, and the value last
+    // written there so an unchanged cursor is not re-assigned.
+    this._cursorTarget = cursorTarget;
+    this._appliedCursor = null;
+    // Caret blink: the time the current caret last became visible, the
+    // caret identity the anchor belongs to (element plus offset), and the
+    // phase the presented frame carries. A surface with a caret keeps
+    // waking so the phase can flip; nothing else about the document
+    // changes, so those frames reuse the retained scene.
+    this._caretBlinkAnchorMilliseconds = null;
+    this._caretBlinkElement = null;
+    this._caretBlinkOffset = -1;
+    this._caretBlinkVisible = true;
     this._preparedState = null;
     this._syncLayout = null;
     // Style-generation checkpoints (frame-incrementality): the style system
@@ -897,6 +1236,15 @@ class DOMRenderSurface {
     this._selectionChanged = false;
     this._transformOnlyMutations = new Set();
     this._hasNonTransformMutation = false;
+    // Whether a mutation since the last frame was anything but a change of
+    // one of RESTYLE_STATES; only a frame without one may restyle the
+    // retained scene (frame mode 4).
+    this._hasNonStateMutation = false;
+    // Tree mutations recorded under the root (insertions, removals, shadow
+    // roots attached). The text geometry grouping keeps its owner
+    // classification (_textOwnerKinds) until the next one.
+    this._structureMutations = 0;
+    this._textOwnerKinds = null;
     this._scrollOwner = root._domCore.status("scroll_owner_create");
     root._domCore.status(
       "scroll_owner_bind",
@@ -917,6 +1265,9 @@ class DOMRenderSurface {
     this._activeTransitionCount = 0;
     this._transitionTimings = new WeakMap();
     this._transitionRecords = new Map();
+    // The time the renderer last ticked the engine's tracks at: every
+    // transition that time reached the end of has ended by then.
+    this._transitionTickMilliseconds = null;
     this._animations = [];
     // Animations this surface adopted from a document's pending timeline
     // (element.animate() before any surface existed). They hold until the
@@ -933,10 +1284,17 @@ class DOMRenderSurface {
     this._snapCheckPending = false;
     // A layout consequence owes a snap-container check; the frame that
     // renders it asks the core, which resolved every box element, and only
-    // a tree with snap containers keeps a snap frame scheduled.
+    // a tree with snap containers keeps a snap frame scheduled or walks
+    // the tree for them after a scroll (_snapContainersInLastBuild).
     this._snapCheckOwed = false;
+    this._snapContainersPresent = false;
+    this._snapContainersBuild = -1;
     this._smoothScrolls = new NativeScrollMotions(this);
     this._scrollbars = [];
+    // Overlay scrollbar visibility on the surface clock (decision 2 of
+    // plans/PLAN-native-scrollbars.md). Each published descriptor carries
+    // the visibility it was painted with.
+    this._scrollbarVisibility = new ScrollbarVisibility(this.scrollbarStyle);
     this._pendingAnimationDeclarations = [];
     this._animationFrameCore = root._domCore;
     this._animationFrameOwner = this._animationFrameCore.status(
@@ -981,6 +1339,34 @@ class DOMRenderSurface {
   // is null until the first frame delivers.
   get presentedFrame() {
     return this._presentedFrame;
+  }
+
+  // Adds one render's work (scene-renderer's performance.preparation and
+  // performance.rasterPreparation) to the surface's work counters. A
+  // renderer without the record (a test double) reports none.
+  _countRenderWork(performance) {
+    const preparation = performance?.preparation;
+    if (preparation?.writtenRowCount === undefined) return;
+    const counters = this._stageCounters;
+    counters.rowsChanged += preparation.writtenRowCount;
+    counters.nodesLaidOut += preparation.nodesLaidOut;
+    if (preparation.paintWalked) counters.paintWalks++;
+    counters.commandBytesEmitted += preparation.commandBytesEmitted;
+    counters.retainedCommandPatches += preparation.retainedCommandPatches;
+    counters.commandBlocksEmitted += preparation.commandBlocksEmitted;
+    counters.blockCommandsEmitted += preparation.blockCommandsEmitted;
+    counters.commandsDecoded += preparation.commandsDecoded;
+    counters.rasterPlanRangesReplanned += preparation.rasterPlanRangesReplanned;
+    counters.rasterPlanCommandsReplanned +=
+      preparation.rasterPlanCommandsReplanned;
+    counters.textBatchesPrepared += preparation.textBatchesPrepared;
+    counters.textRowsPrepared += preparation.textRowsPrepared;
+    counters.textRunsKept += preparation.textRunsKept;
+    counters.textRunsRebuilt += preparation.textRunsRebuilt;
+    counters.rasterDamagePixels += preparation.rasterDamagePixels;
+    if (performance.rasterPreparation?.damageSelected) {
+      counters.rasterDamageSelections++;
+    }
   }
 
   // Permanent frame-stage counters (Slice 2 verification contract). Frozen
@@ -1033,10 +1419,10 @@ class DOMRenderSurface {
         : target._requestedScrollTop,
       effectiveLeft: target === this.viewport
         ? target.scrollX
-        : target.scrollLeft,
+        : target._scrollLeft,
       effectiveTop: target === this.viewport
         ? target.scrollY
-        : target.scrollTop,
+        : target._scrollTop,
       minimumLeft: fact(16),
       maximumLeft: fact(17),
       minimumTop: fact(18),
@@ -1098,7 +1484,11 @@ class DOMRenderSurface {
   // the primary's slot-releasing disconnect above and the follower fanout
   // below, which must never touch the primary's _renderSurface slots.
   _forgetNodeState(node) {
+    if (this._computedSamples) {
+      node._domCore.status("computed_samples_remove_node", this._computedSamples, node._coreHandle);
+    }
     this._mutatedNodes.delete(node);
+    this.imageLoadFailures.delete(node);
     this._forcedGenerationNodes.delete(node);
     this._scrollAnchors.delete(node);
     for (const [container, state] of this._scrollAnchors) {
@@ -1164,7 +1554,7 @@ class DOMRenderSurface {
   _frameFlags(rasterize, deliverObservers, pixelReadback) {
     const document = this._root.ownerDocument;
     const style = document?._styleSystem;
-    return (this._usesDefaultRenderer ? 1 : 0) |
+    return 1 |
       (this._preparedState !== null && this._presentedFrame !== null ? 2 : 0) |
       (this._pendingScrollSources.size > 0 ? 4 : 0) |
       (this._animations.length + this._cssAnimations.size +
@@ -1194,8 +1584,13 @@ class DOMRenderSurface {
         ? 128
         : 0) |
       (rasterize ? 256 : 0) |
-      (pixelReadback && this._presentFrame !== null &&
-          this._persistentRenderer?.graphicsBackend !== "webgl2"
+      // A pixel capture after a texture delivery cannot merge into the
+      // retained pixel snapshot (the texture frames changed tiles it never
+      // saw), so it reads the whole target back; consecutive pixel frames
+      // stay incremental.
+      (pixelReadback &&
+          this._persistentRenderer?.graphicsBackend !== "webgl2" &&
+          !this._lastRendered?.pixels
         ? 512
         : 0) |
       (this._scrollAnchors.size > 0 ? 2048 : 0) |
@@ -1204,10 +1599,77 @@ class DOMRenderSurface {
         : 0) |
       (deliverObservers ? 8192 : 0) |
       (this._lastBoxes.length > 0 ? 16384 : 0) |
-      (this._lastPixels !== null ||
-          (this._presentFrame !== null && this._frameSequence > 0)
-        ? 65536
-        : 0);
+      (this._lastPixels !== null || this._frameSequence > 0 ? 65536 : 0);
+  }
+
+  // Frame mode 4: restyles the retained publication in place
+  // (engine_record_restyle) instead of building the scene. Answers whether
+  // it did; a frame it refuses builds the scene, and the refusal is counted
+  // by its reason.
+  _restyleRetainedPublication(core, frameViewport, styleSystem) {
+    const counters = this._stageCounters;
+    if (this._hasNonStateMutation) {
+      counters.sceneRestyleRefusedMutation++;
+      return false;
+    }
+    if (
+      this._serializedViewportWidth !== frameViewport.width ||
+      this._serializedViewportHeight !== frameViewport.height ||
+      this._serializedViewportScale !== frameViewport.deviceScale
+    ) {
+      counters.sceneRestyleRefusedViewport++;
+      return false;
+    }
+    // Sampled before the restyle, as a serialization samples it before its
+    // walk.
+    const styleGeneration = styleSystem === undefined
+      ? -1
+      : styleSystem.generation;
+    const refusal = core.status(
+      "engine_record_restyle",
+      this._preparedState.serialized.publication,
+      this._root._coreHandle,
+    );
+    if (refusal !== 0) {
+      const counter = SCENE_RESTYLE_REFUSALS[refusal];
+      if (counter === undefined) {
+        throw new Error(`engine_record_restyle answered ${refusal}`);
+      }
+      counters[counter]++;
+      return false;
+    }
+    this._serializedStyleGeneration = styleGeneration;
+    counters.sceneRestyleFrames++;
+    return true;
+  }
+
+  // The retained serialization after its publication was restyled in
+  // place: the scene nodes of the restyled rows are copies, and a box that
+  // declares transitions takes its new record copy (the renderer's
+  // transition endpoint), since the previous one keeps the old.
+  _restyledSerialization(core) {
+    const previous = this._preparedState.serialized;
+    const loweredRows = core.engineRecordLowered(previous.publication);
+    const changedRows = core.engineRecordChanged(previous.publication);
+    const nodes = previous.nodes.slice();
+    for (const index of loweredRows) {
+      const node = { ...nodes[index] };
+      if (node._coreRecord !== undefined) {
+        const box = previous.geometryBoxes[index];
+        node._coreRecord = core.engineRecordCopy(
+          box.stableId,
+          box.sourceRevision,
+        );
+      }
+      nodes[index] = node;
+    }
+    return {
+      ...previous,
+      nodes,
+      loweredRows,
+      changedRows,
+      reusedRows: core.engineRecordReused(previous.publication),
+    };
   }
 
   _frameClaim(frame, expected, bindings = this._frameBindings) {
@@ -1232,12 +1694,22 @@ class DOMRenderSurface {
 
   _recordMutation(kind, node, detail) {
     if (this._shutdown) throw new Error("render surface is shut down");
+    if (kind === "attribute") {
+      const failure = this.imageLoadFailures.get(node);
+      if (failure && node.getAttribute("src") !== failure.requestedURL) {
+        this.imageLoadFailures.delete(node);
+      }
+    }
     if (node && kind !== "selection") this._mutatedNodes.add(node);
     if (kind === "style" && detail === "transform" && node) {
       this._transformOnlyMutations.add(node);
     } else {
       this._hasNonTransformMutation = true;
     }
+    if (kind !== "state" || !RESTYLE_STATES.has(detail)) {
+      this._hasNonStateMutation = true;
+    }
+    if (kind === "structure") this._structureMutations++;
     if (kind === "selection") this._selectionChanged = true;
     // Native records classify DOM fields before callback delivery. Only
     // host-owned bitmap and interaction changes enter as normalized facts.
@@ -1465,6 +1937,7 @@ class DOMRenderSurface {
     ownerDocument?._styleSystem?.setEnvironment({
       viewportWidth: this.viewport.width,
       viewportHeight: this.viewport.height,
+      scrollbarStyle: this.scrollbarStyle,
     });
     ownerDocument?._reevaluateMediaQueryLists?.();
     this._forceFullInvalidation = true;
@@ -1655,17 +2128,38 @@ class DOMRenderSurface {
     return containers;
   }
 
+  // Whether the last build's tree has a snap container, counted once per
+  // serialization: only a serialization writes the stored fields the list
+  // reads.
+  _snapContainersInLastBuild() {
+    const build = this._stageCounters.serializations;
+    if (this._snapContainersBuild !== build) {
+      this._snapContainersPresent = this._snapContainers().length > 0;
+      this._snapContainersBuild = build;
+    }
+    return this._snapContainersPresent;
+  }
+
   _applyScrollSnapping() {
     if (
       this._scrollInteractionActive || this._scrollMomentum ||
       !this._presentedFrame?.geometryHandle
     ) return false;
+    // A pending check re-snaps every snap container of the tree, which is a
+    // walk of every element. A tree whose last build had none owes no walk,
+    // unless styles changed since that build. Scrollers already snapped or
+    // owing a snap take theirs either way.
+    const walkTree = this._snapCheckPending &&
+      (this._snapContainersInLastBuild() ||
+        this._root.ownerDocument?._styleSystem?.generation !==
+          this._serializedStyleGeneration);
+    if (walkTree) this._stageCounters.snapTreeWalks++;
     const changed = !!this._root._domCore.status(
       "scroll_snap_apply",
       this._scrollOwner,
       this._presentedFrame.geometryHandle,
       this._root._coreHandle,
-      this._snapCheckPending ? 1 : 0,
+      walkTree ? 1 : 0,
       0,
     );
     this._snapCheckPending = false;
@@ -1711,6 +2205,51 @@ class DOMRenderSurface {
     }
   }
 
+  // A caret is on screen when the presented frame carries one. The surface
+  // then keeps asking for frames, the way a running animation does, so the
+  // blink phase can flip; the frame that flips it changes nothing that
+  // feeds serialization, so it reuses the retained scene.
+  _caretBlinkActive() {
+    return this._caretBlinkElement !== null;
+  }
+
+  // The CSS cursor the engine resolves at a document point, written to the
+  // host's element. Called from input dispatch, which is the only moment
+  // the answer can change: the pointer moved, or what is under it did.
+  _applyCursor(x, y) {
+    const target = this._cursorTarget;
+    if (!target || this._shutdown || !this._presentedFrame) return;
+    let cursor;
+    try {
+      cursor = this._presentedFrame.geometryCore.string(
+        "input_pointer_cursor",
+        this._presentedFrame.geometryHandle,
+        x,
+        y,
+      );
+    } catch {
+      // A cursor query against geometry that has just been released is not
+      // a host error; the next pointer event asks again.
+      return;
+    }
+    if (cursor === this._appliedCursor) return;
+    this._appliedCursor = cursor;
+    if (target.style) target.style.cursor = cursor;
+  }
+
+  // Input dispatch names the scrollbar descriptor under the pointer, or
+  // null, and the bar whose thumb a pointer pressed (null on release,
+  // undefined for no change). A change that paints differently (an overlay
+  // bar shows, a thumb changes colour) requests a frame; that frame applies
+  // it at its own time.
+  _noteScrollbarPointer(scrollbar, pressed = undefined) {
+    if (this._shutdown) return;
+    if (this._scrollbarVisibility.notePointer(scrollbar, pressed)) {
+      this._dirty = true;
+      this._schedule();
+    }
+  }
+
   _schedule() {
     if (
       this._frameTransaction ||
@@ -1720,6 +2259,8 @@ class DOMRenderSurface {
         this._animationFrameOwner,
       ) &&
         !this._dirty &&
+        !this._caretBlinkActive() &&
+        !this._scrollbarVisibility.active &&
         ((this._pendingScrollEndTargets.size === 0 &&
           !this._snapCheckPending) ||
           this._scrollInteractionActive)) ||
@@ -1731,9 +2272,26 @@ class DOMRenderSurface {
       // Native snapshots detach before invoking. Exceptions still reach the
       // realm sink without preventing the remaining callbacks or the render.
       this._runDocumentAnimationFrameCheckpoint(frameTimeMilliseconds);
+      if (
+        this._caretBlinkActive() &&
+        caretVisibleInPhase(
+            this._caretBlinkAnchorMilliseconds,
+            frameTimeMilliseconds,
+          ) !== this._caretBlinkVisible
+      ) {
+        this._dirty = true;
+      }
+      // An overlay bar that starts or continues to fade, or a pointer that
+      // entered or left a bar, changes the overlay without a DOM change.
+      if (
+        this._scrollbarVisibility.due(this._scrollbars, frameTimeMilliseconds)
+      ) {
+        this._dirty = true;
+      }
       if (!this._dirty) {
         if (this._applyScrollSnapping()) return null;
         this._flushScrollEndEvents();
+        this._schedule();
         return null;
       }
       const forceStateDelivery = this._forceStateDelivery;
@@ -1816,8 +2374,7 @@ class DOMRenderSurface {
           (this._textSelectionEnabled &&
             this._preparedState.serialized.textBoxes > 0)) &&
       (rendered.pixels !== undefined) ===
-        (this._presentFrame === null ||
-          this._persistentRenderer?.graphicsBackend === "webgl2");
+        (this._persistentRenderer?.graphicsBackend === "webgl2");
   }
 
   _notifyFrameListeners(frame, resizeObserverLoopError) {
@@ -1842,6 +2399,175 @@ class DOMRenderSurface {
     }
   }
 
+  // A transition the renderer declared for this frame's scene enters the
+  // registry as it is declared, before any of its own events: a reversal
+  // of a transition that has not progressed has no duration left, and it
+  // starts and ends in the tick of the frame that declares it. Its
+  // CSSTransition takes over the track the renderer declared; the
+  // transitions one frame declares share a transition generation.
+  _registerStartedTransition(transition) {
+    const element = this._eventElementAtIndex[transition.nodeIndex];
+    if (!element) return;
+    this._transitionTimings.get(element)?.get(transition.propertyName)?.animation
+      ?._settleReplaced();
+    const timing = {
+      duration: transition.duration,
+      delay: transition.delay,
+      easing: transition.easing,
+      startTimeMilliseconds: transition.startTime,
+      startValue: transition.startValue,
+      endValue: transition.endValue,
+      trackStartValue: transition.trackStartValue,
+      animationId: transition.animationId,
+      engineHandle: transition.engineHandle,
+    };
+    timing.animation = new CSSTransition(
+      this,
+      element,
+      transition.propertyName,
+      timing,
+      this._frameSequence,
+    );
+    this._registerTransitionAnimation(timing.animation);
+  }
+
+  // The registry holds each running or paused transition of an element
+  // under its property; one whose property a newer transition took stays
+  // out.
+  _registerTransitionAnimation(animation) {
+    const element = animation._element;
+    const propertyName = animation._transitionProperty;
+    let timings = this._transitionTimings.get(element);
+    if (!timings) {
+      timings = new Map();
+      this._transitionTimings.set(element, timings);
+    }
+    if (timings.has(propertyName)) return;
+    timings.set(propertyName, animation._transitionRecord);
+    let records = this._transitionRecords.get(element);
+    if (!records) {
+      records = new Map();
+      this._transitionRecords.set(element, records);
+    }
+    records.set(propertyName, animation._transitionRecord);
+    this._activeTransitionCount++;
+  }
+
+  _unregisterTransition(animation) {
+    const element = animation._element;
+    const timings = this._transitionTimings.get(element);
+    if (timings?.get(animation._transitionProperty)?.animation !== animation) return;
+    timings.delete(animation._transitionProperty);
+    const records = this._transitionRecords.get(element);
+    records?.delete(animation._transitionProperty);
+    if (records?.size === 0) this._transitionRecords.delete(element);
+    if (this._activeTransitionCount > 0) this._activeTransitionCount--;
+  }
+
+  // The animations getAnimations() chooses from: this surface's animations
+  // and its registered transitions.
+  _animationCandidates() {
+    const candidates = [...this._animations];
+    for (const records of this._transitionRecords.values()) {
+      for (const record of records.values()) candidates.push(record.animation);
+    }
+    return candidates;
+  }
+
+  // An engine track's start, iteration end or cancel, dispatched at the
+  // element of its node; the animation or transition that owns the track
+  // acknowledges it.
+  _dispatchEngineAnimationEvent(record) {
+    const element = (this._eventElementAtIndex ?? this._elementAtIndex)[
+      record.nodeIndex
+    ];
+    if (!element) {
+      throw new RangeError(
+        `No DOM element for animated layout index ${record.nodeIndex}`,
+      );
+    }
+    const transitionAnimation = this._transitionTimings.get(element)
+      ?.get(record.propertyName)?.animation;
+    const matchingAnimation =
+      this._animationCancelingThroughEngine?._ownsEngineAnimationId(record.animationId)
+        ? this._animationCancelingThroughEngine
+        : transitionAnimation?._ownsEngineAnimationId(record.animationId)
+        ? transitionAnimation
+        : this._animations.find((animation) =>
+          animation._animationId === record.animationId
+        );
+    const ends = record.type === "transitionend" ||
+      record.type === "transitioncancel";
+    const feedback = matchingAnimation?._beginEngineLifecycle(record);
+    // An owned event is dispatched once: never when already reported, or
+    // when it comes from a track its animation has replaced.
+    if (!matchingAnimation || feedback) {
+      try {
+        dispatchEvent(
+          element,
+          createEvent(record.type, {
+            bubbles: true,
+            propertyName: record.propertyName,
+            animationName: matchingAnimation?._cssAnimationName ?? "",
+            elapsedTime: matchingAnimation
+              ? matchingAnimation._elapsedTimeForEvent(record.type)
+              : 0,
+            pseudoElement: "",
+          }),
+        );
+      } finally {
+        if (feedback) matchingAnimation._completeEngineLifecycle(feedback);
+      }
+    }
+    // A transition whose track ended or was cancelled leaves the registry,
+    // whether or not its event was still owed.
+    if (ends && matchingAnimation instanceof CSSTransition) {
+      this._unregisterTransition(matchingAnimation);
+    }
+  }
+
+  // The renderer ends a transition's track in the first tick whose time
+  // reaches its end, and that tick reports the end to the registry. A
+  // transition still registered after such a tick is one whose end the
+  // registry missed; it would keep every later frame rebuilding the scene.
+  _requireEndedTransitionsUnregistered() {
+    const tickMilliseconds = this._transitionTickMilliseconds;
+    if (tickMilliseconds === null) return;
+    for (const [element, timings] of this._transitionRecords) {
+      for (const [propertyName, timing] of timings) {
+        // A paused or held transition's track does not end, and one its
+        // CSSTransition declared or seeked since that tick has not run.
+        if (!timing.animation._trackAdvances() || timing.trackAwaitsTick) continue;
+        // The engine's own test (engine-layout.watpart, tick) over the
+        // timing the track was written with (writeAnimationTrack).
+        const activeStartMilliseconds = timing.startTimeMilliseconds +
+          (timing.delay ?? 0);
+        if (tickMilliseconds - activeStartMilliseconds < timing.duration) {
+          continue;
+        }
+        const elementLabel = `${element.localName}${
+          element.id ? `#${element.id}` : ""
+        }`;
+        throw new Error(
+          `The render surface still counts the ${propertyName} transition of ${elementLabel} as running after the frame at ${tickMilliseconds} ms, which reached its end at ${
+            activeStartMilliseconds + timing.duration
+          } ms (start ${timing.startTimeMilliseconds} ms, delay ${timing.delay} ms, duration ${timing.duration} ms). The renderer ended its track without the registry removing it, and every later frame would rebuild the scene; a transition must enter the registry when the renderer declares it and leave it at its transitionend or transitioncancel.`,
+        );
+      }
+    }
+  }
+
+  // A registered transition's track advances on the clock unless it is
+  // paused or has a zero playback rate.
+  _transitionsNeedFrames() {
+    for (const timings of this._transitionRecords.values()) {
+      for (const timing of timings.values()) {
+        if (timing.animation._trackAdvances()) return true;
+      }
+    }
+    return false;
+  }
+
   _hasActiveAnimationWork() {
     if (this._shutdown) return false;
     const pseudoContentIsActive = [...this._pseudoContentAnimations.values()]
@@ -1859,7 +2585,7 @@ class DOMRenderSurface {
         )
       );
     return this._smoothScrolls.size > 0 ||
-      this._activeTransitionCount > 0 ||
+      this._transitionsNeedFrames() ||
       pseudoContentIsActive ||
       this._animations.some((animation) => animation._needsFrame());
   }
@@ -1932,7 +2658,6 @@ class DOMRenderSurface {
       trackGeneration,
     } = {},
   ) {
-    const nodeIndex = this._indexOfElement.get(element);
     const declarationOptions = {
       beforeTrackIndices: beforeEngineHandles.flatMap((handle) =>
         handle.trackIndices
@@ -1958,10 +2683,22 @@ class DOMRenderSurface {
         );
       }
     };
+    return this._declareEngineEffect(element, declareEngineAnimation);
+  }
+  // A CSSTransition's track declared again over its endpoints.
+  _declareTransitionTrack(element, propertyName, keyframes, timing, declarationOptions) {
+    return this._declareEngineEffect(element, (renderer, nodeIndex) =>
+      renderer.declareTransitionTrack(nodeIndex, propertyName, keyframes, timing, declarationOptions)
+    );
+  }
+  // Declares through the renderer, or, before the renderer has the
+  // element's row, defers the declaration to the frame that writes it.
+  _declareEngineEffect(element, declare) {
+    const nodeIndex = this._indexOfElement.get(element);
     if (this._persistentRenderer && nodeIndex !== undefined) {
-      return declareEngineAnimation(this._persistentRenderer, nodeIndex);
+      return declare(this._persistentRenderer, nodeIndex);
     }
-    const deferred = deferAnimationBinding(declareEngineAnimation);
+    const deferred = deferAnimationBinding(declare);
     this._pendingAnimationDeclarations.push({
       element,
       bind: deferred.bind,
@@ -1980,7 +2717,7 @@ class DOMRenderSurface {
   }
 
   _animationsForElement(element, subtree) {
-    return animationsForElement(this._animations, element, subtree);
+    return animationsForElement(this._animationCandidates(), element, subtree);
   }
 
   _removeAnimation(animation) {
@@ -1997,11 +2734,11 @@ class DOMRenderSurface {
   // scene build: an entry per element and pseudo-element whose content
   // animation has a record.
   // A synchronous layout getter's serialization, offered by
-  // computeLayoutBoxes (src/dom/layout-getters.js): the next frame under
+  // computeLayoutBoxes (src/dom/live-geometry.js): the next frame under
   // the same style generation, resource revision and viewport takes it
   // instead of serializing again. One is held at a time; a newer offer
   // or a mismatch releases it.
-  _offerSyncLayout(layout, styleGeneration, resourceRevision) {
+  _offerSyncLayout(layout, styleGeneration, resourceRevision, scrollRevision) {
     if (this._shutdown || this._pseudoContentAnimations.size > 0) return false;
     const held = this._syncLayout;
     if (held !== null) {
@@ -2013,18 +2750,53 @@ class DOMRenderSurface {
       // write, but the frame still skips serializing and laying out again.
       if (
         held.styleGeneration === styleGeneration &&
-        held.resourceRevision === resourceRevision
+        held.resourceRevision === resourceRevision &&
+        held.scrollRevision === scrollRevision
       ) return false;
       this._releaseSyncLayout();
     }
-    this._syncLayout = { layout, styleGeneration, resourceRevision };
+    this._syncLayout = {
+      layout,
+      styleGeneration,
+      resourceRevision,
+      scrollRevision,
+      frameSequence: this._frameSequence,
+      timeMilliseconds: this._now(),
+    };
     return true;
+  }
+  // The held layout for another synchronous getter, left held: it answers
+  // while the style generation, resource revision, scroll positions and
+  // viewport are unchanged, no frame has rendered since (a frame samples
+  // the engine's animation tracks, which the layout inherits), and nothing
+  // animates.
+  _peekSyncLayout(styleGeneration, viewport, resourceRevision, scrollRevision) {
+    const held = this._syncLayout;
+    if (
+      held === null ||
+      this._animations.length + this._cssAnimations.size + this._pseudoContentAnimations.size +
+          this._activeTransitionCount + this._pendingAnimationDeclarations.length > 0 ||
+      this._pendingScrollSources.size > 0 ||
+      held.styleGeneration !== styleGeneration ||
+      held.resourceRevision !== resourceRevision ||
+      held.scrollRevision !== scrollRevision ||
+      held.frameSequence !== this._frameSequence
+    ) return null;
+    const heldViewport = held.layout.viewport;
+    if (
+      heldViewport.width !== viewport.width ||
+      heldViewport.height !== viewport.height ||
+      (heldViewport.deviceScale ?? 1) !== (viewport.deviceScale ?? 1) ||
+      heldViewport._requestedLeft !== viewport._requestedLeft ||
+      heldViewport._requestedTop !== viewport._requestedTop
+    ) return null;
+    return held.layout;
   }
   _takeSyncLayout(styleGeneration, viewport, resourceRevision) {
     const held = this._syncLayout;
     if (held === null) return null;
     this._syncLayout = null;
-    const { layout } = held;
+    const { layout, timeMilliseconds } = held;
     if (
       held.styleGeneration === styleGeneration &&
       held.resourceRevision === resourceRevision &&
@@ -2032,6 +2804,9 @@ class DOMRenderSurface {
       layout.viewport.height === viewport.height &&
       (layout.viewport.deviceScale ?? 1) === (viewport.deviceScale ?? 1)
     ) {
+      // The frame takes the layout alone; getters' geometry stays behind.
+      this._releaseRetainedGeometry(layout);
+      layout.transitionStartTimeMilliseconds = timeMilliseconds;
       return layout;
     }
     this._releaseSyncLayoutState(layout);
@@ -2044,9 +2819,14 @@ class DOMRenderSurface {
     this._releaseSyncLayoutState(held.layout);
   }
   _releaseSyncLayoutState(layout) {
+    this._releaseRetainedGeometry(layout);
     layout.serialized.release();
     this._root._domCore.releaseSceneResources(layout.serialized.nodes);
     releaseBoxSnapshot(layout.boxes);
+  }
+  _releaseRetainedGeometry(layout) {
+    layout.retainedGeometry?.release();
+    layout.retainedGeometry = undefined;
   }
   _animatedGeneratedContent(timeMilliseconds) {
     if (this._pseudoContentAnimations.size === 0) return null;
@@ -2090,6 +2870,7 @@ class DOMRenderSurface {
       return null;
     }
     if (!this._dirty && !forceDelivery) return null;
+    this._requireEndedTransitionsUnregistered();
     this._rendering = true;
     this._dirty = false;
     this._currentTime = timeMilliseconds;
@@ -2104,6 +2885,10 @@ class DOMRenderSurface {
     this._stageCounters.currentStage = "prepare";
     let resizeObserverLoopError = false;
     const renderStartedAt = renderSurfaceNow();
+    // Image decoding may happen in the preparation layout pass, before the
+    // persistent renderer receives its options. Share one collector across
+    // both paths so the delivered frame owns every first-use SVG stage.
+    const svgImageTimings = [];
     let rasterStartedAt = null;
     let rendererReadyAt = null;
     let rendererResizedAt = null;
@@ -2114,6 +2899,16 @@ class DOMRenderSurface {
     const core = this._frameCore;
     const frameOwner = this._frameOwner;
     const frameBindings = this._frameBindings;
+    // The frame's restyle work: the core's record counters before the frame
+    // and after it, taken by the outermost call only (an observer restart
+    // renders within this call).
+    const restyleCountsBefore = ownsContinuation
+      ? [
+        core.status("computed_restyle_counts", 0),
+        core.status("computed_restyle_counts", 1),
+        core.status("computed_restyle_counts", 2),
+      ]
+      : null;
     continuation ??= core.status(
       "frame_begin",
       frameOwner,
@@ -2128,6 +2923,9 @@ class DOMRenderSurface {
     let frameForcedGenerationNodes = null;
     let capturedScrollRequests = null;
     let releaseUnpublishedSuccessor = null;
+    let transitionStartTimeMilliseconds = timeMilliseconds;
+    // Set once this frame restyled the retained publication in place.
+    let publicationRestyled = false;
     const previousPublication = {
       presentedFrame: this._presentedFrame,
       preparedState: this._preparedState,
@@ -2136,7 +2934,6 @@ class DOMRenderSurface {
       indexOfElement: this._indexOfElement,
       elementAtIndex: this._elementAtIndex,
       scrollbars: this._scrollbars,
-      documentSelectionRects: this._documentSelectionRects,
     };
     const rollback = () => {
       core.status("frame_abort", continuation);
@@ -2154,8 +2951,14 @@ class DOMRenderSurface {
       this._indexOfElement = previousPublication.indexOfElement;
       this._elementAtIndex = previousPublication.elementAtIndex;
       this._scrollbars = previousPublication.scrollbars;
-      this._documentSelectionRects = previousPublication.documentSelectionRects;
       this._serializedStyleGeneration = -1;
+      this._hasNonStateMutation = true;
+      // The retained publication holds this frame's restyled rows, which
+      // the renderer may not have received: a new cascade generation makes
+      // the next publication lower and change every row.
+      if (publicationRestyled) {
+        core.styleInvalidate(this._root.ownerDocument._coreHandle);
+      }
       this._dirty = true;
     };
     try {
@@ -2191,7 +2994,11 @@ class DOMRenderSurface {
         styleSystem.setEnvironment({
           viewportWidth: this.viewport.width,
           viewportHeight: this.viewport.height,
+          scrollbarStyle: this.scrollbarStyle,
         });
+        // Answered before any element of this frame resolves, and before
+        // the style generation below is sampled (answers can advance it).
+        styleSystem.answerDeclaredFontFamilies(this._root);
       }
       // The animation-definition reconciliation resolves definitions for
       // the elements whose cascade names an animation. Its inputs are
@@ -2202,7 +3009,10 @@ class DOMRenderSurface {
       // mutate the DOM re-scans next frame. The core lists the candidates
       // (animation_candidates: a native walk over its resolved records);
       // an element that stopped being one has its animations cancelled
-      // here, exactly as an empty definition list would.
+      // here, exactly as an empty definition list would. Without a
+      // @keyframes rule in the root's scope no element has a definition,
+      // so the walk, which resolves every element, is skipped and every
+      // element counts as a non-candidate.
       if (
         styleSystem && !scrollOnly &&
         this._animationSyncStyleGeneration !== styleSystem.generation
@@ -2210,8 +3020,11 @@ class DOMRenderSurface {
         this._animationSyncStyleGeneration = styleSystem.generation;
         core.mediaEnvironmentSet(styleSystem.environment);
         core.lengthViewport(this.viewport.width, this.viewport.height);
+        const declaresKeyframes = styleSystem.declaresKeyframes(this._root);
         const activeElements = new Set(
-          core.animationCandidates(this._root._coreHandle, 0),
+          declaresKeyframes
+            ? core.animationCandidates(this._root._coreHandle, 0)
+            : [],
         );
         // Resolving natively can raise font-family requests; answering them
         // bumps the style generation, which must land before serialization
@@ -2300,7 +3113,6 @@ class DOMRenderSurface {
                 diagnosticAnimationName: desired.definition.name,
               },
             );
-            animation._cssAnimationName = desired.definition.name;
             animation._cascadingStyleSheetsAnimationIdentity = desired.identity;
             if (desired.definition.paused) animation.pause();
             nextRecords.push({
@@ -2349,6 +3161,7 @@ class DOMRenderSurface {
 
         const nextPseudoContentAnimations = new Map();
         for (const pseudoElement of ["::before", "::after"]) {
+          if (!declaresKeyframes) break;
           for (
             const element of core.animationCandidates(
               this._root._coreHandle,
@@ -2415,10 +3228,10 @@ class DOMRenderSurface {
         this._frameFlags(rasterize, deliverObservers, pixelReadback) | 32768,
       );
       this._frameResume(continuation, preparationToken, 0, -1, frameBindings);
-      scrollOnly = core.status("frame_mode", continuation) === 1;
-      transformOnly = core.status("frame_mode", continuation) === 2;
-      const cleanSceneReuse = core.status("frame_mode", continuation) === 3;
-      const retainedScene = core.status("frame_mode", continuation) !== 0;
+      const frameMode = core.status("frame_mode", continuation);
+      scrollOnly = frameMode === 1;
+      transformOnly = frameMode === 2;
+      const cleanSceneReuse = frameMode === 3;
       const sceneToken = this._frameClaim(continuation, 2, frameBindings);
       capturedScrollRequests = this._captureScrollRequests();
       const capturedViewportScroll = capturedScrollRequests.get(this.viewport);
@@ -2440,8 +3253,21 @@ class DOMRenderSurface {
             this._mutatedNodes.size === 0
           )
         );
-      let captureTextGeometry = this._textSelectionEnabled &&
-        !reuseTextGeometry;
+      // A frame that reuses the presented text geometry still captures it:
+      // a replayed emission keeps the renderer's artifact at no cost, and
+      // commands emitted under another capture mode are not replayable, so
+      // switching the mode walks the paint tree and writes every row in
+      // the frame after. Such a frame reads no coordinates from the
+      // artifact, so the engine also replays commands whose sticky scopes
+      // moved (textGeometryArtifactRead).
+      let captureTextGeometry = this._textSelectionEnabled;
+      // Frame mode 4: the retained scene with its restyled rows, or null
+      // when the frame builds the scene after all.
+      publicationRestyled = frameMode === 4 &&
+        this._restyleRetainedPublication(core, frameViewport, styleSystem);
+      const restyledScene = publicationRestyled
+        ? this._restyledSerialization(core)
+        : null;
       let serialized;
       let declaredChangedNodeIndices = null;
       // A frame that takes a getter's serialization also takes the rows the
@@ -2501,6 +3327,12 @@ class DOMRenderSurface {
         serialized = { ...this._preparedState.serialized };
         declaredChangedNodeIndices = new Set();
         this._stageCounters.retainedCleanFrames++;
+      } else if (restyledScene !== null) {
+        // The renderer receives the restyled rows as the declared change
+        // set.
+        serialized = restyledScene;
+        declaredChangedNodeIndices = new Set(serialized.changedRows);
+        this._stageCounters.rowsLowered += serialized.loweredRows.length;
       } else {
         this._stageCounters.serializations++;
         this._stageCounters.currentStage = "serialize";
@@ -2523,6 +3355,10 @@ class DOMRenderSurface {
             core.status("resource_revision"),
           )
           : null;
+        if (syncLayout !== null) {
+          transitionStartTimeMilliseconds =
+            syncLayout.transitionStartTimeMilliseconds;
+        }
         if (syncLayout !== null) {
           serialized = syncLayout.serialized;
           syncLayoutSource = serialized.nodes;
@@ -2555,9 +3391,15 @@ class DOMRenderSurface {
             generatedContent,
             viewport: frameViewport,
           });
+          this._stageCounters.sceneRowsBuilt += serialized.nodes.length;
+          this._stageCounters.rowsLowered += serialized.loweredRows.length;
         }
       }
-      if (scrollOnly || transformOnly) {
+      // Every mode but a full serialization keeps the retained scene; a
+      // restyle the core refused serialized in full.
+      const retainedScene = frameMode !== 0 &&
+        (frameMode !== 4 || restyledScene !== null);
+      if (scrollOnly || transformOnly || restyledScene !== null) {
         core.shareSceneResources(
           this._preparedState.serialized.nodes,
           serialized.nodes,
@@ -2586,7 +3428,7 @@ class DOMRenderSurface {
       }
       // Visible-region rasterization (raster-scale plan, slice 3): the
       // raster target covers the visible rectangle at the raster scale.
-      // Damage and overlay rectangles are produced in full-scene device
+      // Damage rectangles are produced in full-scene device
       // coordinates; toTargetRectangle shifts them into target space.
       const visibleRegion = this._visibleRectangle;
       const originDeviceX = (visibleRegion?.x ?? 0) *
@@ -2645,12 +3487,10 @@ class DOMRenderSurface {
       this._forcedGenerationNodes = new Set();
       this._transformOnlyMutations = new Set();
       this._hasNonTransformMutation = false;
+      this._hasNonStateMutation = false;
       this._forceFullInvalidation = false;
       this._selectionChanged = false;
-      this._eventElementAtIndex = new Array(serialized.nodes.length).fill(null);
-      for (const [element, index] of serialized.indexOf) {
-        this._eventElementAtIndex[index] = element;
-      }
+      this._eventElementAtIndex = nodesAtRow(serialized);
       for (;;) {
         const action = core.status("frame_stage", continuation);
         if (action === 8) break;
@@ -2668,7 +3508,7 @@ class DOMRenderSurface {
                 height: frameViewport.height,
                 nodes: serialized.nodes,
                 imageSources: serialized.imageSources,
-              });
+              }, svgImageTimings);
             }
             break;
           case 5:
@@ -2752,7 +3592,19 @@ class DOMRenderSurface {
       // delivery re-presents the retained result (texture or pixels) under
       // the presented frame's sequence. Decided AFTER the observer stages:
       // an observer mutation restarts preparation above and re-decides.
+      // A caret whose blink phase is due to flip is an overlay input that
+      // HAS changed, so the retained result is not this frame: the caret
+      // has to appear or disappear. Without this the fast path re-presents
+      // the previous texture forever and the caret never blinks.
+      const caretBlinkFlipDue = this._caretBlinkActive() &&
+        caretVisibleInPhase(
+            this._caretBlinkAnchorMilliseconds,
+            timeMilliseconds,
+          ) !== this._caretBlinkVisible;
       if (
+        !caretBlinkFlipDue &&
+        // A scrollbar whose visibility changes is an overlay input too.
+        !this._scrollbarVisibility.due(this._scrollbars, timeMilliseconds) &&
         this._retainedDeliveryPossible(
           cleanSceneReuse,
           pixelReadback,
@@ -2780,7 +3632,7 @@ class DOMRenderSurface {
         if (this._presentFrame !== null) {
           this._presentingFrame = true;
           try {
-            await this._presentFrame(this._lastRendered);
+            await this._presentFrame(frame);
           } finally {
             this._presentingFrame = false;
           }
@@ -2836,7 +3688,7 @@ class DOMRenderSurface {
           height: frameViewport.height,
           nodes: serialized.nodes,
           imageSources: serialized.imageSources,
-        });
+        }, svgImageTimings);
       }
       // ONE geometry source for scrollbar descriptors: the presented
       // snapshot (the engine's boxes, the same family the delivered pixels
@@ -2856,10 +3708,6 @@ class DOMRenderSurface {
           target === this.viewport ? 0n : target?._coreHandle ?? 0n,
           slot,
         );
-      const pendingContentShift = (node) =>
-        snapshot
-          ? { shiftX: predictScroll(node, 4), shiftY: predictScroll(node, 5) }
-          : { shiftX: 0, shiftY: 0 };
       // The same slots for every node of a list in one crossing: a page of
       // text has a text owner per line, and four crossings each, every one
       // walking the ancestor chain, were a measured share of the frame.
@@ -2898,175 +3746,143 @@ class DOMRenderSurface {
           snapshot.geometryCore,
           snapshot.geometryHandle,
           capturedScrollRequests.size > 0 ? capturedScrollRequests.handle : 0n,
+          this.scrollbarStyle,
         )
-        : computeScrollbars(serialized, boxes, this.viewport);
-      const overlayRects = [];
-      for (const scrollbar of scrollbars) {
-        for (
-          const [rectangle, color] of [
-            [scrollbar.track, scrollbar.colors.track],
-            [scrollbar.thumb, scrollbar.colors.thumb],
-          ]
-        ) {
-          // Overlay rects bypass the engine's clip stack, so the
-          // descriptor's ancestor clip applies here: a bar on a scroller
-          // that protrudes past a clipping ancestor paints only its
-          // visible part, exactly as the scroller box itself does.
-          let { x, y, width: rectWidth, height: rectHeight } = rectangle;
-          if (scrollbar.clip) {
-            const right = Math.min(
-              x + rectWidth,
-              scrollbar.clip.x + scrollbar.clip.width,
-            );
-            const bottom = Math.min(
-              y + rectHeight,
-              scrollbar.clip.y + scrollbar.clip.height,
-            );
-            x = Math.max(x, scrollbar.clip.x);
-            y = Math.max(y, scrollbar.clip.y);
-            rectWidth = right - x;
-            rectHeight = bottom - y;
-            if (rectWidth <= 0 || rectHeight <= 0) continue;
-          }
-          // Same floor/ceil snap the CPU byte paint applied, in physical
-          // pixels (the overlay contract matches the command stream).
-          const left = Math.floor(x * frameViewport.deviceScale);
-          const top = Math.floor(y * frameViewport.deviceScale);
-          overlayRects.push(toTargetRectangle({
-            x: left,
-            y: top,
-            width: Math.ceil(
-              (x + rectWidth) * frameViewport.deviceScale,
-            ) - left,
-            height: Math.ceil(
-              (y + rectHeight) * frameViewport.deviceScale,
-            ) - top,
-            color,
-          }));
+        : computeScrollbars(serialized, boxes, this.viewport, this.scrollbarStyle);
+      // Each descriptor carries the visibility it paints with; a hidden
+      // overlay bar emits nothing, a fading one scales its colors' alpha.
+      const scrollbarVisibility = this._scrollbarVisibility.advance(
+        scrollbars,
+        this._scrollbars,
+        timeMilliseconds,
+      );
+      for (const [index, scrollbar] of scrollbars.entries()) {
+        scrollbar.visibility = scrollbarVisibility[index];
+      }
+      // Sandom's scrollbar design (src/dom/scrollbar-paint.js): each bar's
+      // track, edge line, rounded thumb and classic corner in viewport CSS
+      // px, under its scroller's scene index (-1 for the viewport). The
+      // engine paints them at its scroller's scrollbar marker, inside the
+      // clips over the scroller, and repaints what changed.
+      const paintedScrollbars = paintScrollbars(scrollbars, this.scrollbarStyle);
+      const scrollbarParts = [];
+      for (const { bar, parts } of paintedScrollbars) {
+        const ownerIndex = bar.element === this.viewport
+          ? -1
+          : serialized.indexOf.get(bar.element);
+        if (ownerIndex === undefined) continue;
+        for (const part of parts) {
+          scrollbarParts.push({
+            ownerIndex,
+            x: part.x,
+            y: part.y,
+            width: part.width,
+            height: part.height,
+            radius: part.radius,
+            color: part.color,
+          });
         }
       }
+      // Selected text paints in the text's own paint order (the renderer's
+      // text highlights), never as an overlay over the finished frame.
+      const textHighlights = [];
+      // The focused text control's caret paints in the engine, in its value
+      // text's paint order and clip (scene-renderer's textCaret). The value
+      // is the one generated text box the control's scene node holds: its
+      // value, or its placeholder or a line break while the value is empty.
+      let textCaret = null;
       const focusedElement = this._root.ownerDocument?._focusedElement ?? null;
-      const textGeometry = this._presentedFrame?.textGeometryByElement.get(
-        focusedElement,
-      );
-      if (textGeometry) {
-        const { shiftX, shiftY } = pendingContentShift(focusedElement);
+      const controlIndex = focusedElement?.localName === "input" ||
+          focusedElement?.localName === "textarea"
+        ? serialized.indexOf.get(focusedElement)
+        : undefined;
+      const caretTextIndex = controlIndex === undefined
+        ? undefined
+        : serialized.nodes[controlIndex]?.children?.find((child) =>
+          serialized.nodes[child]?.generatedOwnerIndex === controlIndex
+        );
+      if (caretTextIndex !== undefined) {
         const selectionStart = focusedElement.selectionStart ??
           focusedElement.value.length;
         const selectionEnd = focusedElement.selectionEnd ?? selectionStart;
         if (selectionStart === selectionEnd) {
-          const caret = caretRectangle(
-            this._presentedFrame,
-            focusedElement,
-            selectionStart,
-            {
-              deltaX: -shiftX,
-              deltaY: -shiftY,
-              deviceScale: frameViewport.deviceScale,
-            },
+          // The blink anchor belongs to one caret position: a different
+          // element or a different offset is a caret that just moved, so
+          // the cycle restarts shown. Identity is the element itself, never
+          // its serialization index — a retained frame carries no index
+          // map, so an index key flapped every frame and reset the anchor,
+          // which pinned the caret to its visible phase forever.
+          if (
+            focusedElement !== this._caretBlinkElement ||
+            selectionStart !== this._caretBlinkOffset
+          ) {
+            this._caretBlinkElement = focusedElement;
+            this._caretBlinkOffset = selectionStart;
+            this._caretBlinkAnchorMilliseconds = timeMilliseconds;
+          }
+          this._caretBlinkVisible = caretVisibleInPhase(
+            this._caretBlinkAnchorMilliseconds,
+            timeMilliseconds,
           );
-          if (caret) {
-            overlayRects.push(toTargetRectangle({
-              ...caret,
-              color: caretPaintColor(focusedElement),
-            }));
+          // An explicit pixel capture shows the caret whatever the phase
+          // says. A capture is an observation of the document, and one that
+          // answered "no caret" every other time it was asked would make
+          // every caret assertion and every screenshot a coin toss; the
+          // phase itself is untouched, so the loop keeps its cadence.
+          if (this._caretBlinkVisible || pixelReadback) {
+            const elementCore = focusedElement._domCore;
+            textCaret = {
+              ownerIndex: caretTextIndex,
+              offset: selectionStart,
+              upstream: elementCore.status(
+                "input_caret_upstream",
+                focusedElement._coreHandle,
+                selectionStart,
+              ) === 1,
+              color: elementCore.styleUsedCaretColor(focusedElement._coreHandle),
+            };
           }
         } else {
-          for (
-            const rectangle of selectionRectangles(
-              this._presentedFrame,
-              [{
-                node: focusedElement,
-                start: selectionStart,
-                end: selectionEnd,
-                deltaX: -shiftX,
-                deltaY: -shiftY,
-              }],
-              { physical: true, deviceScale: frameViewport.deviceScale },
-            )
-          ) {
-            overlayRects.push(toTargetRectangle({
-              ...rectangle,
-              color: { r: 0.15, g: 0.45, b: 0.9, a: 0.35 },
-            }));
-          }
-        }
-      }
-      const documentSelectionRects = [];
-      const selectionDocument = this._root.ownerDocument;
-      const documentSelection = selectionDocument?.getSelection();
-      if (
-        documentSelection?.rangeCount === 1 && !documentSelection.isCollapsed &&
-        this._presentedFrame
-      ) {
-        const selectedByNode = new Map();
-        for (const span of documentSelection._selectedSpans()) {
-          selectedByNode.set(span[0], span);
-        }
-        const spans = [];
-        // Preserve imported engine text order while transporting native range
-        // membership and native pending-scroll deltas, never walking the DOM.
-        for (const [node] of this._presentedFrame.textGeometryByNode) {
-          const span = selectedByNode.get(node);
-          if (!span) continue;
-          const { shiftX, shiftY } = pendingContentShift(node);
-          spans.push({
-            node,
-            start: span[1],
-            end: span[2],
-            deltaX: -shiftX,
-            deltaY: -shiftY,
+          // A range, not a caret: nothing blinks, and the next collapsed
+          // selection starts a fresh cycle.
+          this._caretBlinkElement = null;
+          this._caretBlinkOffset = -1;
+          this._caretBlinkAnchorMilliseconds = null;
+          this._caretBlinkVisible = true;
+          textHighlights.push({
+            ownerIndex: controlIndex,
+            start: Math.min(selectionStart, selectionEnd),
+            end: Math.max(selectionStart, selectionEnd),
+            ...selectionPaint(focusedElement),
           });
         }
-        for (
-          const rectangle of selectionRectangles(
-            this._presentedFrame,
-            spans,
-            { physical: true, deviceScale: frameViewport.deviceScale },
-          )
-        ) {
-          documentSelectionRects.push(toTargetRectangle({
-            ...rectangle,
-            color: { r: 0.15, g: 0.45, b: 0.9, a: 0.35 },
-          }));
-        }
-        overlayRects.push(...documentSelectionRects);
+      } else {
+        this._caretBlinkElement = null;
+        this._caretBlinkOffset = -1;
+        this._caretBlinkAnchorMilliseconds = null;
+        this._caretBlinkVisible = true;
       }
-      // Overlay scrollbars bypass the engine's dirty map. Repaint only a
-      // changed track or the old and new thumb bounds; an unchanged scrollbar
-      // must not turn every localized frame into a full-axis repaint.
+      const selectionDocument = this._root.ownerDocument;
+      const documentSelection = selectionDocument?.getSelection();
+      if (documentSelection?.rangeCount === 1 && !documentSelection.isCollapsed) {
+        for (const [node, start, end] of documentSelection._selectedSpans()) {
+          if (
+            node.nodeType !== 3 || !(end > start) ||
+            !isShadowIncludingInclusiveDescendant(node, this._root)
+          ) continue;
+          const ownerIndex = serialized.indexOf.get(node);
+          if (ownerIndex === undefined) continue;
+          textHighlights.push({
+            ownerIndex,
+            start,
+            end,
+            ...selectionPaint(flatTreeParent(node)),
+          });
+        }
+      }
+      // The caret, the selection bands and the scrollbars are the
+      // renderer's damage.
       if (dirtyTiles !== null) {
-        for (
-          const rectangle of [
-            ...this._documentSelectionRects,
-            ...documentSelectionRects,
-          ]
-        ) {
-          requestedDirtyRectangles.push(rectangle);
-        }
-        if (textGeometry) {
-          const textControlBox = geometryBox(
-            this._presentedFrame.geometryCore,
-            this._presentedFrame.geometryHandle,
-            focusedElement._coreHandle,
-          );
-          if (textControlBox) {
-            requestedDirtyRectangles.push(toTargetRectangle({
-              x: Math.floor(
-                textControlBox.x * frameViewport.deviceScale,
-              ),
-              y: Math.floor(
-                textControlBox.y * frameViewport.deviceScale,
-              ),
-              width: Math.ceil(
-                textControlBox.w * frameViewport.deviceScale,
-              ),
-              height: Math.ceil(
-                textControlBox.h * frameViewport.deviceScale,
-              ),
-            }));
-          }
-        }
         for (const rectangle of requestedDirtyRectangles) {
           core.status(
             "frame_damage_rect",
@@ -3076,30 +3892,6 @@ class DOMRenderSurface {
             rectangle.y,
             rectangle.width,
             rectangle.height,
-          );
-        }
-        const previousByOrientation = new Map(
-          this._scrollbars.map((scrollbar) => [
-            scrollbar.orientation,
-            scrollbar,
-          ]),
-        );
-        const nextByOrientation = new Map(
-          scrollbars.map((scrollbar) => [scrollbar.orientation, scrollbar]),
-        );
-        for (
-          const orientation of new Set([
-            ...previousByOrientation.keys(),
-            ...nextByOrientation.keys(),
-          ])
-        ) {
-          core.frameOverlayDamage(
-            continuation,
-            previousByOrientation.get(orientation),
-            nextByOrientation.get(orientation),
-            frameViewport.deviceScale,
-            originDeviceX,
-            originDeviceY,
           );
         }
         requestedDirtyRectangles = core.frameDamageRectangles(continuation);
@@ -3114,6 +3906,7 @@ class DOMRenderSurface {
         width: frameViewport.width,
         height: frameViewport.height,
         nodes: serialized.nodes,
+        generatedBoxRows: serialized.generatedBoxRows,
         imageSources: serialized.imageSources,
         styleGeneration: serialized.styleGeneration,
         changedRows: serialized.changedRows,
@@ -3184,7 +3977,9 @@ class DOMRenderSurface {
         ...(scrollOnly && declaredChangedNodeIndices !== null
           ? { scrollOnlyNodeIndices: declaredChangedNodeIndices }
           : {}),
-        ...(overlayRects.length > 0 ? { overlayRects } : {}),
+        ...(scrollbarParts.length > 0 ? { scrollbarParts } : {}),
+        ...(textHighlights.length > 0 ? { textHighlights } : {}),
+        ...(textCaret !== null ? { textCaret } : {}),
         ...(declaredChangedNodeIndices !== null
           ? { declaredChangedNodeIndices }
           : {}),
@@ -3193,6 +3988,14 @@ class DOMRenderSurface {
           ? { forceGenerationNodeIndices }
           : {}),
         timeMilliseconds,
+        transitionStartTimeMilliseconds,
+        onTransitionStarted: (transition) =>
+          this._registerStartedTransition(transition),
+        computedSamples: {
+          core: this._root._domCore,
+          owner: this._computedSamples,
+          elements: this._eventElementAtIndex,
+        },
         ...(this._glyphResourceManager === null
           ? {}
           : { glyphResourceManager: this._glyphResourceManager }),
@@ -3212,19 +4015,26 @@ class DOMRenderSurface {
         ...(this._resolveResource
           ? { resolveResource: this._resolveResource }
           : {}),
+        onImageLoadError: this._onImageLoadError,
+        svgImageTimings,
         ...(this._capturePaintArtifact
           ? { capturePaintArtifact: true }
           : captureTextGeometry
-          ? { captureTextGeometry: true }
+          ? {
+            captureTextGeometry: true,
+            textGeometryArtifactRead: !reuseTextGeometry,
+          }
           : {}),
       };
+      if (this._background !== undefined) {
+        renderOptions.background = this._background;
+      }
+      if (this._textThickening !== undefined) {
+        renderOptions.textThickening = this._textThickening;
+      }
       if (!rasterize) {
         this._indexOfElement = serialized.indexOf;
-        const elementAtIndex = new Array(serialized.nodes.length).fill(null);
-        for (const [element, index] of serialized.indexOf) {
-          elementAtIndex[index] = element;
-        }
-        this._elementAtIndex = elementAtIndex;
+        this._elementAtIndex = nodesAtRow(serialized);
         this._lastBoxes = boxes;
         const supersededSerialized = this._preparedState?.serialized ?? null;
         this._preparedState = Object.freeze({
@@ -3234,7 +4044,7 @@ class DOMRenderSurface {
             nodes: Object.freeze(scene.nodes),
           }),
           serialized,
-          boxes: Object.freeze(boxes),
+          boxes: freezeBoxes(boxes),
         });
         if (
           supersededSerialized !== null &&
@@ -3251,7 +4061,7 @@ class DOMRenderSurface {
         return this._preparedState;
       }
       const renderToken = this._frameClaim(continuation, 9, frameBindings);
-      if (this._usesDefaultRenderer && !this._persistentRendererPromise) {
+      if (!this._persistentRendererPromise) {
         this._persistentRendererPromise = this._createPersistentRenderer({
           width: frameViewport.width,
           height: frameViewport.height,
@@ -3260,152 +4070,55 @@ class DOMRenderSurface {
         }).then((renderer) => {
           this._persistentRenderer = renderer;
           this._animationEventUnsubscribe = renderer.onAnimationEvent(
-            (record) => {
-              const element =
-                (this._eventElementAtIndex ?? this._elementAtIndex)[
-                  record.nodeIndex
-                ];
-              if (!element) {
-                throw new RangeError(
-                  `No DOM element for animated layout index ${record.nodeIndex}`,
-                );
-              }
-              const matchingAnimation =
-                this._animationCancelingThroughEngine?._animationId ===
-                    record.animationId
-                  ? this._animationCancelingThroughEngine
-                  : this._animations.find((animation) =>
-                    animation._animationId === record.animationId
-                  );
-              const transitionTiming = this._transitionTimings.get(element)
-                ?.get(
-                  record.propertyName,
-                );
-              const elapsedTime = matchingAnimation
-                ? matchingAnimation._elapsedTimeForEvent(record.type)
-                : record.type === "transitionend"
-                ? (transitionTiming?.duration ?? 0) / 1000
-                : Math.max(0, -(transitionTiming?.delay ?? 0)) / 1000;
-              const feedback = matchingAnimation?._beginEngineLifecycle(record);
-              if (matchingAnimation && !feedback) return;
-              try {
-                dispatchEvent(
-                  element,
-                  createEvent(record.type, {
-                    bubbles: true,
-                    propertyName: record.propertyName,
-                    animationName: matchingAnimation?._cssAnimationName ?? "",
-                    elapsedTime,
-                    pseudoElement: "",
-                  }),
-                );
-              } finally {
-                if (feedback) {
-                  matchingAnimation._completeEngineLifecycle(feedback);
-                }
-              }
-              if (
-                record.type === "transitionend" ||
-                record.type === "transitioncancel"
-              ) {
-                const timings = this._transitionTimings.get(element);
-                if (timings?.delete(record.propertyName)) {
-                  const records = this._transitionRecords.get(element);
-                  records?.delete(record.propertyName);
-                  if (records?.size === 0) {
-                    this._transitionRecords.delete(element);
-                  }
-                  if (this._activeTransitionCount > 0) {
-                    this._activeTransitionCount--;
-                  }
-                }
-              }
-            },
+            (record) => this._dispatchEngineAnimationEvent(record),
           );
           return renderer;
         });
       }
-      let rendered;
       this._stageCounters.currentStage = "raster";
       rasterStartedAt = renderSurfaceNow();
-      if (this._persistentRendererPromise) {
-        const renderer = await this._persistentRendererPromise;
-        rendererReadyAt = renderSurfaceNow();
-        await renderer.resize(
-          frameViewport.width,
-          frameViewport.height,
-          frameViewport.deviceScale,
-        );
-        rendererResizedAt = renderSurfaceNow();
-        if (renderer.setVisibleRectangle) {
-          await renderer.setVisibleRectangle(this._visibleRectangle);
-        }
-        visibleRectangleSetAt = renderSurfaceNow();
-        // Texture delivery (zero-copy presentation): the renderer returns
-        // the live GPU texture image plus device, exactly what
-        // createCanvasPresenter.present consumes. Only the webgpu backend
-        // can produce it - the webgl2 backend has no GPU texture image to
-        // hand over, so presentation there explicitly falls back to pixel
-        // frames (the delivery carries pixels and no textureImage). A
-        // pixel capture (renderNow({ pixelReadback: true })) reads back
-        // this one frame without presenting it; the finally block
-        // schedules a presentation frame so the presenter catches up.
-        const textureDelivery = this._presentFrame !== null &&
-          !pixelReadback &&
-          renderer.graphicsBackend !== "webgl2";
-        rendered = textureDelivery
-          ? await renderer.renderTexture(scene, renderOptions)
-          : await renderer.render(scene, renderOptions);
-        rasterFinishedAt = renderSurfaceNow();
-        if (this._presentFrame !== null && !pixelReadback) {
-          this._stageCounters.currentStage = "present";
-          pendingPresentation = () => this._presentFrame(rendered);
-        }
-      } else {
-        rendered = await this._renderPixels(
-          scene,
-          frameViewport.deviceScale,
-          {
-            ...renderOptions,
-            ...(this._visibleRectangle
-              ? { visibleRectangle: this._visibleRectangle }
-              : {}),
-          },
-        );
+      const renderer = await this._persistentRendererPromise;
+      rendererReadyAt = renderSurfaceNow();
+      await renderer.resize(
+        frameViewport.width,
+        frameViewport.height,
+        frameViewport.deviceScale,
+      );
+      rendererResizedAt = renderSurfaceNow();
+      if (renderer.setVisibleRectangle) {
+        await renderer.setVisibleRectangle(this._visibleRectangle);
       }
-      rasterFinishedAt ??= renderSurfaceNow();
+      visibleRectangleSetAt = renderSurfaceNow();
+      // Texture delivery is the default: the renderer returns the live GPU
+      // texture image plus device, exactly what createCanvasPresenter.present
+      // consumes, and no CPU readback happens. Only the webgpu backend can
+      // produce it - the webgl2 backend has no GPU texture image to hand
+      // over, so it always delivers pixel frames. A pixel capture
+      // (renderNow({ pixels: true })) reads back this one frame without
+      // presenting it; the finally block schedules a presentation frame so
+      // a presenter catches up.
+      const textureDelivery = !pixelReadback &&
+        renderer.graphicsBackend !== "webgl2";
+      const rendered = textureDelivery
+        ? await renderer.renderTexture(scene, renderOptions)
+        : await renderer.render(scene, renderOptions);
+      rasterFinishedAt = renderSurfaceNow();
       if (this._shutdown) {
         return null;
       }
+      this._countRenderWork(rendered.performance);
       this._frameResume(continuation, renderToken, 0, -1, frameBindings);
       const publicationToken = this._frameClaim(
         continuation,
         10,
         frameBindings,
       );
-      for (const transition of rendered.startedTransitions ?? []) {
-        const element = this._eventElementAtIndex[transition.nodeIndex];
-        if (!element) continue;
-        let timings = this._transitionTimings.get(element);
-        if (!timings) {
-          timings = new Map();
-          this._transitionTimings.set(element, timings);
+      if (rendered.animationTickMilliseconds != null) {
+        this._transitionTickMilliseconds = rendered.animationTickMilliseconds;
+        // That tick sampled every transition track declared so far.
+        for (const timings of this._transitionRecords.values()) {
+          for (const timing of timings.values()) timing.trackAwaitsTick = false;
         }
-        const wasActive = timings.has(transition.propertyName);
-        const timing = {
-          duration: transition.duration,
-          delay: transition.delay,
-          easing: transition.easing,
-          startTimeMilliseconds: transition.startTime,
-        };
-        timings.set(transition.propertyName, timing);
-        let records = this._transitionRecords.get(element);
-        if (!records) {
-          records = new Map();
-          this._transitionRecords.set(element, records);
-        }
-        records.set(transition.propertyName, timing);
-        if (!wasActive) this._activeTransitionCount++;
       }
       for (const animation of this._animations) {
         for (const elapsedTime of animation._iterationEventsAtCurrentTime()) {
@@ -3433,7 +4146,7 @@ class DOMRenderSurface {
           height: frameViewport.height,
           nodes: serialized.nodes,
           imageSources: serialized.imageSources,
-        });
+        }, svgImageTimings);
       }
       const effectiveBoxes = rendered.boxes?.length ? rendered.boxes : boxes;
 
@@ -3448,10 +4161,11 @@ class DOMRenderSurface {
           })
         )
         : requestedDirtyRectangles.map((rectangle) => Object.freeze(rectangle));
-      // Pixel bookkeeping follows the rendered result, not the mode:
-      // texture deliveries have no pixels (every frame delivers), while
-      // the WebGL 2 presentation fallback and pixel captures carry pixels
-      // and diff like plain pixel frames.
+      // Change detection follows the rendered result: a pixel frame diffs
+      // the readback against the retained snapshot; a texture frame has no
+      // CPU pixels, so the renderer's damage is the change — no dirty
+      // rectangle means the texture is byte-identical to the presented one
+      // and a loop frame delivers nothing.
       const pixelsChanged = rendered.pixels
         ? pixelsDifferInRectangles(
           this._lastPixels,
@@ -3459,11 +4173,8 @@ class DOMRenderSurface {
           rendered.width,
           dirtyRectangles,
         )
-        : true;
-      const elementAtIndex = new Array(serialized.nodes.length).fill(null);
-      for (
-        const [element, index] of serialized.indexOf
-      ) elementAtIndex[index] = element;
+        : dirtyRectangles.length > 0;
+      const elementAtIndex = nodesAtRow(serialized);
       // ONE geometry family: the engine's returned boxes (physical layout
       // divided by device scale) are the paint-truth records for scroll
       // facts, scrollbar descriptors, snap, anchoring, and the interaction
@@ -3482,7 +4193,9 @@ class DOMRenderSurface {
           boxes !== rendered.boxes &&
           boxes[BOX_SNAPSHOT] !== rendered.boxes[BOX_SNAPSHOT]
         ) releaseBoxSnapshot(boxes);
-        boxes = rendered.boxes.slice(0, serialized.nodes.length);
+        boxes = rendered.boxes.length === serialized.nodes.length
+          ? rendered.boxes
+          : rendered.boxes.slice(0, serialized.nodes.length);
         const attached = rendered.boxes[BOX_SNAPSHOT];
         if (attached !== undefined && attached.count === boxes.length) {
           boxSnapshot = attached;
@@ -3511,21 +4224,37 @@ class DOMRenderSurface {
           height: frameViewport.height,
           nodes: serialized.nodes,
           imageSources: serialized.imageSources,
-        });
+        }, svgImageTimings);
       }
       const laidOutHere = presentedBoxes !== boxes;
-      presentedBoxes = presentedBoxes
-        .slice(0, serialized.nodes.length)
-        .map((box, index) => Object.freeze({ ...boxes[index], ...box }));
+      if (laidOutHere) {
+        presentedBoxes = presentedBoxes
+          .slice(0, serialized.nodes.length)
+          .map((box, index) => Object.freeze({ ...boxes[index], ...box }));
+      } else if (
+        presentedBoxes !== rendered.boxes || !boxesReadOnly(presentedBoxes)
+      ) {
+        // The renderer's box objects are complete when it returns them
+        // (fragments and SVG path rectangles included) and nothing writes
+        // them after, so they are published frozen as they are: a copy of
+        // every box on every frame was a measured share of the frame and
+        // of its garbage. The renderer's own box list (readEngineBoxes)
+        // makes each box, frozen, on its first read and refuses writes; it
+        // is published itself, since slicing or freezing it would make
+        // every box.
+        presentedBoxes = presentedBoxes.slice(0, serialized.nodes.length);
+        for (const box of presentedBoxes) Object.freeze(box);
+      }
       if (
         boxSnapshot !== null && !laidOutHere &&
-        boxSnapshot.count === presentedBoxes.length
+        boxSnapshot.count === presentedBoxes.length &&
+        presentedBoxes[BOX_SNAPSHOT] !== boxSnapshot
       ) {
         presentedBoxes[BOX_SNAPSHOT] = boxSnapshot;
       }
-      Object.freeze(presentedBoxes);
+      freezeBoxes(presentedBoxes);
       const textGeometryByElement = new Map();
-      const textGeometryByNode = new Map();
+      let textGeometryByNode = new Map();
       // A retained scene with unchanged text keeps the presented frame's
       // glyph and caret geometry; only the scroll translation is refreshed.
       // Those entries are frozen and already complete, so the paint
@@ -3536,21 +4265,82 @@ class DOMRenderSurface {
             rendered.performance?.preparation?.retained))
         ? this._presentedFrame?.textGeometryByNode ?? null
         : null;
+      // A text node's reused geometry is final: its caret stops were made
+      // unique when it was built, and keeping the same frozen stop array is
+      // what lets the geometry build reuse the node's encoded wire blocks
+      // (textWireBlocks is keyed on it). Running it through the unique-stop
+      // pass again copied every stop array on every scroll frame, which
+      // re-encoded every text node's blocks. A text control still takes
+      // that pass: its selection rectangles follow the live selection.
+      // The entries still to be finished below (made unique, frozen, a text
+      // control's selection added); a kept entry is final.
+      const unfinishedTextGeometry = [];
       if (reusedTextGeometry !== null) {
-        const reusedNodes = [...reusedTextGeometry.keys()];
-        const shifts = contentShifts(reusedNodes);
-        for (let index = 0; index < reusedNodes.length; index++) {
-          const node = reusedNodes[index];
-          const geometry = reusedTextGeometry.get(node);
-          const shiftX = shifts === null ? 0 : shifts[index * 4];
-          const shiftY = shifts === null ? 0 : shifts[index * 4 + 1];
-          textGeometryByNode.set(node, {
-            caretStops: geometry.caretStops,
-            glyphs: geometry.glyphs,
-            anchors: geometry.anchors,
-            translationX: (geometry.translationX ?? 0) - shiftX,
-            translationY: (geometry.translationY ?? 0) - shiftY,
-          });
+        // The text controls among the reused entries: a frame keys each
+        // control's entry under textGeometryByElement as well, and every
+        // other entry is a text node's.
+        const reusedControls = this._presentedFrame.textGeometryByElement;
+        const pendingTargets = snapshot === null
+          ? 0
+          : capturedScrollRequests.size;
+        if (
+          pendingTargets === 0 ||
+          (pendingTargets === 1 && capturedScrollRequests.has(this.viewport))
+        ) {
+          // A frame that scrolls the viewport alone shifts every text node by
+          // the viewport's pending delta (no node's chain holds a pending
+          // offset of its own), and one that scrolls nothing by none: one
+          // shift over the reused geometry, which the snapshot applies to
+          // the predecessor's carets and glyphs, instead of an entry per
+          // text node. Only a text control's entry is made, for its live
+          // selection.
+          const shiftX = pendingTargets === 0
+            ? 0
+            : predictScroll(this.viewport, 2);
+          const shiftY = pendingTargets === 0
+            ? 0
+            : predictScroll(this.viewport, 3);
+          textGeometryByNode =
+            reusedTextGeometry instanceof ShiftedTextGeometry
+              ? new ShiftedTextGeometry(
+                reusedTextGeometry.base,
+                reusedTextGeometry.shiftX + shiftX,
+                reusedTextGeometry.shiftY + shiftY,
+                textGeometryByElement,
+              )
+              : new ShiftedTextGeometry(
+                reusedTextGeometry,
+                shiftX,
+                shiftY,
+                textGeometryByElement,
+              );
+          unfinishedTextGeometry.push(...reusedControls.keys());
+          this._stageCounters.translatedTextGeometryEntries +=
+            reusedControls.size;
+        } else {
+          // Any other scroll asks the core for each node's shift.
+          const shifts = contentShifts([...reusedTextGeometry.keys()]);
+          let index = 0;
+          for (const [node, geometry] of reusedTextGeometry) {
+            const shiftX = shifts[index * 4];
+            const shiftY = shifts[index * 4 + 1];
+            index++;
+            const reused = {
+              caretStops: geometry.caretStops,
+              glyphs: geometry.glyphs,
+              anchors: geometry.anchors,
+              translationX: (geometry.translationX ?? 0) - shiftX,
+              translationY: (geometry.translationY ?? 0) - shiftY,
+            };
+            if (reusedControls.has(node)) {
+              textGeometryByNode.set(node, reused);
+              unfinishedTextGeometry.push(node);
+            } else {
+              textGeometryByNode.set(node, Object.freeze(reused));
+            }
+          }
+          this._stageCounters.translatedTextGeometryEntries +=
+            reusedTextGeometry.size;
         }
       }
       const textOperations = reusedTextGeometry === null
@@ -3572,14 +4362,31 @@ class DOMRenderSurface {
       const previousTextGeometry = textOperations.length > 0
         ? this._presentedFrame?.textGeometryByNode ?? null
         : null;
-      const loweredRows = serialized.loweredRows === undefined
+      const loweredRows = textOperations.length === 0 ||
+          serialized.loweredRows === undefined
         ? null
         : new Set(serialized.loweredRows);
-      const keptTextGeometry = new Set();
       // One eager pass: the operations of each text owner, in paint order.
       // Reading operation.glyphs builds a frozen object per glyph, so the
       // grouping uses the eager glyphCount and only a rebuild pays for it.
       const operationsByOwner = new Map();
+      // An owner's kind (0 no text owner, 1 a text control, 2 a text node
+      // under the root) is a function of the node and of the tree. The
+      // surface keeps the kinds, and the ancestry verdicts behind them,
+      // until a tree mutation under the root: an insertion or a removal
+      // is the only change that moves a node's shadow-including ancestry,
+      // and either one reaches the surface (its target is under the root
+      // before a removal and after an insertion). A frame then classifies
+      // only the owners it has not met, instead of walking every owner's
+      // ancestry and reading its node type through the core again.
+      if (this._textOwnerKinds?.structureMutations !== this._structureMutations) {
+        this._textOwnerKinds = {
+          structureMutations: this._structureMutations,
+          kinds: new Map(),
+          isDocumentText: shadowIncludingInclusiveDescendantTest(this._root),
+        };
+      }
+      const { kinds: ownerKinds, isDocumentText } = this._textOwnerKinds;
       for (const operation of textOperations) {
         if (operation.kind !== "text" || operation.glyphCount === 0) continue;
         const sourceNode = serialized.nodes[operation.nodeIndex];
@@ -3588,22 +4395,31 @@ class DOMRenderSurface {
           sourceNode?.generatedOwnerIndex ??
             operation.nodeIndex
         ];
-        const textControl = owner?.localName === "input" ||
-          owner?.localName === "textarea";
-        const documentText = !generated && owner?.nodeType === 3 &&
-          (owner === this._root || this._root.contains(owner));
-        if (!textControl && !documentText) continue;
+        if (owner == null) continue;
+        let ownerKind = ownerKinds.get(owner);
+        if (ownerKind === undefined) {
+          const ownerType = owner.nodeType;
+          ownerKind = ownerType === 1 &&
+              (owner.localName === "input" || owner.localName === "textarea")
+            ? 1
+            : ownerType === 3 && isDocumentText(owner)
+            ? 2
+            : 0;
+          ownerKinds.set(owner, ownerKind);
+        }
+        // Generated text belongs to its element, never a text owner.
+        if (ownerKind === 0 || (ownerKind === 2 && generated)) continue;
         const entry = operationsByOwner.get(owner);
         if (entry === undefined) {
           operationsByOwner.set(owner, {
             operations: [operation],
-            keepable: !generated && owner.nodeType === 3 &&
-              loweredRows !== null && !loweredRows.has(operation.nodeIndex),
+            keepable: ownerKind === 2 && loweredRows !== null &&
+              !loweredRows.has(operation.nodeIndex),
           });
           continue;
         }
         entry.operations.push(operation);
-        entry.keepable = entry.keepable && !generated &&
+        entry.keepable = entry.keepable &&
           !loweredRows.has(operation.nodeIndex);
       }
       // Captured line coordinates are unscrolled. Their successor snapshot
@@ -3620,33 +4436,42 @@ class DOMRenderSurface {
         const shiftY = ownerShifts === null
           ? 0
           : ownerShifts[ownerIndex * 4 + 1] + ownerShifts[ownerIndex * 4 + 3];
-        const previous = keepable && previousTextGeometry !== null
-          ? previousTextGeometry.get(owner)
-          : undefined;
-        const kept = previous === undefined
-          ? null
-          : keptTextGeometryFor(previous, operations);
+        const previous = previousTextGeometry?.get(owner);
+        const kept = keepable && previous !== undefined
+          ? keptTextGeometryFor(previous, operations)
+          : null;
         if (kept !== null) {
+          // The presented entry itself when the translation did not move
+          // either, so the snapshot can keep the presented text block.
+          const translationX = (kept.translationX ?? 0) - shiftX;
+          const translationY = (kept.translationY ?? 0) - shiftY;
           textGeometryByNode.set(
             owner,
-            shiftX === 0 && shiftY === 0 ? kept : Object.freeze({
-              ...kept,
-              translationX: (kept.translationX ?? 0) - shiftX,
-              translationY: (kept.translationY ?? 0) - shiftY,
-            }),
+            Object.is(translationX, previous.translationX ?? 0) &&
+              Object.is(translationY, previous.translationY ?? 0)
+              ? previous
+              : shiftX === 0 && shiftY === 0
+              ? kept
+              : Object.freeze({ ...kept, translationX, translationY }),
           );
-          keptTextGeometry.add(owner);
           continue;
         }
         const anchors = new Float64Array(operations.length * 4);
+        // Subtracted from 0, not negated: a zero shift gives +0, as the
+        // kept and scrolled entries' subtractions do. A -0 translation
+        // differs from their +0 (sameTextGeometryValues compares as the
+        // snapshot bytes do), so after a scroll back to the origin an
+        // unchanged rebuilt entry was not the presented one, and the
+        // restyled frame built its whole geometry snapshot.
         const geometry = {
           caretStops: [],
           glyphs: [],
           anchors,
-          translationX: -shiftX,
-          translationY: -shiftY,
+          translationX: 0 - shiftX,
+          translationY: 0 - shiftY,
         };
         textGeometryByNode.set(owner, geometry);
+        unfinishedTextGeometry.push(owner);
         for (let index = 0; index < operations.length; index++) {
           const operation = operations[index];
           const rectangle = operation.logicalRectangle;
@@ -3667,25 +4492,33 @@ class DOMRenderSurface {
             }));
             geometry.caretStops.push(
               Object.freeze({
-                sourceOffset: glyph.sourceStart,
+                sourceOffset: glyph.rtl ? glyph.sourceEnd : glyph.sourceStart,
                 x: glyph.x,
                 top,
                 bottom,
-                affinity: "downstream",
+                affinity: glyph.rtl ? "upstream" : "downstream",
               }),
               Object.freeze({
-                sourceOffset: glyph.sourceEnd,
+                sourceOffset: glyph.rtl ? glyph.sourceStart : glyph.sourceEnd,
                 x: glyph.x + glyph.width,
                 top,
                 bottom,
-                affinity: "upstream",
+                affinity: glyph.rtl ? "downstream" : "upstream",
               }),
             );
           }
         }
       }
-      for (const [node, geometry] of textGeometryByNode) {
-        if (keptTextGeometry.has(node)) continue;
+      // A rebuilt entry whose values are the presented frame's entry's
+      // keeps that frozen entry: a restyle that lowered a text row without
+      // moving a glyph (a color or underline hover) rebuilds the row's
+      // operations into the same caret stops and glyphs, and the snapshot
+      // can keep the presented text block only for the same objects
+      // (presented-frame.js sameTextObjects).
+      const presentedTextGeometry = this._presentedFrame?.textGeometryByNode ??
+        null;
+      for (const node of unfinishedTextGeometry) {
+        const geometry = textGeometryByNode.get(node);
         const uniqueStops = uniqueCaretStops(node, geometry.caretStops);
         const baseGeometry = {
           caretStops: Object.freeze(uniqueStops),
@@ -3694,25 +4527,39 @@ class DOMRenderSurface {
           translationX: geometry.translationX ?? 0,
           translationY: geometry.translationY ?? 0,
         };
+        const previous = presentedTextGeometry?.get(node);
+        const sameValues = previous !== undefined &&
+          sameTextGeometryValues(previous, baseGeometry);
         if (node.nodeType === 3) {
-          textGeometryByNode.set(node, Object.freeze(baseGeometry));
+          textGeometryByNode.set(
+            node,
+            sameValues ? previous : Object.freeze(baseGeometry),
+          );
           continue;
         }
         const selectionStart = node.selectionStart ?? node.value.length;
         const selectionEnd = node.selectionEnd ?? selectionStart;
-        const controlSelectionRects = selectionRectanglesForText(
-          node,
-          baseGeometry,
-          selectionStart,
-          selectionEnd,
-        );
-        const controlGeometry = Object.freeze({
-          ...baseGeometry,
-          selectionStart,
-          selectionEnd,
-          selectionRectangles: controlSelectionRects,
-        });
-        textGeometryByNode.set(node, controlGeometry);
+        // A control's selection rectangles are a function of its glyphs
+        // and its selection.
+        const controlGeometry = sameValues &&
+            previous.selectionStart === selectionStart &&
+            previous.selectionEnd === selectionEnd
+          ? previous
+          : Object.freeze({
+            ...baseGeometry,
+            selectionStart,
+            selectionEnd,
+            selectionRectangles: selectionRectanglesForText(
+              node,
+              baseGeometry,
+              selectionStart,
+              selectionEnd,
+            ),
+          });
+        // A shifted view reads a control's entry from textGeometryByElement.
+        if (textGeometryByNode instanceof Map) {
+          textGeometryByNode.set(node, controlGeometry);
+        }
         textGeometryByElement.set(node, controlGeometry);
       }
       const preparedState = Object.freeze({
@@ -3722,7 +4569,7 @@ class DOMRenderSurface {
           nodes: Object.freeze(scene.nodes),
         }),
         serialized,
-        boxes: Object.freeze(boxes),
+        boxes: freezeBoxes(boxes),
       });
       const acceptState = (geometryHandle) => {
         const completedScrollTargets = this._acceptScrollFeedback(
@@ -3731,7 +4578,6 @@ class DOMRenderSurface {
           capturedScrollRequests,
         );
         this._scrollbars = scrollbars;
-        this._documentSelectionRects = documentSelectionRects;
         this._indexOfElement = serialized.indexOf;
         this._elementAtIndex = elementAtIndex;
         this._refreshScrollAnchors(serialized, boxes, geometryHandle);
@@ -3787,6 +4633,15 @@ class DOMRenderSurface {
         pixels = snapshotPixels ? retainedPixels : rendered.pixels;
       }
       if (this._shutdown) return null;
+      // A frame whose renderer published only its changed rows, into the
+      // previous frame's rows, and laid out no node restyled what the
+      // presented frame shows: its geometry derives from that frame's when
+      // the core proves the flat tree, the rows and the fragments unchanged
+      // (geometry_restyle_successor), and is built otherwise.
+      const renderPreparation = rendered.performance?.preparation;
+      const restyledInPlace = !scrollOnly &&
+        renderPreparation?.rowsPatched === true &&
+        renderPreparation.nodesLaidOut === 0;
       const successor = buildInteractionSnapshot({
         sourceRevisions,
         publication: serialized.publication,
@@ -3799,7 +4654,34 @@ class DOMRenderSurface {
         timeMilliseconds,
         textGeometryByElement,
         textGeometryByNode,
+        // A frame that only scrolled derives its geometry from the
+        // presented one: only boxes, scrollbars and text translations move.
+        scrollPredecessor: scrollOnly ? this._presentedFrame : null,
+        restylePredecessor: restyledInPlace ? this._presentedFrame : null,
       });
+      if (successor._derivation === "scroll") {
+        this._stageCounters.geometrySuccessorFrames++;
+      }
+      if (successor._derivation === "restyle") {
+        this._stageCounters.geometryRestyleFrames++;
+        this._stageCounters.geometryRestyleRecordsRebuilt +=
+          successor._successorWork.rebuiltRecords;
+        if (successor._successorWork.treeWalked) {
+          this._stageCounters.geometryRestyleTreeWalks++;
+        }
+      }
+      if (successor._successorWork !== null) {
+        const work = successor._successorWork;
+        this._stageCounters.geometrySuccessorElementsResolved += work.elementsResolved;
+        this._stageCounters.geometrySuccessorRecordsCopied += work.recordsCopied;
+        this._stageCounters.geometrySuccessorRecordsDerived += work.recordsDerived;
+        this._stageCounters.geometrySuccessorBoxRowsRead += work.boxRowsRead;
+      }
+      if (successor._restyleRefusal !== null) {
+        this._stageCounters[
+          restyleRefusalCounters[successor._restyleRefusal]
+        ]++;
+      }
       let successorPublished = false;
       releaseUnpublishedSuccessor = () => {
         if (!successorPublished) successor.geometry.release();
@@ -3807,16 +4689,10 @@ class DOMRenderSurface {
       core.status("frame_publish", continuation, successor.geometryHandle);
       this._frameResume(continuation, publicationToken, 0, -1, frameBindings);
       const framePreparedAt = renderSurfaceNow();
-      // PNG bytes are encoded lazily: nothing pays for the encode unless a
-      // consumer reads frame.png, and only a retained snapshot (never the
-      // renderer's live buffer) is stable enough to encode later. The
-      // accessor is non-enumerable so spreading a frame copies its fields
-      // without forcing the encode.
-      const encodePng = pixels !== null && pixels === retainedPixels
-        ? this._encodePixels
-        : null;
-      let png = encodePng === null ? null : undefined;
-      const frame = Object.freeze(Object.defineProperty(
+      // A texture frame carries the renderer's live texture image and
+      // device and no pixels; a pixel capture carries the retained snapshot.
+      // Encoding is the consumer's explicit request (encodeImage).
+      const frame = Object.freeze(
         {
           pixels,
           rowStride: rendered.rowStride,
@@ -3832,6 +4708,11 @@ class DOMRenderSurface {
           graphicsBackend: rendered.graphicsBackend,
           graphicsBackendInfo: rendered.graphicsBackendInfo,
           dirtyRectangles,
+          pixelRegions: Object.freeze(
+            (rendered.pixelRegions ?? []).map((region) =>
+              Object.freeze({ ...region })
+            ),
+          ),
           readbackByteLength: rendered.readbackByteLength,
           frameSequence: this._frameSequence + 1,
           scrollbars: Object.freeze(
@@ -3839,6 +4720,7 @@ class DOMRenderSurface {
           ),
           timeMilliseconds,
           renderTimings: Object.freeze({
+            svgImages: Object.freeze(svgImageTimings),
             preparationMilliseconds: rasterStartedAt - renderStartedAt,
             rendererWaitMilliseconds: rendererReadyAt === null
               ? 0
@@ -3867,17 +4749,14 @@ class DOMRenderSurface {
               }),
             }
             : {}),
+          textureImage: rendered.textureImage ?? null,
+          device: rendered.device ?? null,
         },
-        "png",
-        {
-          get() {
-            if (png === undefined) {
-              png = encodePng(pixels, rendered.width, rendered.height);
-            }
-            return png;
-          },
-        },
-      ));
+      );
+      if (this._presentFrame !== null && !pixelReadback) {
+        this._stageCounters.currentStage = "present";
+        pendingPresentation = () => this._presentFrame(frame);
+      }
       let completedScrollTargets = [];
       const publish = () => {
         // Native frame state is released when superseded, not when the
@@ -3967,13 +4846,30 @@ class DOMRenderSurface {
       if (capturedScrollRequests !== this._stagedFrame?.scrollCapture) {
         capturedScrollRequests?.release();
       }
+      if (restyleCountsBefore !== null && this._frameCore === core) {
+        this._stageCounters.elementsRestyled +=
+          (core.status("computed_restyle_counts", 0) - restyleCountsBefore[0]) >>> 0;
+        this._stageCounters.pseudoElementsRestyled +=
+          (core.status("computed_restyle_counts", 1) - restyleCountsBefore[1]) >>> 0;
+        this._stageCounters.sceneRestyleRowsRead +=
+          (core.status("computed_restyle_counts", 2) - restyleCountsBefore[2]) >>> 0;
+      }
       this._eventElementAtIndex = null;
       this._stageCounters.currentStage = "idle";
       this._rendering = false;
+      // A native change that landed after this frame sealed its scene (a
+      // font face or an image its own layout pass loaded) belongs to the
+      // next frame, and no host mutation callback reports it: only the
+      // frame surface holds it. That frame follows now, instead of the next
+      // input's frame paying for it.
+      if (
+        accepted && !this._dirty && !this._shutdown &&
+        this._mutationConsequence > 0
+      ) this._dirty = true;
       if (this._snapCheckOwed && !this._dirty) {
         this._snapCheckOwed = false;
         this._snapCheckPending = this._snapCheckPending ||
-          this._snappedTargets.size > 0 || this._snapContainers().length > 0;
+          this._snappedTargets.size > 0 || this._snapContainersInLastBuild();
       }
       const idleWaiters = this._idleWaiters.splice(0);
       for (const resolve of idleWaiters) resolve();
@@ -4080,6 +4976,7 @@ class DOMRenderSurface {
           timeMilliseconds,
           true,
           false,
+          true,
         );
         yield Object.freeze({
           sequence,
@@ -4099,7 +4996,7 @@ class DOMRenderSurface {
           readbackByteLength: frame?.readbackByteLength ?? 0,
         });
       }
-      await this._renderOpportunity(endTime, true, false);
+      await this._renderOpportunity(endTime, true, false, true);
     } finally {
       this._capturingFrames = false;
     }
@@ -4110,20 +5007,31 @@ class DOMRenderSurface {
     return new Promise((resolve) => this._idleWaiters.push(resolve));
   }
 
-  renderNow({ pixelReadback = false, _transaction = null } = {}) {
+  async createDisplayListArtifact() {
+    if (this._shutdown) throw new Error("render surface is shut down");
+    const scene = this._preparedState?.scene;
+    if (scene === undefined) {
+      throw new Error(
+        "createDisplayListArtifact requires one completed render frame",
+      );
+    }
+    const renderer = await this._persistentRendererPromise;
+    return await renderer.createDisplayListArtifact(scene);
+  }
+
+  // The one render entry. Delivers the renderer's GPU texture frame on
+  // WebGPU (no readback); `pixels: true` reads this frame back into a
+  // retained CPU snapshot for encoding or inspection. WebGL 2 always
+  // delivers pixels.
+  renderNow({ pixels = false, _transaction = null } = {}) {
     if (this._shutdown) throw new Error("render surface is shut down");
     return this._renderOpportunity(
       this._now(),
       true,
       true,
-      pixelReadback,
+      pixels,
       _transaction,
     );
-  }
-
-  renderForPresentation(timeMilliseconds = this._now()) {
-    if (this._shutdown) throw new Error("render surface is shut down");
-    return this._renderOpportunity(timeMilliseconds, true, false);
   }
 
   tick(timeMilliseconds) {
@@ -4176,14 +5084,25 @@ class DOMRenderSurface {
       previousRegistry?.values().next().value?._connectSubtree(this._root);
     }
     this._frameCore.status("frame_surface_dispose", this._frameOwner);
+    this._frameCore.status("scroll_owner_release", this._scrollOwner);
     this._frameCore = nextRoot._domCore;
     this._frameOwner = this._frameCore.status(
       "frame_surface_create",
       nextRoot._coreHandle,
     );
     this._frameBindings = createFrameBindings(this._frameCore);
+    this._scrollOwner = this._frameCore.status("scroll_owner_create");
+    this._frameCore.status(
+      "scroll_owner_bind",
+      this._scrollOwner,
+      nextRoot._coreHandle,
+    );
+    this._scrollGeometry = null;
     this._root = nextRoot;
     nextRegistry.set(this._environmentKey, this);
+    this._document._liveRenderSurfaces.delete(this);
+    this._document = surfaceDocument(nextRoot);
+    (this._document._liveRenderSurfaces ??= new Set()).add(this);
     this._connectSubtree(nextRoot);
     this.viewport.root = nextRoot;
     this._indexOfElement = new Map();
@@ -4191,7 +5110,6 @@ class DOMRenderSurface {
     this._presentedFrame = null;
     this._lastDeliveredFrame = null;
     this._lastRendered = null;
-    this._documentSelectionRects = [];
     this._selectionChanged = false;
     this._preservedScrollMetrics = null;
     this._scrollAnchors.clear();
@@ -4223,6 +5141,7 @@ class DOMRenderSurface {
     const wasPrimary = this._root._renderSurface === this;
     this._disconnectSubtree(this._root);
     surfaceRegistry?.delete(this._environmentKey);
+    this._document._liveRenderSurfaces.delete(this);
     if (wasPrimary) {
       // Promote any remaining surface over this root to primary: it claims
       // the node _renderSurface slots the shutdown just released.
@@ -4256,6 +5175,7 @@ class DOMRenderSurface {
     this._selectionChanged = false;
     this._transformOnlyMutations.clear();
     this._hasNonTransformMutation = false;
+    this._hasNonStateMutation = false;
     this._pendingSnapOrigins.clear();
     this._snappedTargets.clear();
     this._snapCheckPending = false;
@@ -4270,6 +5190,8 @@ class DOMRenderSurface {
     if (this._persistentRendererPromise) {
       await (await this._persistentRendererPromise).shutdown();
     }
+    this._root._domCore.status("computed_samples_release", this._computedSamples);
+    this._computedSamples = 0;
     this._releaseSyncLayout();
     this._frameCore.releaseSceneResources(
       this._preparedState?.serialized?.nodes,

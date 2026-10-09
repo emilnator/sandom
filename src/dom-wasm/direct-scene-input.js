@@ -28,7 +28,7 @@ export function publishDirectSceneInput(core, nodes, imagePixelsFor, patchIndex 
   };
   const active = new Set();
   const encode = (value, at, key = "", sceneNode = false) => {
-    const entry = { key: string(key), hash: key ? directSceneFields.get(key) : 0, kind: 0 };
+    const entry = { key: string(key), name: key, hash: key ? directSceneFields.get(key) : 0, kind: 0 };
     values[at] = entry;
     if (value == null) return;
     if (typeof value === "number" || typeof value === "boolean") {
@@ -39,11 +39,13 @@ export function publishDirectSceneInput(core, nodes, imagePixelsFor, patchIndex 
     if (typeof value === "string") {
       entry.kind = 2;
       entry.string = string(value);
+      entry.text = value;
       return;
     }
     if (typeof value !== "object") {
       throw new TypeError(`Unsupported authored Scene value for ${key}`);
     }
+    entry.authored = value;
     if (active.has(value)) throw new TypeError("Cyclic authored Scene value");
     active.add(value);
     try {
@@ -64,6 +66,15 @@ export function publishDirectSceneInput(core, nodes, imagePixelsFor, patchIndex 
           authored._nativeTransformOverride = true;
           authored.transform = value._coreTransformOverride;
           authored.transformOrigin = value.transformOrigin;
+        }
+        // An inline SVG shape's fill and stroke paint servers, resolved by
+        // the renderer against the shape's bounding box, paint over the
+        // native row.
+        if (value.svgFillGradient !== undefined) {
+          authored.svgFillGradient = value.svgFillGradient;
+        }
+        if (value.svgStrokeGradient !== undefined) {
+          authored.svgStrokeGradient = value.svgStrokeGradient;
         }
         active.delete(value);
         encode(authored, at, key);
@@ -152,18 +163,35 @@ export function publishDirectSceneInput(core, nodes, imagePixelsFor, patchIndex 
   // The native operation adopts the allocation, including on failure. Full
   // publication replaces the previous owned input; sparse patches replace only
   // their node's owned input. No JavaScript snapshot authority remains.
-  return core.status("engine_direct_publish", pointer, length, patchIndex ?? -1);
+  try {
+    return core.status("engine_direct_publish", pointer, length, patchIndex ?? -1);
+  } catch (error) {
+    if (core.exports.abi_error_kind() !== 18) throw error;
+    const rejectedPointer = core.exports.abi_error_detail_a();
+    const valueIndex = (rejectedPointer - pointer - 16) / 32;
+    const rejected = Number.isInteger(valueIndex) ? values[valueIndex] : undefined;
+    if (!rejected) throw error;
+    const authored = rejected.kind === 2 ? rejected.text
+      : rejected.kind === 1 || rejected.kind === 3 ? rejected.number : rejected.authored;
+    throw new Error(
+      `Unsupported authored Scene value ${JSON.stringify(authored)} for ${rejected.name}` +
+      ` at node ${core.exports.abi_error_detail_b()}`,
+      { cause: error },
+    );
+  }
 }
 
 // A scene every row of which is a DOM-backed core row without a transform
-// override: the authored object per row is the same seven fields, so the
-// input is written straight into the allocation — no per-value objects,
-// no string table beyond the seven key names. The generic encoder below
-// is the definition this must match record for record.
+// override or a paint server: the authored object per row is the same
+// seven fields, so the input is written straight into the allocation — no
+// per-value objects, no string table beyond the seven key names. The
+// generic encoder below is the definition this must match record for
+// record.
 function isDomBackedScene(nodes) {
   for (let index = 0; index < nodes.length; index++) {
     const node = nodes[index];
-    if (node._coreBox === undefined || Object.hasOwn(node, "_coreTransformOverride")) {
+    if (node._coreBox === undefined || Object.hasOwn(node, "_coreTransformOverride") ||
+      node.svgFillGradient !== undefined || node.svgStrokeGradient !== undefined) {
       return false;
     }
   }
@@ -267,12 +295,13 @@ const directSceneFields = new Map([
   "fontIndex", "fontSize", "fontWeight", "fontStyle", "color", "textAlign", "textDecoration", "textOverflow", "whiteSpace",
   "overflowWrap", "verticalAlign", "lineHeight", "letterSpacing", "flexDirection", "flexWrap", "flexGrow", "flexShrink",
   "flexBasis", "alignItems", "alignSelf", "alignContent", "justifyItems", "justifySelf", "justifyContent", "layoutAlignItems",
-  "layoutJustifyContent", "gap", "rowGap", "columnGap", "gridTemplateColumns", "gridTemplateRows", "gridTemplateAreas",
+  "layoutJustifyContent", "gap", "rowGap", "columnGap", "columnWidth", "columnCount", "breakInside", "orphans", "widows",
+  "columnRuleWidth", "columnRuleStyle", "columnRuleColor", "columnSpan", "columnFill", "gridTemplateColumns", "gridTemplateRows", "gridTemplateAreas",
   "gridAutoColumns", "gridAutoRows", "gridAutoFlow", "gridRowStart", "gridRowEnd", "gridColumnStart", "gridColumnEnd",
   "gridRow", "gridColumn", "gridArea", "tableLayout", "borderCollapse", "captionSide", "emptyCells", "colSpan", "rowSpan",
   "borderSpacing", "imageIndex", "objectFit", "objectPosition", "imageRendering", "backgroundGradient", "backgroundImages",
   "resolvedBackgroundImages", "backgroundAttachment", "backgroundClip", "backgroundOrigin", "boxShadows", "textShadows",
-  "filter", "backdropFilter", "masks", "resolvedMasks", "borderImage", "clipPath", "svgFillGradient", "viewBox",
+  "filter", "backdropFilter", "masks", "resolvedMasks", "borderImage", "clipPath", "svgFillGradient", "svgStrokeGradient", "viewBox",
   "preserveAspectRatio", "fill", "stroke", "fillOpacity", "strokeOpacity", "strokeWidth", "fillRule", "strokeLinecap",
   "strokeLinejoin", "svgTextAnchor", "svgTextX", "svgTextY", "resolvedPathIndex", "resolvedPathBbox", "resolvedStrokePathIndex",
   "resolvedStrokePathBbox", "resolvedCoordinateScale", "transform", "transformOrigin", "kind", "components", "value", "radians",

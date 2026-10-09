@@ -4,9 +4,9 @@ import { SCROLL_SOURCES } from "./scroll-core.js";
 const keyCodes = Object.freeze({ ArrowLeft: 1, ArrowRight: 2, ArrowUp: 3, ArrowDown: 4, PageUp: 5, PageDown: 6, Home: 7, End: 8, " ": 9 });
 export function scrollByChained(surface, snapshot, target, deltaX, deltaY, source) {
   const core = snapshot.geometryCore;
-  if (!surface) return { remainingX: deltaX, remainingY: deltaY };
+  if (!surface) return { remainingX: deltaX, remainingY: deltaY, scrolled: false };
   const changed = core.status("scroll_chain", surface._scrollOwner, snapshot.geometryHandle, target?._coreHandle ?? 0n, deltaX, deltaY, SCROLL_SOURCES[source] ?? 0);
-  const result = { remainingX: core.status("scroll_remaining", 0), remainingY: core.status("scroll_remaining", 1) };
+  const result = { remainingX: core.status("scroll_remaining", 0), remainingY: core.status("scroll_remaining", 1), scrolled: Boolean(changed) };
   if (changed) {
     surface._snapCheckPending = true;
     surface._dirty = true;

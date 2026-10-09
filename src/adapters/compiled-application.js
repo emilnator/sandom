@@ -1,5 +1,6 @@
 import { resolveDenoExecutable } from "./deno-executable.js";
 import { DOMParser } from "../dom/node.js";
+import { sharedDomCore } from "../dom-wasm/core.js";
 import {
   createComponentAdapterResult,
   validateComponentAdapterResult,
@@ -65,7 +66,6 @@ const allowedRenderOptions = new Set([
   "invalidationPaths",
   "compilation",
 ]);
-const stylesheetURLPattern = /(?:url\(\s*|@import\s+)(?:["']?)([^"')\s;]+)(?:["']?)/g;
 
 function object(value, name) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -167,10 +167,11 @@ function elementResourceURLs(document, documentURL) {
   return urls;
 }
 
+// Each url() and @import URL of a stylesheet, found and decoded by the
+// core's CSS tokenizer.
 function stylesheetResourceURLs(source, stylesheetURL) {
   const urls = [];
-  for (const match of source.matchAll(stylesheetURLPattern)) {
-    const candidate = match[1];
+  for (const { url: candidate } of sharedDomCore.cssURLs(source)) {
     if (!candidate || candidate.startsWith("data:") || candidate.startsWith("#")) {
       continue;
     }
@@ -561,7 +562,7 @@ function normalizeRenderRequest(candidate) {
 }
 
 function reconstructFrame(value, binary) {
-  const expectedBinaryNames = new Set(["pixels", ...(value.pngPresent ? ["png"] : [])]);
+  const expectedBinaryNames = new Set(["pixels"]);
   for (const name of binary.keys()) {
     if (!expectedBinaryNames.delete(name)) {
       throw new TypeError(`The compiled-application realm returned unknown frame bytes ${name}`);
@@ -586,14 +587,9 @@ function reconstructFrame(value, binary) {
   const pixels = PixelArray === Uint8Array
     ? pixelBytes
     : new PixelArray(pixelBytes.slice().buffer);
-  const png = value.pngPresent ? binary.get("png") : null;
-  if (value.pngPresent && !(png instanceof Uint8Array)) {
-    throw new TypeError("The compiled-application realm omitted declared PNG bytes");
-  }
   const {
     pixelsPresent,
     pixelsType,
-    pngPresent,
     durationMilliseconds,
     ...fields
   } = value;
@@ -601,7 +597,7 @@ function reconstructFrame(value, binary) {
     throw new TypeError("The compiled-application realm returned malformed frame metadata");
   }
   return {
-    frame: Object.freeze({ ...fields, pixels, png }),
+    frame: Object.freeze({ ...fields, pixels }),
     durationMilliseconds,
   };
 }

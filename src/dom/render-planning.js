@@ -2,6 +2,7 @@ import {
   inspectPreparedInput,
   prepareRenderInput,
 } from "./render-animation.js";
+import { assertScrollbarStyle } from "./scrollbar-visibility.js";
 import { DocumentSession } from "./document-session.js";
 import { recommendMotionCapture } from "./motion-capture-recommendation.js";
 import { recommendViewport } from "./viewport-recommendation.js";
@@ -162,6 +163,20 @@ export async function planRenderInput(preparedInput, request = {}) {
       ? "The runtime selects the first available graphics backend"
       : "The caller supplied the graphics backend",
   ));
+  const scrollbarStyle = assertScrollbarStyle(
+    request.scrollbarStyle ?? "overlay",
+    "render planning request",
+  );
+  decisions.push(decision(
+    "scrollbarStyle",
+    request.scrollbarStyle === undefined ? "default" : "caller",
+    request.scrollbarStyle === undefined
+      ? "default-scrollbar-style"
+      : "caller-scrollbar-style",
+    request.scrollbarStyle === undefined
+      ? "Scrollbars use the overlay style"
+      : "The caller supplied the scrollbar style",
+  ));
   const viewportDeviceScale = request.viewport !== null &&
       typeof request.viewport === "object"
     ? request.viewport.deviceScale
@@ -192,7 +207,7 @@ export async function planRenderInput(preparedInput, request = {}) {
     const viewportPlan = planAutomaticViewport(
       await recommendViewport(
         preparedInput,
-        request.viewportRecommendation,
+        { ...request.viewportRecommendation, scrollbarStyle },
       ),
       provisionalDeviceScale,
     );
@@ -205,6 +220,7 @@ export async function planRenderInput(preparedInput, request = {}) {
   const inspection = await inspectPreparedInput(preparedInput, {
     mode: "observed",
     viewport,
+    scrollbarStyle,
   });
   const requestedCapture = request.capture ?? {};
   const durationOverride = requestedCapture.durationMilliseconds;
@@ -459,6 +475,7 @@ export async function planRenderInput(preparedInput, request = {}) {
         : {}),
     },
     graphicsBackend,
+    scrollbarStyle,
     viewport,
     capture: {
       kind: motionRecommendation.kind,

@@ -9,11 +9,11 @@ import {
   selectPreprocessor,
 } from "./input-preprocessors.js";
 import { createRenderSurface } from "./render-surface.js";
+import { assertScrollbarStyle } from "./scrollbar-visibility.js";
 import { SDDocument } from "./node.js";
 import { serializeToScene } from "./serialize.js";
 import { resolvedElementFields } from "./style.js";
 import { createLayoutArtifact } from "../scene-renderer.js";
-import { DocumentSession } from "./document-session.js";
 import { createPreparedDocument } from "./prepared-document.js";
 
 const REC2100_PQ_OUTPUT_ENCODING = Object.freeze({
@@ -25,6 +25,7 @@ const REC2100_PQ_OUTPUT_ENCODING = Object.freeze({
   profile: null,
 });
 
+const PNG_OUTPUT_REQUEST = Object.freeze({ format: "png" });
 const JPEG_XL_OUTPUT_REQUEST = Object.freeze({
   format: "jpeg-xl",
   colorEncoding: REC2100_PQ_OUTPUT_ENCODING,
@@ -115,7 +116,9 @@ export async function renderDocumentAnimation(document, options = {}) {
     resolveResource = null,
     adaptiveCodecOptions = {},
     graphicsBackend = "auto",
+    scrollbarStyle = "overlay",
   } = options;
+  assertScrollbarStyle(scrollbarStyle, "render options");
   if (!["gif", "png", "jpeg-xl", "jpeg-gain-map"].includes(format)) {
     throw new RangeError(`Unsupported render format ${JSON.stringify(format)}`);
   }
@@ -146,13 +149,13 @@ export async function renderDocumentAnimation(document, options = {}) {
     viewportHeight: height,
     deviceScale,
     resolveResource,
-    encodePixels: highDynamicRangeStillOutput ? null : undefined,
     renderMode: highDynamicRangeStillOutput ? "high-dynamic-range" : undefined,
     renderPrecision: highDynamicRangeStillOutput ? "rgba16float" : undefined,
     graphicsBackend,
+    scrollbarStyle,
   });
   try {
-    const initialFrame = await surface.renderNow();
+    const initialFrame = await surface.renderNow({ pixels: true });
     surface.stop();
     if (format !== "gif") {
       const frame = frameMetadata(initialFrame);
@@ -171,7 +174,10 @@ export async function renderDocumentAnimation(document, options = {}) {
       let bytes;
       let outputFacts;
       if (format === "png") {
-        bytes = await initialFrame.png;
+        bytes = await encodeImage(descriptor, PNG_OUTPUT_REQUEST, {
+          encodePngOutput: document._sandomSceneRendererRuntime?.codecRuntime
+            ?.encodePngOutput,
+        });
       } else if (format === "jpeg-xl") {
         bytes = await encodeImage(descriptor, JPEG_XL_OUTPUT_REQUEST, {
           renderPrecision: "rgba16float",
@@ -205,6 +211,7 @@ export async function renderDocumentAnimation(document, options = {}) {
         deviceScale: initialFrame.deviceScale,
         graphicsBackend: initialFrame.graphicsBackend,
         graphicsBackendInfo: initialFrame.graphicsBackendInfo,
+        scrollbarStyle: surface.scrollbarStyle,
         dirtyRectangles: initialFrame.dirtyRectangles,
         readbackByteLength: initialFrame.readbackByteLength,
         frameSequence: initialFrame.frameSequence,
@@ -243,6 +250,7 @@ export async function renderDocumentAnimation(document, options = {}) {
       height: Math.ceil(height * deviceScale),
       graphicsBackend: initialFrame.graphicsBackend,
       graphicsBackendInfo: initialFrame.graphicsBackendInfo,
+      scrollbarStyle: surface.scrollbarStyle,
       durationMilliseconds: durationMilliseconds ??
         frames.reduce(
           (total, frame) => total + frame.durationMilliseconds,
@@ -385,6 +393,10 @@ function renderRequestFromPlan(plan) {
   if (!["auto", "webgpu", "webgl2"].includes(graphicsBackend)) {
     throw new RangeError("render plan graphics backend is unsupported");
   }
+  const scrollbarStyle = assertScrollbarStyle(
+    plan.scrollbarStyle ?? "overlay",
+    "render plan",
+  );
   if (!["png", "gif", "jpeg-xl", "jpeg-gain-map"].includes(format)) {
     throw new RangeError("render plan output format is unsupported");
   }
@@ -407,6 +419,7 @@ function renderRequestFromPlan(plan) {
       height,
       deviceScale,
       graphicsBackend,
+      scrollbarStyle,
       ...(format === "jpeg-gain-map"
         ? { adaptiveCodecOptions: plan.output.codecOptions ?? {} }
         : {}),
@@ -440,6 +453,7 @@ function renderRequestFromPlan(plan) {
     height,
     deviceScale,
     graphicsBackend,
+    scrollbarStyle,
     durationMilliseconds,
     frameBudget,
     loopCount,
@@ -500,26 +514,6 @@ export async function startPreparedRenderSurface(preparedInput, options = {}) {
   });
 }
 
-export async function renderAnimationInput(input, options = {}) {
-  const {
-    preprocessors = [],
-    preprocessor,
-    resolveResource = null,
-    ...renderRequest
-  } = options;
-  const preparedInput = await prepareRenderInput(input, {
-    preprocessors,
-    preprocessor,
-    resolveResource,
-  });
-  const session = new DocumentSession(preparedInput);
-  try {
-    return await session.renderOnce(renderRequest);
-  } finally {
-    await session.dispose();
-  }
-}
-
 // The inspected style facts of a scene node: a declared pixel size and
 // whether it paints a background. A DOM-backed box answers from its
 // resolved fields (its scene node carries no style); a scene-written node
@@ -549,6 +543,7 @@ function immutableLayoutFacts(
   viewport,
   serialized,
   artifact,
+  scrollbarStyle,
 ) {
   const elementsBySceneIndex = new Map();
   for (const [element, sceneIndex] of serialized.indexOf) {
@@ -666,6 +661,7 @@ function immutableLayoutFacts(
     kind: "layout-facts",
     version: 1,
     viewport: Object.freeze({ ...viewport }),
+    scrollbarStyle,
     documentScrollBounds: Object.freeze({
       width: scrollWidth,
       height: scrollHeight,
@@ -705,8 +701,10 @@ export async function inspectDocumentLayout(
   {
     createArtifact = createLayoutArtifact,
     resolveResource = null,
+    scrollbarStyle = "overlay",
   } = {},
 ) {
+  assertScrollbarStyle(scrollbarStyle, "layout inspection options");
   const document = renderRoot.ownerDocument;
   const width = Number(viewport.width);
   const height = Number(viewport.height);
@@ -727,6 +725,7 @@ export async function inspectDocumentLayout(
     styleSystem.setEnvironment({
       viewportWidth: width,
       viewportHeight: height,
+      scrollbarStyle,
     });
     await document._readyForRendering();
     const serialized = serializeToScene(renderRoot, {
@@ -746,6 +745,7 @@ export async function inspectDocumentLayout(
       { width, height, deviceScale },
       serialized,
       artifact,
+      scrollbarStyle,
     );
   } catch (error) {
     inspectionError = error;
@@ -780,7 +780,12 @@ export async function inspectPreparedInput(
       createSurface = createRenderSurface,
       createArtifact = createLayoutArtifact,
     } = inspectionDependencies;
-    const { mode = "observed", viewport = {} } = request;
+    const {
+      mode = "observed",
+      viewport = {},
+      scrollbarStyle = "overlay",
+    } = request;
+    assertScrollbarStyle(scrollbarStyle, "inspection request");
     if (!["observed", "analytical-layout"].includes(mode)) {
       throw new RangeError(
         `Unsupported inspection mode ${JSON.stringify(mode)}`,
@@ -803,12 +808,14 @@ export async function inspectPreparedInput(
         {
           createArtifact,
           resolveResource: state.resolveResource,
+          scrollbarStyle,
         },
       );
       return Object.freeze({
         kind: "prepared-render-inspection",
         version: 1,
         mode,
+        scrollbarStyle,
         input: preparedInput.input,
         resources: state.resourceRecords(),
         diagnostics: state.diagnosticRecords(),
@@ -828,6 +835,7 @@ export async function inspectPreparedInput(
       cancelFrame: () => {},
       resolveResource: state.resolveResource,
       initializePersistentRenderer: false,
+      scrollbarStyle,
     });
     try {
       const preparedState = await surface.prepareNow();
@@ -841,6 +849,7 @@ export async function inspectPreparedInput(
         kind: "prepared-render-inspection",
         version: 1,
         mode,
+        scrollbarStyle,
         input: preparedInput.input,
         resources: state.resourceRecords(),
         diagnostics: state.diagnosticRecords(),
@@ -849,6 +858,7 @@ export async function inspectPreparedInput(
           { width, height, deviceScale },
           preparedState.serialized,
           artifact,
+          scrollbarStyle,
         ),
         motion: Object.freeze({
           kind: "motion-facts",
@@ -885,7 +895,9 @@ export async function inspectAnimationPreparedInput(
       deviceScale = 1,
       renderMode = "standard-dynamic-range",
       graphicsBackend = "auto",
+      scrollbarStyle = "overlay",
     } = inspectionRequest;
+    assertScrollbarStyle(scrollbarStyle, "inspection request");
     if (
       !Number.isFinite(width) || width <= 0 || !Number.isFinite(height) ||
       height <= 0
@@ -916,11 +928,11 @@ export async function inspectAnimationPreparedInput(
         viewportHeight: height,
         deviceScale,
         resolveResource: state.resolveResource,
-        encodePixels: null,
         renderMode: highDynamicRange ? "high-dynamic-range" : undefined,
         renderPrecision: highDynamicRange ? "rgba16float" : undefined,
         capturePaintArtifact: true,
         graphicsBackend,
+        scrollbarStyle,
       },
     );
     try {
@@ -1065,6 +1077,7 @@ export async function inspectAnimationPreparedInput(
         requestedGraphicsBackend: graphicsBackend,
         graphicsBackend: frame.graphicsBackend,
         graphicsBackendInfo: frame.graphicsBackendInfo,
+        scrollbarStyle: surface.scrollbarStyle,
         viewport: Object.freeze({
           width,
           height,
@@ -1086,45 +1099,5 @@ export async function inspectAnimationPreparedInput(
     } finally {
       await surface.shutdown();
     }
-  });
-}
-
-export async function inspectAnimationInput(input, options = {}) {
-  const {
-    preprocessors = [],
-    preprocessor,
-    resolveResource = null,
-    ...inspectionRequest
-  } = options;
-  const preparedInput = await prepareRenderInput(input, {
-    preprocessors,
-    preprocessor,
-    resolveResource,
-  });
-  const session = new DocumentSession(preparedInput);
-  try {
-    return await inspectAnimationPreparedInput(
-      preparedInput,
-      inspectionRequest,
-    );
-  } finally {
-    await session.dispose();
-  }
-}
-
-export async function renderHTMLAnimation(source, options = {}) {
-  const { baseURL = "about:blank", format = "gif", ...renderOptions } = options;
-  if (format !== "gif") {
-    throw new RangeError(
-      `Unsupported animation format ${JSON.stringify(format)}`,
-    );
-  }
-  return await renderAnimationInput({
-    url: new URL(baseURL),
-    bytes: new TextEncoder().encode(String(source)),
-  }, {
-    ...renderOptions,
-    preprocessor: "html",
-    format: "gif",
   });
 }

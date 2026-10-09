@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "variant": { "type": "string", "enum": ["default", "secondary", "outline"] },
+    "size": { "type": "string", "enum": ["default", "sm", "lg"] },
+    "disabled": { "type": "boolean" },
+    "withIcon": { "type": "boolean" }
+  },
+  "required": ["variant", "size", "disabled", "withIcon"],
+  "additionalProperties": false
+}

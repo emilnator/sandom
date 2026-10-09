@@ -1,5 +1,6 @@
 import { enqueueInputRecord, mapPresentedPoint } from "./interaction.js";
 import { quantizeWorkingPixels } from "../output/color-transform.js";
+import { createCanvasPresenter } from "../canvas-presentation.js";
 
 const HTMLElementBase = globalThis.HTMLElement ?? class {};
 const MODES = new Set(["asset", "real"]);
@@ -13,7 +14,9 @@ export class SandomInteractiveRendererElement extends HTMLElementBase {
   #dispatchScheduled = false;
   #activePointerIdentifiers = new Set();
   #canvas;
-  #context;
+  #context = null;
+  #presenter = null;
+  #presenterDevice = null;
 
   constructor() {
     super();
@@ -26,7 +29,6 @@ export class SandomInteractiveRendererElement extends HTMLElementBase {
       <canvas part="canvas" role="img" aria-label="Sandom interactive render"></canvas>
     `;
     this.#canvas = shadowRoot.querySelector("canvas");
-    this.#context = this.#canvas.getContext("2d");
 
     const enqueuePointer = (kind, event) => {
       if (this.#mode !== "real") return;
@@ -162,11 +164,70 @@ export class SandomInteractiveRendererElement extends HTMLElementBase {
     this.#canvas.style.cursor = "default";
   }
 
+  // Presents the target's current output. A texture target (the default)
+  // hands the single layer's GPU texture to a WebGPU canvas presenter with
+  // no readback; a pixel target, or the WebGL 2 fallback, draws its
+  // composited pixels through a 2D context.
   present(output = this.#session?.captureCurrent(this.#target)) {
     if (!output) throw new Error("No current Sandom target frame is available");
-    if (!output.pixels) {
-      throw new Error("The current Sandom target has no readable pixels");
+    const textureLayer = output.pixels
+      ? null
+      : output.layers?.find(({ frame }) => frame?.textureImage?.texture);
+    if (textureLayer) {
+      const { frame } = textureLayer;
+      if (output.layers.length !== 1) {
+        throw new Error(
+          "A texture target presents exactly one placement; attach a pixel target for composited placements",
+        );
+      }
+      this.#presentTexture(frame);
+    } else if (output.pixels) {
+      this.#presentPixels(output);
+    } else {
+      throw new Error("The current Sandom target has no presentable frame");
     }
+    this.dispatchEvent(
+      new CustomEvent("frame", {
+        detail: Object.freeze({
+          target: output.target,
+          presentationRevision: output.presentationRevision,
+          width: output.width,
+          height: output.height,
+        }),
+      }),
+    );
+  }
+
+  #presentTexture(frame) {
+    if (this.#context !== null) {
+      throw new Error(
+        "The canvas already presents pixels; a texture target needs a fresh element",
+      );
+    }
+    if (this.#presenter === null || this.#presenterDevice !== frame.device) {
+      this.#presenter?.destroy();
+      this.#presenter = createCanvasPresenter({
+        canvas: this.#canvas,
+        device: frame.device,
+      });
+      this.#presenterDevice = frame.device;
+    }
+    if (
+      this.#canvas.width !== frame.width || this.#canvas.height !== frame.height
+    ) {
+      this.#canvas.width = frame.width;
+      this.#canvas.height = frame.height;
+    }
+    this.#presenter.present(frame.textureImage);
+  }
+
+  #presentPixels(output) {
+    if (this.#presenter !== null) {
+      throw new Error(
+        "The canvas already presents textures; a pixel target needs a fresh element",
+      );
+    }
+    this.#context ??= this.#canvas.getContext("2d");
     this.#canvas.width = output.width;
     this.#canvas.height = output.height;
     this.#context.putImageData(
@@ -177,16 +238,6 @@ export class SandomInteractiveRendererElement extends HTMLElementBase {
       ),
       0,
       0,
-    );
-    this.dispatchEvent(
-      new CustomEvent("frame", {
-        detail: Object.freeze({
-          target: output.target,
-          presentationRevision: output.presentationRevision,
-          width: output.width,
-          height: output.height,
-        }),
-      }),
     );
   }
 
