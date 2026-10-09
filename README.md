@@ -249,6 +249,29 @@ grows on frames that reused the retained scene. For host time, record
 `performance.now()` in the surface's `requestFrame` callback and again in
 `presentFrame`, and show it outside the rendered document.
 
+## Examples
+
+Complete programs that follow the Performance patterns live in the
+repository's
+[`examples/`](https://github.com/fernandoviac/sandom/tree/main/examples)
+directory. Each imports only this package and pinned public CDNs, and its
+README says how to run it and what it produces.
+
+- [`still-image`](https://github.com/fernandoviac/sandom/tree/main/examples/still-image)
+  — one PNG from a DOM built in the process, on Node or Deno.
+- [`badge-batch`](https://github.com/fernandoviac/sandom/tree/main/examples/badge-batch)
+  — many PNGs from one template on one kept render surface.
+- [`motion-gif`](https://github.com/fernandoviac/sandom/tree/main/examples/motion-gif)
+  — a CSS animation captured to an animated GIF by the surface's own clock.
+- [`react-session`](https://github.com/fernandoviac/sandom/tree/main/examples/react-session)
+  — a React application mounted once in a kept component session.
+- [`code-editor`](https://github.com/fernandoviac/sandom/tree/main/examples/code-editor)
+  — a live editor on a canvas: texture presentation and projected input.
+- [`wikipedia-scroll`](https://github.com/fernandoviac/sandom/tree/main/examples/wikipedia-scroll)
+  — a long, scrolling document on a mesh in a three.js WebGPU scene.
+- [`shatter`](https://github.com/fernandoviac/sandom/tree/main/examples/shatter)
+  — one live, animated document split across many meshes in a three.js scene.
+
 ## Vite component adapter
 
 Install Vite only when the project uses the optional adapter:
