@@ -112,13 +112,28 @@ const presenter = createTexturePresenter({
   },
 });
 
+// The scene draws only when it has something new to show. requestRender
+// asks for one host frame; a request made before the scene exists (the
+// first Sandom frame) is drawn once it does.
+let renderQueued = false;
+let sceneReady = false;
+function requestRender() {
+  if (renderQueued || !sceneReady) return;
+  renderQueued = true;
+  requestAnimationFrame(renderFrame);
+}
+
 const surface = createRenderSurface(root, {
   viewportWidth: DOCUMENT_WIDTH,
   viewportHeight: DOCUMENT_HEIGHT,
   deviceScale: TEXTURE_SCALE,
   createPersistentRenderer: (options) =>
     createSceneRenderer({ ...options, graphicsDevice: device }),
-  presentFrame: presenter.presentFrame,
+  // A presented frame lands in the texture the scene samples; draw it.
+  presentFrame(frame) {
+    presenter.presentFrame(frame);
+    requestRender();
+  },
 });
 await surface.renderNow(); // input needs a presented frame
 surface.start();
@@ -358,6 +373,7 @@ function shatter(impact) {
   reassembleButton.disabled = false;
   playbackStep = 0;
   playing = true;
+  requestRender();
   intact = false;
   hint.textContent = "The shards are live: click a toggle's row on any of them.";
 }
@@ -380,6 +396,7 @@ reassembleButton.addEventListener("click", () => {
   if (intact) return;
   playing = false;
   reassembling = true;
+  requestRender();
   reassembleButton.disabled = true;
   hint.textContent = "Rewinding.";
 });
@@ -478,9 +495,9 @@ bindProjectedInput({
 //
 // The scene renders when it has something new to show: a frame Sandom
 // presented into the shared texture, a step of the fall, a camera move, or
-// a resize. Event handlers change the document; the surface's own loop
-// renders it.
-
+// a resize. Each of those requests a host frame; an idle page requests
+// none. Event handlers change the document; the surface's own loop renders
+// it.
 let sceneDirty = true;
 let cameraMoving = false;
 let presentedFrames = 0;
@@ -494,11 +511,13 @@ function resize() {
   threeRenderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   threeRenderer.setSize(width, height, false);
   sceneDirty = true;
+  requestRender();
 }
 new ResizeObserver(resize).observe(canvas);
 resize();
 
 function renderFrame() {
+  renderQueued = false;
   if (playing) {
     playbackStep++;
     applyStep(playbackStep);
@@ -543,9 +562,11 @@ function renderFrame() {
         `${presenter.frames} Sandom frames · ${sceneFrames} scene frames`;
     }
   }
-  requestAnimationFrame(renderFrame);
+  // The fall and the camera ease advance one step per host frame.
+  if (playing || reassembling || cameraMoving) requestRender();
 }
-requestAnimationFrame(renderFrame);
+sceneReady = true;
+requestRender();
 
 notice.hidden = true;
 

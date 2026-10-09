@@ -1597,13 +1597,6 @@ export const CMD_RECT_FLAG_AREA_COVERAGE = 0x20;
 // activity/reports/REPORT-2026-10-07-resolved-bug-records.md). The raster plan
 // carries it to the rect shader as bit 17 of the styles word.
 export const CMD_RECT_FLAG_SVG_STROKE = 0x40;
-// A text decoration line: its y is the text's unsnapped baseline plus a
-// whole-CSS-pixel offset, and the raster plan snaps that y to the device
-// pixel grid, round half up, as it snaps the text run's baseline. The line
-// then keeps its place below or through the glyphs at every device scale:
-// Chrome derives each decoration from the rounded text origin, so a box
-// top of 20.5 moves the glyphs and all three decorations together.
-export const CMD_RECT_FLAG_TEXT_BASELINE = 0x80;
 
 // Byte size / gradient-extension offset for a CMD_RECT record, given its
 // two independent flag bits. The ONLY functions that should ever compute

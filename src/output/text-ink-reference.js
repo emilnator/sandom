@@ -8,12 +8,10 @@
 // the GPU, so a defect in the renderer's glyph path is visible against it.
 // For SVG fills the module parses the path data itself.
 //
-// Glyphs sit where the display list places them: each glyph's position,
-// unrounded, in the renderer's f32 arithmetic, under the command's affine
-// when it carries one (SVG text, CSS transforms). The text command's
-// baseline snaps to the whole device pixel, round half up, when the affine
-// maps the x axis onto the device x axis, as the raster plan snaps it
-// (`$rasterPlanPackTextRun`).
+// Glyphs sit where the display list places them: the text command's
+// baseline and each glyph's position, unrounded, in the renderer's f32
+// arithmetic, under the command's affine when it carries one (SVG text,
+// CSS transforms).
 
 import { instantiate } from "../wasm/text-ink-reference-binary.js";
 import { createGlyphOutlineSource } from "../shaping.js";
@@ -103,17 +101,6 @@ function composeAffine([a, b, c, d, e, f], deviceScale, [pa, pb, pc, pd, pe, pf]
   ];
 }
 
-// The device-pixel shift the raster plan gives a text run's baseline: the
-// device y of the baseline rounded half up, less that y, when the affine
-// keeps the x axis horizontal; otherwise none.
-function baselineSnap(transform, deviceScale, baselineY) {
-  if (transform === null) return Math.floor(baselineY + 0.5) - baselineY;
-  const [, b, , d, , f] = transform;
-  if (b !== 0 || d === 0) return 0;
-  const deviceY = f32(f32(f32(d) * baselineY) + f32(f * deviceScale));
-  return f32(Math.floor(deviceY + 0.5) - deviceY);
-}
-
 export function createTextInkReference() {
   const exports = instantiate({}).exports;
   const outlineSources = new Map();
@@ -174,7 +161,6 @@ export function createTextInkReference() {
       const { x: textX, y: textY, baseline } = command.geometry;
       const baselineY = f32(f32(f32(textY * deviceScale)) + f32(baseline * deviceScale));
       const deviceTextX = f32(textX * deviceScale);
-      const snap = baselineSnap(command.transform, deviceScale, baselineY);
       for (let glyphIndex = 0; glyphIndex < command.glyphIds.length; glyphIndex++) {
         const glyphId = command.glyphIds[glyphIndex];
         if (glyphId === 0xFFFF) continue;
@@ -188,7 +174,6 @@ export function createTextInkReference() {
           f32(deviceTextX + f32(command.glyphPositions[glyphIndex] * deviceScale)), baselineY,
         ];
         const transform = command.transform === null ? placement : composeAffine(command.transform, deviceScale, placement);
-        transform[5] += snap;
         yield { label: `${label}, glyph ${glyphId}`, verbs, transform, fieldKey: glyphFieldKey(command.fontSize, upem) };
       }
     }

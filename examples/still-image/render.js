@@ -1,10 +1,13 @@
 // One PNG from a DOM built in the process: a release card with a heading, a
-// paragraph, and a two-column table, styled by an ordinary stylesheet.
+// paragraph, and a two-column table, styled by an ordinary stylesheet. Then
+// more cards from the same kept surface: each changes two text nodes and a
+// class, and each frame costs what those nodes changed.
 //
 //   node render.js            (after npm install)
 //   deno run -A render.js     (after deno install)
 //
-// Writes release-card.png to the working directory.
+// Writes release-card.png, release-card-beta.png and
+// release-card-nightly.png to the working directory.
 
 import { createRenderSurface, createSandomDOM, encodeImage, loadFont } from "sandom";
 import { writeFile } from "node:fs/promises";
@@ -47,6 +50,8 @@ root.innerHTML = `
       border-radius: 999px; background: #3366d9; font-size: 12px;
       vertical-align: 4px;
     }
+    .badge.beta { background: #b7791f; }
+    .badge.nightly { background: #7b4bd1; }
   </style>
   <h1>Release card<span class="badge">stable</span></h1>
   <p>A DOM tree built in this process, laid out by Sandom's engine, and
@@ -54,7 +59,7 @@ root.innerHTML = `
   <table>
     <tr><td>Layout</td><td>WebAssembly</td></tr>
     <tr><td>Raster</td><td>WebGPU</td></tr>
-    <tr><td>Output</td><td>PNG, ${WIDTH} × ${HEIGHT}</td></tr>
+    <tr><td>Version</td><td class="version">0.5.0</td></tr>
   </table>
 `;
 
@@ -68,6 +73,40 @@ const frame = await surface.renderNow({ pixels: true });
 const png = await encodeImage(frame, { format: "png" });
 await writeFile("release-card.png", png);
 console.log(`wrote release-card.png (${frame.width}×${frame.height}, ${png.byteLength} bytes)`);
+
+// Many images from one kept surface. The card is not built again: keep the
+// nodes that differ between images, set their text and the badge's class,
+// and render. The class goes on the badge, not the root: a class on the
+// root restyles every element under it. The surface keeps its layout,
+// glyphs and GPU target, so each image after the first pays only for the
+// nodes it changed; a new document or a new surface per image pays for the
+// whole card again.
+const badge = root.querySelector(".badge");
+const channel = badge.firstChild;
+const version = root.querySelector(".version").firstChild;
+for (const release of [
+  { channel: "beta", version: "0.6.0-beta.2" },
+  { channel: "nightly", version: "0.6.0-nightly.1009" },
+]) {
+  badge.className = `badge ${release.channel}`;
+  channel.data = release.channel;
+  version.data = release.version;
+  const started = performance.now();
+  const next = await surface.renderNow({ pixels: true });
+  const milliseconds = performance.now() - started;
+  const name = `release-card-${release.channel}.png`;
+  await writeFile(name, await encodeImage(next, { format: "png" }));
+  console.log(
+    `wrote ${name} in ${milliseconds.toFixed(1)} ms, ` +
+      `${next.dirtyRectangles.length} dirty ${next.dirtyRectangles.length === 1 ? "rectangle" : "rectangles"}`,
+  );
+}
+
+// serializations and layoutPasses count frames that built the scene from
+// the tree again or ran a separate layout pass; retainedCleanFrames counts
+// frames that reused the retained scene as it was.
+const { serializations, layoutPasses, retainedCleanFrames } = surface.frameStageCounters;
+console.log({ serializations, layoutPasses, retainedCleanFrames });
 
 await surface.shutdown();
 for (const font of fonts) font.unload();

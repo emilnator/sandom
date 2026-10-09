@@ -257,20 +257,25 @@ repository's
 directory. Each imports only this package and pinned public CDNs, and its
 README says how to run it and what it produces.
 
-- [`still-image`](https://github.com/fernandoviac/sandom/tree/main/examples/still-image)
-  — one PNG from a DOM built in the process, on Node or Deno.
-- [`badge-batch`](https://github.com/fernandoviac/sandom/tree/main/examples/badge-batch)
-  — many PNGs from one template on one kept render surface.
-- [`motion-gif`](https://github.com/fernandoviac/sandom/tree/main/examples/motion-gif)
-  — a CSS animation captured to an animated GIF by the surface's own clock.
-- [`react-session`](https://github.com/fernandoviac/sandom/tree/main/examples/react-session)
-  — a React application mounted once in a kept component session.
+- [`book`](https://github.com/fernandoviac/sandom/tree/main/examples/book)
+  — books with physics-turned pages in a WebGPU scene, printed from a live
+  HTML and CSS document you can edit, replace, and type into on the paper.
+- [`live-list`](https://github.com/fernandoviac/sandom/tree/main/examples/live-list)
+  — a task list on a canvas whose items are inserted, removed, reordered,
+  and expanded while shown, with each change's measured cost beside it.
 - [`code-editor`](https://github.com/fernandoviac/sandom/tree/main/examples/code-editor)
   — a live editor on a canvas: texture presentation and projected input.
 - [`wikipedia-scroll`](https://github.com/fernandoviac/sandom/tree/main/examples/wikipedia-scroll)
   — a long, scrolling document on a mesh in a three.js WebGPU scene.
 - [`shatter`](https://github.com/fernandoviac/sandom/tree/main/examples/shatter)
   — one live, animated document split across many meshes in a three.js scene.
+- [`still-image`](https://github.com/fernandoviac/sandom/tree/main/examples/still-image)
+  — one PNG from a DOM built in the process, then more from the same kept
+  surface, on Node or Deno.
+- [`motion-gif`](https://github.com/fernandoviac/sandom/tree/main/examples/motion-gif)
+  — a CSS animation captured to an animated GIF by the surface's own clock.
+- [`react-session`](https://github.com/fernandoviac/sandom/tree/main/examples/react-session)
+  — a React application mounted once in a kept component session.
 
 ## Vite component adapter
 
