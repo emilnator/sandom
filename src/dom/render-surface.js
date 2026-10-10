@@ -2737,8 +2737,9 @@ class DOMRenderSurface {
   // computeLayoutBoxes (src/dom/live-geometry.js): the next frame under
   // the same style generation, resource revision and viewport takes it
   // instead of serializing again. One is held at a time; a newer offer
-  // or a mismatch releases it.
-  _offerSyncLayout(layout, styleGeneration, resourceRevision, scrollRevision) {
+  // or a mismatch releases it. A provisional one (an image in it hadn't
+  // loaded) answers getters but is never the frame's.
+  _offerSyncLayout(layout, styleGeneration, resourceRevision, scrollRevision, provisional = false) {
     if (this._shutdown || this._pseudoContentAnimations.size > 0) return false;
     const held = this._syncLayout;
     if (held !== null) {
@@ -2760,6 +2761,7 @@ class DOMRenderSurface {
       styleGeneration,
       resourceRevision,
       scrollRevision,
+      provisional,
       frameSequence: this._frameSequence,
       timeMilliseconds: this._now(),
     };
@@ -2798,6 +2800,7 @@ class DOMRenderSurface {
     this._syncLayout = null;
     const { layout, timeMilliseconds } = held;
     if (
+      !held.provisional &&
       held.styleGeneration === styleGeneration &&
       held.resourceRevision === resourceRevision &&
       layout.viewport.width === viewport.width &&

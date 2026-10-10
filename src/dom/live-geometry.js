@@ -89,9 +89,10 @@ export function computeLayoutBoxes(
       nodes: serialized.nodes,
       imageSources: serialized.imageSources,
     };
+    const loading = { images: false };
     const boxes = runtimeLayoutTreeBoxesSync(
       scene,
-      engineWriteOwner === null ? {} : { engineWriteOwner },
+      engineWriteOwner === null ? { loading } : { engineWriteOwner, loading },
     );
     // A cold font can invalidate both resource and computed-style generations.
     // Keep the original envelope; only fresh serialization and layout can
@@ -108,7 +109,9 @@ export function computeLayoutBoxes(
     // A live surface takes the serialization: its next frame reuses it
     // instead of serializing the same tree again (the "scrollTop =
     // scrollHeight" pattern paid two serializations per line appended).
-    if (surfaceViewport !== undefined && root._renderSurface?._offerSyncLayout?.(layout, revisions.document, resource, scroll)) {
+    // A layout with an image still to load is provisional: it answers
+    // other getters, but the next frame lays out again.
+    if (surfaceViewport !== undefined && root._renderSurface?._offerSyncLayout?.(layout, revisions.document, resource, scroll, loading.images)) {
       layout.ownedBySurface = true;
     }
     return layout;
