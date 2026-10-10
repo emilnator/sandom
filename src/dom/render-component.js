@@ -9,6 +9,7 @@ import {
   normalizeComponentEnvironmentOptions,
 } from "./component-environment.js";
 import { createSandomDOM } from "./sandom-dom.js";
+import { releaseEventHandlers } from "./node.js";
 import { normalizeInputBatch } from "./interaction.js";
 import { createPreparedDocument } from "./prepared-document.js";
 import { SandomViewport } from "./viewport.js";
@@ -754,6 +755,13 @@ export async function renderComponent(
               collectCleanupError(cleanupErrors, error);
             }
           }
+          if (globalsInstalled) {
+            try {
+              releaseEventHandlers(globalThis);
+            } catch (error) {
+              collectCleanupError(cleanupErrors, error);
+            }
+          }
           if (globalsInstalled && restoreAmbientGlobals) {
             try {
               restoreAmbientGlobalDescriptors(previousGlobalDescriptors);
@@ -827,6 +835,11 @@ export async function renderComponent(
       }
     }
     if (globalsInstalled) {
+      try {
+        releaseEventHandlers(globalThis);
+      } catch (error) {
+        collectCleanupError(cleanupErrors, error);
+      }
       try {
         restoreAmbientGlobalDescriptors(previousGlobalDescriptors);
       } catch (error) {
