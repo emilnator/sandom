@@ -216,6 +216,7 @@ export async function renderComponent(
   const abortController = new AbortController();
   let preparedDocument = null;
   let surface = null;
+  let paused = false;
   let mountDispose = null;
   let globalsInstalled = false;
   let componentEnvironment = null;
@@ -514,7 +515,7 @@ export async function renderComponent(
         if (backgroundException !== null) throw thrownBackgroundException();
         return currentFrame;
       } finally {
-        if (!disposeRequested) surface.start();
+        if (!disposeRequested && !paused) surface.start();
       }
     };
 
@@ -662,6 +663,24 @@ export async function renderComponent(
           globalThis.dispatchEvent(new Event("resize"));
           globalThis.visualViewport.dispatchEvent(new Event("resize"));
           return await renderCurrentSurface();
+        });
+      },
+      // Stops the session's live loop, as a browser stops rendering a
+      // hidden page: no animation frames or transitions advance until
+      // resume(). render() and the other operations still paint a frame on
+      // request, and that frame delivers observers as usual. Timers the
+      // page set keep running.
+      pause() {
+        return runOperation(async () => {
+          paused = true;
+          surface.stop();
+          await surface.whenIdle();
+        });
+      },
+      resume() {
+        return runOperation(() => {
+          paused = false;
+          surface.start();
         });
       },
       subscribe(listener) {
