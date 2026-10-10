@@ -25,6 +25,13 @@ function positiveDimension(value, name) {
   return number;
 }
 
+function colorSchemeOption(value) {
+  if (value !== null && value !== "light" && value !== "dark") {
+    throw new RangeError(`Unknown display.colorScheme ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 function readinessPromise(value, name) {
   if (value === undefined) return null;
   if (
@@ -116,7 +123,7 @@ export async function renderComponent(
     throw new TypeError("renderComponent display must be an object");
   }
   for (const key of Object.keys(display)) {
-    if (key !== "colorGamut" && key !== "dynamicRange") {
+    if (key !== "colorGamut" && key !== "dynamicRange" && key !== "colorScheme") {
       throw new TypeError(`Unknown display option ${String(key)}`);
     }
   }
@@ -138,6 +145,9 @@ export async function renderComponent(
       `Unknown display.dynamicRange ${JSON.stringify(displayDynamicRange)}`,
     );
   }
+  // The user's preferred color scheme: (prefers-color-scheme) answers
+  // from it, from the first style resolution on.
+  const displayColorScheme = colorSchemeOption(display.colorScheme ?? null);
   const callerReportException = options.reportException ?? null;
   if (
     callerReportException !== null &&
@@ -244,12 +254,16 @@ export async function renderComponent(
         }),
     );
     const document = preparedDocument.document;
-    if (displayColorGamut !== null || displayDynamicRange !== null) {
+    if (
+      displayColorGamut !== null || displayDynamicRange !== null ||
+      displayColorScheme !== null
+    ) {
       document._styleSystem.setEnvironment({
         ...(displayColorGamut === null ? {} : { colorGamut: displayColorGamut }),
         ...(displayDynamicRange === null
           ? {}
           : { dynamicRange: displayDynamicRange }),
+        ...(displayColorScheme === null ? {} : { colorScheme: displayColorScheme }),
       });
     }
     const html = document.createElement("html");
@@ -661,6 +675,27 @@ export async function renderComponent(
           componentEnvironment.viewportDidResize();
           globalThis.dispatchEvent(new Event("resize"));
           globalThis.visualViewport.dispatchEvent(new Event("resize"));
+          return await renderCurrentSurface();
+        });
+      },
+      // Changes the user's preferences the session was created with, as
+      // a browser does when they change: CSS restyles, and each media
+      // query list whose state changed fires "change".
+      setDisplay(changes) {
+        return runOperation(async () => {
+          if (!changes || typeof changes !== "object" || Array.isArray(changes)) {
+            throw new TypeError("setDisplay changes must be an object");
+          }
+          for (const key of Reflect.ownKeys(changes)) {
+            if (key !== "colorScheme") {
+              throw new TypeError(`Unknown setDisplay option ${String(key)}`);
+            }
+          }
+          const colorScheme = colorSchemeOption(changes.colorScheme ?? null);
+          if (colorScheme !== null) {
+            document._styleSystem.setEnvironment({ colorScheme });
+            document._reevaluateMediaQueryLists?.();
+          }
           return await renderCurrentSurface();
         });
       },
