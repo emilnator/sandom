@@ -101,10 +101,27 @@ const restyleRefusalCounters = Object.freeze({
   fragments: "geometryRestyleRefusedFragments",
 });
 
+// A host without animation frames (Deno, Node, Bun) gets them from a timer at
+// a 60 Hz display's rate, on its vsync grid: a live loop doesn't render on
+// every turn of the event loop.
+const HOST_FRAME_INTERVAL = 1000 / 60;
+let lastHostFrameBoundary = -Infinity;
 const requestHostAnimationFrame =
   typeof globalThis.requestAnimationFrame === "function"
     ? globalThis.requestAnimationFrame.bind(globalThis)
-    : (callback) => setTimeout(() => callback(performance.now()), 0);
+    : (callback) => {
+      const now = performance.now();
+      // The next vsync, but never one a frame already took: a timer that
+      // fires a little early doesn't make a second frame in its interval.
+      const next = Math.max(
+        Math.ceil(now / HOST_FRAME_INTERVAL) * HOST_FRAME_INTERVAL,
+        lastHostFrameBoundary + HOST_FRAME_INTERVAL,
+      );
+      return setTimeout(() => {
+        lastHostFrameBoundary = Math.max(lastHostFrameBoundary, next);
+        callback(performance.now());
+      }, next - now);
+    };
 const renderSurfaceNow = globalThis.performance.now.bind(
   globalThis.performance,
 );
