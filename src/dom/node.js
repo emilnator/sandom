@@ -1216,6 +1216,64 @@ export class SDHTMLIFrameElement extends SDHTMLElement {
   }
 }
 
+export class SDHTMLImageElement extends SDHTMLElement {
+  constructor(tag = "img", ownerDocument = null) {
+    super(tag, HTML_NS, ownerDocument);
+  }
+}
+
+export class SDHTMLSourceElement extends SDHTMLElement {
+  constructor(tag = "source", ownerDocument = null) {
+    super(tag, HTML_NS, ownerDocument);
+  }
+}
+
+// Reflected content attributes (HTML "Reflecting content attributes in IDL
+// attributes"): a URL resolves against the document's base URL and reads ""
+// when absent; an unsigned long reads 0 when absent, invalid or out of range.
+function reflectAttributes(prototype, { urls = [], strings = [], unsignedLongs = [] }) {
+  const define = (name, get, set) =>
+    Object.defineProperty(prototype, name, { configurable: true, get, set });
+  const setter = (name) => function (value) {
+    this.setAttribute(name, String(value));
+  };
+  for (const name of urls) {
+    define(name, function () {
+      const value = this.getAttribute(name);
+      if (value === null) return "";
+      try {
+        return new URL(value, this.ownerDocument.baseURI).href;
+      } catch {
+        return value;
+      }
+    }, setter(name));
+  }
+  for (const name of strings) {
+    define(name, function () {
+      return this.getAttribute(name) ?? "";
+    }, setter(name));
+  }
+  for (const name of unsignedLongs) {
+    define(name, function () {
+      const value = Number.parseInt(this.getAttribute(name) ?? "", 10);
+      return value >= 0 && value <= 0x7FFFFFFF ? value : 0;
+    }, function (value) {
+      const number = Number(value) >>> 0;
+      this.setAttribute(name, String(number <= 0x7FFFFFFF ? number : 0));
+    });
+  }
+}
+reflectAttributes(SDHTMLImageElement.prototype, {
+  urls: ["src"],
+  strings: ["srcset", "sizes", "alt"],
+  unsignedLongs: ["width", "height"],
+});
+reflectAttributes(SDHTMLSourceElement.prototype, {
+  urls: ["src"],
+  strings: ["srcset", "sizes", "media", "type"],
+  unsignedLongs: ["width", "height"],
+});
+
 class SDTreeWalker {
   constructor(root, whatToShow = 0xFFFFFFFF, filter = null) {
     this.root = root;
@@ -1475,6 +1533,7 @@ const elementFamily = createElementFamily({
   SDElement, SDHTMLElement, SDSVGElement, SDHTMLTemplateElement,
   SDHTMLButtonElement, SDHTMLCanvasElement, SDHTMLFormElement, SDHTMLInputElement,
   SDHTMLSelectElement, SDHTMLScriptElement, SDHTMLIFrameElement,
+  SDHTMLImageElement, SDHTMLSourceElement,
 });
 
 installNodeBindings({ addListener, removeListener, dispatchNativeEvent }, SDNode.prototype);
