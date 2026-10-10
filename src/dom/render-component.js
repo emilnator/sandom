@@ -302,6 +302,12 @@ export async function renderComponent(
         componentEnvironment,
       );
     });
+    const createPersistentRenderer = (rendererOptions) =>
+      (document._sandomSceneRendererRuntime?.createSceneRenderer ??
+        createSceneRenderer)({
+        ...rendererOptions,
+        graphicsDevice: document._preferredCanvasDevice ?? undefined,
+      });
     surface = backend.createRenderSurface(document.documentElement, {
       capturePaintArtifact: true,
       graphicsBackend,
@@ -318,14 +324,27 @@ export async function renderComponent(
       // webgl2 fallback). Pixels are an explicit request through
       // session.render({ pixels: true }).
       presentFrame,
-      createPersistentRenderer: (rendererOptions) =>
-        (document._sandomSceneRendererRuntime?.createSceneRenderer ??
-          createSceneRenderer)({
-          ...rendererOptions,
-          graphicsDevice: document._preferredCanvasDevice ?? undefined,
-        }),
+      createPersistentRenderer,
     });
     surface.stop();
+    // A surface for one capture of the page taller than the viewport: a
+    // follower over the same document, so the window, its media query
+    // lists and its observers stay with the session's surface.
+    const createCaptureSurface = (height) =>
+      backend.createRenderSurface(document.documentElement, {
+        graphicsBackend,
+        resolveResource: preparedDocument.resolveResource,
+        viewport: new SandomViewport({
+          width: surface.viewport.width,
+          height,
+          deviceScale: surface.viewport.deviceScale,
+        }),
+        initializePersistentRenderer: false,
+        ...(displayDynamicRange === "high"
+          ? { renderMode: "high-dynamic-range" }
+          : {}),
+        createPersistentRenderer,
+      });
     const identifyNode = (node) => {
       let identifier = nodeIdentifiers.get(node);
       if (!identifier) {
@@ -717,6 +736,58 @@ export async function renderComponent(
             document._reevaluateMediaQueryLists?.();
           }
           return await renderCurrentSurface();
+        });
+      },
+      // Pixels of the page `height` CSS pixels tall from its top, as a
+      // browser's full-page screenshot paints beyond the viewport: the
+      // viewport keeps its size, so the page hears of nothing - no resize
+      // event, media query change, observer callback, animation frame or
+      // animation event. The frame is a still: its pixels, without the
+      // renderer's texture.
+      capture(request) {
+        return runOperation(async () => {
+          if (!request || typeof request !== "object" || Array.isArray(request)) {
+            throw new TypeError("capture request must be an object");
+          }
+          for (const key of Reflect.ownKeys(request)) {
+            if (key !== "height") {
+              throw new TypeError(`Unknown capture request option ${String(key)}`);
+            }
+          }
+          const height = positiveDimension(request.height, "height");
+          surface.stop();
+          await surface.whenIdle();
+          const suppressed = document._suppressAuthoredCallbacks;
+          document._suppressAuthoredCallbacks = true;
+          let capture = null;
+          try {
+            if (height !== surface.viewport.height) {
+              capture = createCaptureSurface(height);
+              capture.stop();
+              capture._suppressAnimationEvents = true;
+            }
+            const frame = await (capture ?? surface).renderNow({
+              pixels: true,
+              _deliverObservers: false,
+            });
+            if (!frame) throw new Error("The capture surface did not produce a frame");
+            const { textureImage: _texture, device: _device, ...still } = frame;
+            return Object.freeze(still);
+          } finally {
+            document._suppressAuthoredCallbacks = suppressed;
+            try {
+              await capture?.shutdown();
+            } finally {
+              // The capture surface set the document's style environment
+              // to its own viewport; a layout read before the next frame
+              // answers for the session's again.
+              document._styleSystem.setEnvironment({
+                viewportWidth: surface.viewport.width,
+                viewportHeight: surface.viewport.height,
+              });
+              if (!disposeRequested && !paused) surface.start();
+            }
+          }
         });
       },
       subscribe(listener) {

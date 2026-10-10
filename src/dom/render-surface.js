@@ -1296,6 +1296,7 @@ class DOMRenderSurface {
     this._pendingScrollSources = new NativeScrollCollection(this, 0);
     this._pendingScrollEndTargets = new NativeScrollCollection(this, 1);
     this._capturingFrames = false;
+    this._suppressAnimationEvents = false;
     this._pendingSnapOrigins = new NativeScrollCollection(this, 2);
     this._snappedTargets = new NativeScrollCollection(this, 3);
     this._snapCheckPending = false;
@@ -2495,6 +2496,9 @@ class DOMRenderSurface {
   // element of its node; the animation or transition that owns the track
   // acknowledges it.
   _dispatchEngineAnimationEvent(record) {
+    // A capture surface (component capture()) renders the page once for a
+    // still; the page's animations are the session surface's to report.
+    if (this._suppressAnimationEvents) return;
     const element = (this._eventElementAtIndex ?? this._elementAtIndex)[
       record.nodeIndex
     ];
@@ -2613,6 +2617,7 @@ class DOMRenderSurface {
     snapshotPixels = true,
     pixelReadback = false,
     transaction = null,
+    deliverObservers = true,
   ) {
     if (this._frameTransaction && this._frameTransaction !== transaction) {
       return Promise.resolve(this._lastDeliveredFrame);
@@ -2636,7 +2641,7 @@ class DOMRenderSurface {
       forceDelivery,
       snapshotPixels,
       true,
-      true,
+      deliverObservers,
       pixelReadback,
     );
   }
@@ -5043,7 +5048,7 @@ class DOMRenderSurface {
   // WebGPU (no readback); `pixels: true` reads this frame back into a
   // retained CPU snapshot for encoding or inspection. WebGL 2 always
   // delivers pixels.
-  renderNow({ pixels = false, _transaction = null } = {}) {
+  renderNow({ pixels = false, _transaction = null, _deliverObservers = true } = {}) {
     if (this._shutdown) throw new Error("render surface is shut down");
     return this._renderOpportunity(
       this._now(),
@@ -5051,6 +5056,7 @@ class DOMRenderSurface {
       true,
       pixels,
       _transaction,
+      _deliverObservers,
     );
   }
 
