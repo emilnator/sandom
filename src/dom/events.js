@@ -37,7 +37,7 @@ function targetBinding(target, core = targetCore(target)) {
   let targets = targetsByCore.get(core);
   if (!targets) targetsByCore.set(core, targets = new Map());
   targets.set(handle, new WeakRef(target));
-  targetFinalizer.register(target, { core, handle });
+  targetFinalizer.register(target, { core, handle }, binding);
   core.eventDisposalHandler ??= prepareEventDisposal;
   return binding;
 }
@@ -76,6 +76,27 @@ function prepareEventDisposal(core, documentHandle) {
       }
     }
   };
+}
+
+// Drops every listener registered on a target that outlives its document,
+// such as the realm's global a component session installs its window on:
+// prepareEventDisposal releases only targets that belong to a document.
+export function releaseEventTarget(target, core = targetCore(target)) {
+  const bindings = bindingsByCore.get(core);
+  const binding = bindings?.get(target);
+  if (!binding) return;
+  // Removed one by one, as removeEventListener does, so that a dispatch
+  // suspended in an async listener skips them when it resumes.
+  for (const [handle, entry] of [...binding.registrations]) {
+    if (!binding.registrations.has(handle)) continue;
+    const { callback } = binding.callbacks.get(entry.identity);
+    removeListener(binding, entry.eventType, callback, entry.capture);
+    releaseRegistration(binding, handle);
+  }
+  bindings.delete(target);
+  targetsByCore.get(core)?.delete(binding.handle);
+  targetFinalizer.unregister(binding);
+  core.status("event_target_release", binding.handle);
 }
 
 function normalizeOptions(options) {
@@ -132,7 +153,13 @@ function addListener(target, eventType, callback, normalized) {
   retained.references++;
   binding.callbacks.set(identity, retained);
   binding.identities.set(callback, identity);
-  const entry = { identity, signal: normalized.signal, abortHandler: null };
+  const entry = {
+    identity,
+    eventType,
+    capture: normalized.capture,
+    signal: normalized.signal,
+    abortHandler: null,
+  };
   binding.registrations.set(handle, entry);
   if (entry.signal) {
     entry.abortHandler = () =>

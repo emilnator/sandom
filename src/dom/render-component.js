@@ -13,6 +13,7 @@ import { normalizeInputBatch } from "./interaction.js";
 import { createPreparedDocument } from "./prepared-document.js";
 import { SandomViewport } from "./viewport.js";
 import { buildAccessibilitySnapshot } from "./accessibility.js";
+import { releaseEventTarget } from "./events.js";
 import { prepareNativeWebgl2Host } from "../native-webgl2-adapter.js";
 import { createSceneRenderer } from "../scene-renderer.js";
 import { validateClosedRecord } from "../closed-record.js";
@@ -754,6 +755,16 @@ export async function renderComponent(
               collectCleanupError(cleanupErrors, error);
             }
           }
+          if (globalsInstalled) {
+            // The session's window is the realm's global, which outlives
+            // it: its listeners go with the session, as a page's window's
+            // go with the page.
+            try {
+              releaseEventTarget(globalThis, preparedDocument.document._domCore);
+            } catch (error) {
+              collectCleanupError(cleanupErrors, error);
+            }
+          }
           if (globalsInstalled && restoreAmbientGlobals) {
             try {
               restoreAmbientGlobalDescriptors(previousGlobalDescriptors);
@@ -827,6 +838,11 @@ export async function renderComponent(
       }
     }
     if (globalsInstalled) {
+      try {
+        releaseEventTarget(globalThis, preparedDocument.document._domCore);
+      } catch (error) {
+        collectCleanupError(cleanupErrors, error);
+      }
       try {
         restoreAmbientGlobalDescriptors(previousGlobalDescriptors);
       } catch (error) {
