@@ -476,6 +476,8 @@ export async function renderComponent(
     let disposalPromise = null;
     let disposalRestoreAmbientGlobals = null;
     let operationChain = Promise.resolve();
+    // Ends the captureFrames() iteration that holds the operation chain.
+    let endFrameCapture = null;
     let firstFrameRecorded = false;
 
     const runOperation = (operation) => {
@@ -484,6 +486,11 @@ export async function renderComponent(
       }
       if (backgroundException !== null) {
         return Promise.reject(thrownBackgroundException());
+      }
+      if (endFrameCapture !== null) {
+        return Promise.reject(
+          new Error("A frame capture is active; end its iteration first"),
+        );
       }
       const result = operationChain.then(operation, operation);
       operationChain = result.then(() => undefined, () => undefined);
@@ -664,6 +671,54 @@ export async function renderComponent(
           return await renderCurrentSurface();
         });
       },
+      // The motion of the current frame: its animations and transitions,
+      // and whether they are finite, periodic or unbounded.
+      inspectMotion() {
+        return runOperation(async () => {
+          await renderCurrentSurface();
+          return surface.inspectMotion();
+        });
+      },
+      // Frames of the motion from the current frame on, on the motion's
+      // own clock rather than the live loop's, as a render surface's
+      // captureFrames(): the capture holds the session from the first
+      // next() until the iteration ends, and other operations reject
+      // meanwhile; dispose() ends it. Each frame's pixels are borrowed
+      // until the next.
+      captureFrames(request = {}) {
+        return (async function* () {
+          let started;
+          let finish;
+          const ready = new Promise((resolve) => started = resolve);
+          const finished = new Promise((resolve) => finish = resolve);
+          const operation = runOperation(async () => {
+            await renderCurrentSurface();
+            surface.stop();
+            await surface.whenIdle();
+            endFrameCapture = finish;
+            started();
+            try {
+              await finished;
+            } finally {
+              endFrameCapture = null;
+              if (!disposeRequested) surface.start();
+            }
+          });
+          const frames = surface.captureFrames(request);
+          try {
+            await Promise.race([ready, operation]);
+            while (!disposeRequested) {
+              const { value, done } = await frames.next();
+              if (done || disposeRequested) break;
+              yield value;
+            }
+          } finally {
+            await frames.return();
+            finish();
+            await operation;
+          }
+        })();
+      },
       subscribe(listener) {
         if (typeof listener !== "function") {
           throw new TypeError("subscribe listener must be a function");
@@ -716,6 +771,7 @@ export async function renderComponent(
         }
         disposalRestoreAmbientGlobals = restoreAmbientGlobals;
         disposeRequested = true;
+        endFrameCapture?.();
         disposalPromise = (async () => {
           await operationChain;
           const cleanupErrors = [];
