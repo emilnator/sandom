@@ -2187,6 +2187,8 @@ export function createElementFamily(runtime) {
             case "select": return runtime.SDHTMLSelectElement.prototype;
             case "script": return runtime.SDHTMLScriptElement.prototype;
             case "iframe": return runtime.SDHTMLIFrameElement.prototype;
+            case "img": return runtime.SDHTMLImageElement.prototype;
+            case "source": return runtime.SDHTMLSourceElement.prototype;
             default: return runtime.SDHTMLElement.prototype;
           }
         default: return runtime.SDElement.prototype;
@@ -2207,6 +2209,8 @@ export function createElementFamily(runtime) {
             case "select": return new runtime.SDHTMLSelectElement("select", document);
             case "script": return new runtime.SDHTMLScriptElement("script", document);
             case "iframe": return new runtime.SDHTMLIFrameElement("iframe", document);
+            case "img": return new runtime.SDHTMLImageElement("img", document);
+            case "source": return new runtime.SDHTMLSourceElement("source", document);
             default: return new runtime.SDHTMLElement(tag, namespaceURI, document);
           }
         default: return new runtime.SDElement(tag, namespaceURI, document);

@@ -7,9 +7,11 @@ import {
   SDHTMLElement,
   SDHTMLFormElement,
   SDHTMLIFrameElement,
+  SDHTMLImageElement,
   SDHTMLInputElement,
   SDHTMLScriptElement,
   SDHTMLSelectElement,
+  SDHTMLSourceElement,
   SDHTMLTemplateElement,
   SDNode,
   SDShadowRoot,
@@ -229,6 +231,8 @@ export function installComponentGlobals(
     HTMLTextAreaElement: SDHTMLElement,
     HTMLScriptElement: SDHTMLScriptElement,
     HTMLIFrameElement: SDHTMLIFrameElement,
+    HTMLImageElement: SDHTMLImageElement,
+    HTMLSourceElement: SDHTMLSourceElement,
     Document: class Document extends SDDocument {
       constructor(options = {}) {
         super({ ...options, core: document._domCore });
