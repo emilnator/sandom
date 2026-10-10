@@ -192,6 +192,9 @@ export function restoreAmbientGlobalDescriptors(previousDescriptors) {
   }
 }
 
+// A session's window dispatchEvent -> the realm's own it wraps.
+const hostDispatchEventByWrapper = new WeakMap();
+
 export function installComponentGlobals(
   target,
   document,
@@ -603,7 +606,49 @@ export function installComponentGlobals(
     addComponentEventListener(target, type, callback, options);
   target.removeEventListener = (type, callback, options) =>
     removeComponentEventListener(target, type, callback, options);
-  target.dispatchEvent = (event) => dispatchComponentEvent(target, event);
+  // The host realm reports an uncaught exception or an unhandled rejection
+  // by dispatching it on its global, which is the session's window now:
+  // the page's listeners hear it first, and then, unless one of them
+  // cancelled it, the host's own, which decide whether it ends the process.
+  // The host hears a copy: an event Sandom has dispatched isn't the host's
+  // to dispatch again. Whether the page cancelled it is read when the
+  // dispatch returns, as the host reads it (an async listener cancels
+  // before its first await), and answered as a boolean. A previous session's dispatcher, left by a
+  // disposal that kept the globals, is unwrapped to the realm's own.
+  const installedDispatchEvent = typeof target.dispatchEvent === "function"
+    ? target.dispatchEvent
+    : null;
+  const hostDispatchEvent = hostDispatchEventByWrapper.get(installedDispatchEvent) ??
+    installedDispatchEvent;
+  target.dispatchEvent = (event) => {
+    const result = dispatchComponentEvent(target, event);
+    const error = typeof ErrorEvent === "function" &&
+      event instanceof ErrorEvent && event.type === "error";
+    const rejection = typeof PromiseRejectionEvent === "function" &&
+      event instanceof PromiseRejectionEvent && event.type === "unhandledrejection";
+    if (!error && !rejection) return result;
+    if (hostDispatchEvent !== null && !event.defaultPrevented) {
+      const copy = error
+        ? new ErrorEvent("error", {
+          message: event.message,
+          filename: event.filename,
+          lineno: event.lineno,
+          colno: event.colno,
+          error: event.error,
+          cancelable: event.cancelable,
+        })
+        : new PromiseRejectionEvent("unhandledrejection", {
+          promise: event.promise,
+          reason: event.reason,
+          cancelable: event.cancelable,
+        });
+      if (!Reflect.apply(hostDispatchEvent, target, [copy])) event.preventDefault();
+    }
+    return !event.defaultPrevented;
+  };
+  if (hostDispatchEvent !== null) {
+    hostDispatchEventByWrapper.set(target.dispatchEvent, hostDispatchEvent);
+  }
   const hostFunctions = {
     setTimeout: globalThis.setTimeout,
     clearTimeout: globalThis.clearTimeout,
