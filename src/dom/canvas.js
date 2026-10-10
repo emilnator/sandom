@@ -107,7 +107,22 @@ export class SandomGPUCanvasContext {
     this._activeReadbacks = new Set();
     this._availableTextures = [];
     this._webglDescriptorCache = new WeakMap();
+    // The renderer keeps the canvas's image slot until the context shuts
+    // down.
+    const releaseListeners = new Set();
+    this._releaseListeners = releaseListeners;
+    const context = this;
+    const owner = Object.freeze({
+      get released() {
+        return context._shutdown;
+      },
+      onRelease(listener) {
+        if (context._shutdown) listener();
+        else releaseListeners.add(listener);
+      },
+    });
     this.paintSource = Object.freeze({
+      owner,
       kind: "canvas",
       sourceIdentifier: core.resourceId(this._resourceHandle),
       resourceHandle: this._resourceHandle,
@@ -355,6 +370,8 @@ export class SandomGPUCanvasContext {
         slot.busy = false;
       }
       this._configuration = null;
+      for (const listener of this._releaseListeners) listener();
+      this._releaseListeners.clear();
       this.canvas._domCore.resourceNodeDetach(this.canvas._coreHandle);
       this.canvas._domCore.resourceRelease(this._resourceHandle);
     }
