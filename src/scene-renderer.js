@@ -282,6 +282,7 @@ import {
   LAYOUT_NODE_OFFSET_MIN_WIDTH,
   LAYOUT_NODE_OFFSET_MIN_WIDTH_PERCENT,
   LAYOUT_NODE_OFFSET_OPACITY,
+  LAYOUT_NODE_OFFSET_DISPLAY,
   LAYOUT_NODE_OFFSET_PADDING_TOP,
   LAYOUT_NODE_OFFSET_PADDING_RIGHT,
   LAYOUT_NODE_OFFSET_PADDING_BOTTOM,
@@ -301,6 +302,9 @@ import {
   LAYOUT_NODE_OFFSET_WIDTH_TAG,
   LAYOUT_NODE_SIZE,
   LAYOUT_NODE_OFFSET_FLAGS,
+  DISPLAY_BLOCK,
+  DISPLAY_INLINE,
+  LAYOUT_FLAG_IS_INLINE_CTX,
   LAYOUT_FLAG_HAS_BOX_SHADOW,
   LAYOUT_NODE_OFFSET_SHADOW_COUNT,
   LAYOUT_NODE_OFFSET_SHADOW_OFFSET,
@@ -5686,6 +5690,67 @@ export async function createSceneRendererRuntime({
     return { view: new DataView(copy), bytesWritten, nodes, globalPreparation };
   }
 
+  // The core lays an <img> or outer <svg> (DISPLAY_IMAGE, DISPLAY_SVG_ROOT)
+  // out as a block: its scene build ends the inline run before it and
+  // wraps the text on each side in an anonymous block (box kind 3). For an
+  // inline-level one (serialize.js _replacedInline) whose block parent
+  // holds only such runs and inline replaced boxes, the parent becomes the
+  // inline formatting context and each run a plain inline box, so the
+  // replaced box is an atomic inline on the line (CSS 2 §10.3.2, §10.8).
+  // Runs after every finish, before layout, over every row: rows a sparse
+  // frame did not republish keep the rewrite. A row it changes is stamped
+  // with the current generation, as the core's own write-if-changed stamps
+  // a changed row, so incremental layout lays it out again.
+  function applyReplacedElementRecords(nodes) {
+    let parents = null;
+    let records = null;
+    const decided = new Set();
+    const at = (index) => layoutBufferBase + index * LAYOUT_NODE_SIZE;
+    const rewrite = (base, displayValue, flags) => {
+      if (
+        records.getUint8(base + LAYOUT_NODE_OFFSET_DISPLAY) === displayValue &&
+        records.getUint16(base + LAYOUT_NODE_OFFSET_FLAGS, true) === flags
+      ) return;
+      records.setUint8(base + LAYOUT_NODE_OFFSET_DISPLAY, displayValue);
+      records.setUint16(base + LAYOUT_NODE_OFFSET_FLAGS, flags, true);
+      records.setUint32(
+        base + LAYOUT_NODE_OFFSET_CHANGED_GEN,
+        records.getUint32(HEADER_BASE + HEADER_OFFSET_GENERATION, true),
+        true,
+      );
+    };
+    const anonymousRun = (node) => (node._coreBox & 0xff) === 3;
+    for (let index = 0; index < nodes.length; index++) {
+      if (nodes[index]._replacedInline !== true) continue;
+      if (parents === null) {
+        parents = new Int32Array(nodes.length).fill(-1);
+        for (let p = 0; p < nodes.length; p++) {
+          for (const child of nodes[p].children ?? []) parents[child] = p;
+        }
+        records = new DataView(engine.memory.buffer);
+      }
+      const parent = parents[index];
+      if (parent < 0 || decided.has(parent)) continue;
+      decided.add(parent);
+      const parentBase = at(parent);
+      if (records.getUint8(parentBase + LAYOUT_NODE_OFFSET_DISPLAY) !== DISPLAY_BLOCK) continue;
+      const parentFlags = records.getUint16(parentBase + LAYOUT_NODE_OFFSET_FLAGS, true);
+      if (parentFlags & LAYOUT_FLAG_IS_INLINE_CTX) continue;
+      const siblings = nodes[parent].children;
+      if (!siblings.every((s) => nodes[s]._replacedInline === true || anonymousRun(nodes[s]))) continue;
+      rewrite(parentBase, DISPLAY_BLOCK, parentFlags | LAYOUT_FLAG_IS_INLINE_CTX);
+      for (const sibling of siblings) {
+        if (!anonymousRun(nodes[sibling])) continue;
+        const base = at(sibling);
+        rewrite(
+          base,
+          DISPLAY_INLINE,
+          records.getUint16(base + LAYOUT_NODE_OFFSET_FLAGS, true) & ~LAYOUT_FLAG_IS_INLINE_CTX,
+        );
+      }
+    }
+  }
+
   // Shared write step between emitSceneCommands and its synchronous
   // counterpart below — factored out once a second (sync) caller existed,
   // not before (this project's own "don't build shared abstractions ahead
@@ -5815,6 +5880,7 @@ export async function createSceneRendererRuntime({
       } else {
         sparseValid = finishRows();
       }
+      applyReplacedElementRecords(nodes);
       if (globalThis.__engineRecordProbe) {
         for (const index of retained ? changedNodeIndices : nodes.keys()) {
           const base = layoutBufferBase + index * LAYOUT_NODE_SIZE;

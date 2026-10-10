@@ -542,6 +542,21 @@ export function serializeToScene(
     }
     if (el === root) Object.assign(node, rootWriting);
     node.display = display;
+    // <img> and an outer <svg> get the core's replaced scene displays (20,
+    // 21), which it lays out as blocks whatever their computed display.
+    // The renderer puts an inline-level one on the line in the engine
+    // records (applyReplacedElementRecords in src/scene-renderer.js). A
+    // float or an absolutely positioned box isn't inline-level.
+    if (box.display === 20 || box.display === 21) {
+      const fields = resolvedElementFields(el);
+      if (
+        (fields.display === undefined || fields.display.startsWith("inline")) &&
+        (fields.float ?? fields.cssFloat ?? "none") === "none" &&
+        fields.position !== "absolute" && fields.position !== "fixed"
+      ) {
+        node._replacedInline = true;
+      }
+    }
     // The element behind the box, for the core's engine record. Handles
     // are (generation << 32 | index) and fit a double exactly.
     node._coreHandle = Number(el._coreHandle);
