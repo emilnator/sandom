@@ -93,6 +93,18 @@ export async function createPreparedDocument({
   const generatedStylesheetSources = new Map();
   let cachedResourceRecords = null;
   let released = false;
+  // The owner of this document's resources: the renderer keeps a decoded
+  // image until its last owner is released.
+  const releaseListeners = new Set();
+  const owner = Object.freeze({
+    get released() {
+      return released;
+    },
+    onRelease(listener) {
+      if (released) listener();
+      else releaseListeners.add(listener);
+    },
+  });
 
   const resolveResource = async (
     {
@@ -171,6 +183,7 @@ export async function createPreparedDocument({
       byteLength: resolved.bytes.byteLength,
       digest: resolvedDigest,
       kind,
+      owner,
     });
     resourcesByURL.set(requestedFinalURL, resource);
     resourcesByURL.set(resolvedFinalURL, resource);
@@ -261,6 +274,14 @@ export async function createPreparedDocument({
         }
       }
       ownedResourceReleases.clear();
+      for (const listener of releaseListeners) {
+        try {
+          listener();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      releaseListeners.clear();
       if (errors.length > 0) {
         throw new AggregateError(
           errors,

@@ -1582,6 +1582,89 @@ export async function createSceneRendererRuntime({
   // decode (or SVG raster) of its bytes, until the registration of the
   // entry, so two resources with one key decode once.
   const decodedImageByCacheKey = new Map();
+  // The image table outlives every document. A prepared document gives its
+  // resources an owner; an image's slot is released with its last owner
+  // and reused, so a host can render one document after another without
+  // filling the table. Images resolved without an owner keep their slot.
+  const imageOwnersByCacheKey = new Map(); // cacheKey -> Set(owner)
+  const imageKeysByOwner = new Map(); // owner -> { cacheKeys, joinKeys }
+  const freeImageIndices = [];
+  // Holds an image a resolver without an owner also uses, for good.
+  const permanentImageOwner = Object.freeze({});
+
+  function ownImage(owner, cacheKey) {
+    let owners = imageOwnersByCacheKey.get(cacheKey);
+    if (owners === undefined) {
+      owners = new Set();
+      imageOwnersByCacheKey.set(cacheKey, owners);
+    }
+    if (!owner) {
+      owners.add(permanentImageOwner);
+      return;
+    }
+    // A document released while its load was in flight owns nothing.
+    if (owner.released) return;
+    let keys = imageKeysByOwner.get(owner);
+    if (keys === undefined) {
+      keys = { cacheKeys: new Set(), joinKeys: new Set() };
+      imageKeysByOwner.set(owner, keys);
+      owner.onRelease(() => releaseImageOwner(owner));
+    }
+    keys.cacheKeys.add(cacheKey);
+    owners.add(owner);
+  }
+
+  function releaseImageOwner(owner) {
+    const keys = imageKeysByOwner.get(owner);
+    if (keys === undefined) return;
+    imageKeysByOwner.delete(owner);
+    for (const joinKey of keys.joinKeys) {
+      imageJoinByKey.delete(joinKey);
+      brokenImageByKey.delete(joinKey);
+      const handle = imageResourceHandles.get(joinKey);
+      if (handle !== undefined) {
+        imageResourceHandles.delete(joinKey);
+        core.resourceRelease(handle);
+      }
+    }
+    for (const cacheKey of keys.cacheKeys) {
+      const owners = imageOwnersByCacheKey.get(cacheKey);
+      owners.delete(owner);
+      if (owners.size > 0) continue;
+      imageOwnersByCacheKey.delete(cacheKey);
+      brokenImageByCacheKey.delete(cacheKey);
+      const imageIndex = imageIndexBySrc.get(cacheKey);
+      if (imageIndex === undefined) continue;
+      imageIndexBySrc.delete(cacheKey);
+      imagePixelsByIndex.delete(imageIndex);
+      engine.exports.raster_resource_table_release(RASTER_RESOURCE_IMAGE, imageIndex);
+      freeImageIndices.push(imageIndex);
+    }
+  }
+
+  function releaseCanvasSource(source) {
+    const imageIndex = imageIndexByCanvasSource.get(source);
+    if (imageIndex === undefined) return;
+    imageIndexByCanvasSource.delete(source);
+    imagePixelsByIndex.delete(imageIndex);
+    engine.exports.raster_resource_table_release(RASTER_RESOURCE_IMAGE, imageIndex);
+    freeImageIndices.push(imageIndex);
+    const handle = canvasResourceHandles.get(source.sourceIdentifier);
+    if (handle !== undefined) {
+      canvasResourceHandles.delete(source.sourceIdentifier);
+      core.resourceRelease(handle);
+    }
+  }
+
+  function allocateImageIndex() {
+    if (freeImageIndices.length > 0) return freeImageIndices.pop();
+    if (nextImageIndex >= IMAGE_TABLE_MAX_ENTRIES) {
+      throw new RangeError(
+        `IMAGE_TABLE overflow: more than ${IMAGE_TABLE_MAX_ENTRIES} images in one renderer`,
+      );
+    }
+    return nextImageIndex++;
+  }
 
   function startImageLoad(
     src,
@@ -1644,11 +1727,13 @@ export async function createSceneRendererRuntime({
         if (typeof registered === "number") {
           const join = joinEngineResource(resourceHandle, registered);
           imageJoinByKey.set(joinKey, join);
+          imageKeysByOwner.get(loaded.owner)?.joinKeys.add(joinKey);
           return join;
         }
         broken = registered;
         core.resourceUpdate(resourceHandle, 2, 0, 0, false, 1);
         brokenImageByKey.set(joinKey, broken);
+        imageKeysByOwner.get(loaded.owner)?.joinKeys.add(joinKey);
       }
     }
     if (!onImageLoadError) throw broken.error;
@@ -1695,8 +1780,10 @@ export async function createSceneRendererRuntime({
     if (!(bytes instanceof Uint8Array)) {
       throw new TypeError("Image resolver must return Uint8Array bytes");
     }
+    const owner = resource.owner;
+    ownImage(owner, cacheKey);
     if (brokenImageByCacheKey.has(cacheKey) || imageIndexBySrc.has(cacheKey)) {
-      return { cacheKey, entry: null };
+      return { cacheKey, entry: null, owner };
     }
     let decoded = decodedImageByCacheKey.get(cacheKey);
     if (decoded === undefined) {
@@ -1709,7 +1796,7 @@ export async function createSceneRendererRuntime({
         if (entry === null) forget();
       }, forget);
     }
-    return { cacheKey, entry: await decoded };
+    return { cacheKey, entry: await decoded, owner };
   }
 
   // The registration entry of the bytes, or null when they do not decode
@@ -1767,12 +1854,14 @@ export async function createSceneRendererRuntime({
         `Image ${cacheKey}: the load skipped its decode, but the resolved URL is neither registered nor broken`,
       );
     }
-    if (nextImageIndex >= IMAGE_TABLE_MAX_ENTRIES) {
-      throw new RangeError(
-        `IMAGE_TABLE overflow: more than ${IMAGE_TABLE_MAX_ENTRIES} images in one renderer`,
-      );
+    if (!imageOwnersByCacheKey.get(cacheKey)?.size) {
+      decodedImageByCacheKey.delete(cacheKey);
+      return Object.freeze({
+        failure: "fetch",
+        error: new Error(`Image ${cacheKey}: its document was released`),
+      });
     }
-    imageIndex = nextImageIndex++;
+    imageIndex = allocateImageIndex();
     const measurement = globalThis[resourceMeasurementKey];
     engine.exports.register_image(imageIndex, entry.width, entry.height);
     if (measurement) {
@@ -1803,13 +1892,9 @@ export async function createSceneRendererRuntime({
     }
     let imageIndex = imageIndexByCanvasSource.get(source);
     if (imageIndex === undefined) {
-      if (nextImageIndex >= IMAGE_TABLE_MAX_ENTRIES) {
-        throw new RangeError(
-          `IMAGE_TABLE overflow: more than ${IMAGE_TABLE_MAX_ENTRIES} images in one renderer`,
-        );
-      }
-      imageIndex = nextImageIndex++;
+      imageIndex = allocateImageIndex();
       imageIndexByCanvasSource.set(source, imageIndex);
+      source.owner?.onRelease(() => releaseCanvasSource(source));
     }
     const measurement = globalThis[resourceMeasurementKey];
     engine.exports.register_image(imageIndex, source.width, source.height);
