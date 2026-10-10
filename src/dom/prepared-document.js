@@ -153,6 +153,7 @@ export async function createPreparedDocument({
     const resolvedFinalURL = new URL(
       resolved.finalURL ?? requestedFinalURL,
     ).href;
+    const resolvedDigest = await digest(resolved.bytes);
     resource = Object.freeze({
       bytes: resolved.bytes,
       source: resolved.source ?? (
@@ -162,10 +163,13 @@ export async function createPreparedDocument({
       ),
       requestedFinalURL,
       finalURL: resolvedFinalURL,
-      cacheKey: resolvedFinalURL,
+      // The renderer's decoded images outlive this document: they are
+      // shared by URL and content, so another document's resolver that
+      // answers the same URL with other bytes gets its own.
+      cacheKey: `${resolvedFinalURL} ${resolvedDigest}`,
       contentType: resolved.contentType ?? null,
       byteLength: resolved.bytes.byteLength,
-      digest: await digest(resolved.bytes),
+      digest: resolvedDigest,
       kind,
     });
     resourcesByURL.set(requestedFinalURL, resource);

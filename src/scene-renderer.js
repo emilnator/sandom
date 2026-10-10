@@ -1578,9 +1578,9 @@ export async function createSceneRendererRuntime({
   // the resolved URL is already registered or broken), or { thrown } (a
   // resolver contract error or a Sandom bug, thrown at registration).
   const pendingImageLoadByKey = new Map();
-  // Resolved URL -> decode (or SVG raster) of its bytes, until the
-  // registration of the entry, so two resources with one resolved URL
-  // decode once.
+  // Cache key (a prepared document's resolved URL and content digest) ->
+  // decode (or SVG raster) of its bytes, until the registration of the
+  // entry, so two resources with one key decode once.
   const decodedImageByCacheKey = new Map();
 
   function startImageLoad(
