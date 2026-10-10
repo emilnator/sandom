@@ -433,6 +433,9 @@ export async function createSceneRendererRuntime({
   // frame that takes the same serialization to reuse instead of publishing
   // every row again. Any other engine write supersedes it.
   let syncLayoutWrite = null;
+  // Whether the synchronous layout running now laid out an image that
+  // hasn't loaded yet: a frame must not take its rows or boxes.
+  let syncLayoutLoadsImages = false;
   const retainedPreparations = new WeakMap();
 
   function releaseRetainedPreparation(owner, preservedTextResources = null) {
@@ -1831,18 +1834,17 @@ export async function createSceneRendererRuntime({
     return imagePixelsByIndex.get(imageIndex);
   }
 
-  // Synchronous counterpart of imageIndexFor — same "throw rather than
-  // fall back to real async I/O" contract as fontIndexForSync above. It
-  // uses the same key as imageIndexFor: a resolver can register an image
-  // under its final URL, which differs from the node's src.
+  // Synchronous counterpart of imageIndexFor. It uses the same key as
+  // imageIndexFor: a resolver can register an image under its final URL,
+  // which differs from the node's src. An image that hasn't loaded yet has
+  // no natural size, as in a browser before its load completes: it lays out
+  // as a broken one does until the next render loads it.
   function imageIndexForSync(src, resourceIdentifier) {
     const joinKey = resourceIdentifier ?? src;
     const joined = imageJoinByKey.get(joinKey);
     if (joined !== undefined) return joined;
-    if (brokenImageByKey.has(joinKey)) return undefined;
-    throw new Error(
-      `imageIndexForSync: image "${src}" (resource key ${JSON.stringify(joinKey)}) not registered yet — synchronous layout-getters require the tree to have been rendered (or this image otherwise pre-warmed) at least once already`,
-    );
+    if (!brokenImageByKey.has(joinKey)) syncLayoutLoadsImages = true;
+    return undefined;
   }
 
   // A node without an image, canvas source, background layer or mask keeps
@@ -5751,10 +5753,12 @@ export async function createSceneRendererRuntime({
   // Synchronous counterpart of emitSceneCommands — matches a real
   // browser's SYNCHRONOUS layout-getter properties exactly (offsetWidth
   // etc., src/dom/layout-getters.js), per project ruling. Throws (via
-  // resolveFontIndices/resolveImageIndicesSync/resolveSvgPathIndicesSync)
-  // if the tree references a font/image/SVG-path not already registered —
-  // see each sync resolver's own comment for why that's the correct,
-  // honest contract rather than silently blocking or guessing wrong. Font
+  // resolveFontIndices/resolveSvgPathIndicesSync) if the tree references a
+  // font/SVG-path not already registered — see each sync resolver's own
+  // comment for why that's the correct, honest contract rather than
+  // silently blocking or guessing wrong. An image not loaded yet lays out
+  // as a browser lays it out before its load completes, without a natural
+  // size (resolveImageIndicesSync). Font
   // indices take the shared resolver: it has been synchronous since the
   // async fontIndexFor went away, and the copy its duplicate made per
   // text node evaluated every node's deferred text decode.
@@ -6047,8 +6051,11 @@ export async function createSceneRendererRuntime({
 
   // Synchronous counterpart of layoutTreeBoxes — matches a real browser's
   // synchronous offsetWidth/getBoundingClientRect/etc. exactly. Throws if
-  // the tree references an unregistered font/image/SVG-path (see
+  // the tree references an unregistered font/SVG-path (see
+  // emitSceneCommandsSync). A layout that met an image not loaded yet is
+  // provisional: it sets options.loading.images, and no frame reuses it.
   function layoutTreeBoxesSync(scene, options = {}) {
+    syncLayoutLoadsImages = false;
     const analytical = analyticalWriteOptions(scene, options);
     // emitPaintCommands stays ON for the analytical path: a non-atomic
     // inline box's computed box is the union of its per-line fragment
@@ -6063,7 +6070,12 @@ export async function createSceneRendererRuntime({
       analytical.generationReservation,
       true,
     );
-    return finishAnalyticalWrite(scene, analytical, written);
+    const boxes = finishAnalyticalWrite(scene, analytical, written);
+    if (syncLayoutLoadsImages) {
+      syncLayoutWrite = null;
+      if (options.loading) options.loading.images = true;
+    }
+    return boxes;
   }
 
   function artifactBytes(value) {
