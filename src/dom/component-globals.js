@@ -17,6 +17,7 @@ import {
   SDShadowRoot,
   SDSVGElement,
   SDTextNode,
+  installWindowEventHandlers,
 } from "./node.js";
 import { createDOMParserClass } from "./dom-parser.generated.js";
 import { parseHTMLDocument } from "./html.js";
@@ -602,6 +603,7 @@ export function installComponentGlobals(
   document._reevaluateMediaQueryLists = () => {
     for (const list of mediaQueryLists) list._reevaluate();
   };
+  installWindowEventHandlers(target);
   target.addEventListener = (type, callback, options) =>
     addComponentEventListener(target, type, callback, options);
   target.removeEventListener = (type, callback, options) =>

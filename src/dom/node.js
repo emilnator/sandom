@@ -153,7 +153,8 @@ function setEventHandler(element, type, candidate) {
   const record = {
     value,
     listener(event) {
-      const core = this._domCore;
+      // The window, which isn't a node, answers through its document.
+      const core = this._domCore ?? this.document?._domCore ?? sharedDomCore;
       const result = record.value.call(this, event);
       if (core.status("event_handler_result", typeof result === "boolean" ? 1 : 0, result ? 1 : 0)) {
         event.preventDefault();
@@ -162,6 +163,47 @@ function setEventHandler(element, type, candidate) {
   };
   records.set(type, record);
   addListener(element, type, record.listener);
+}
+
+// The window's event handlers beyond those HTMLElement.prototype has: the
+// WindowEventHandlers mixin (HTML), and onresize, a GlobalEventHandler
+// the element bindings don't define yet.
+const WINDOW_EVENT_HANDLERS = [
+  "onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange",
+  "onlanguagechange", "onmessage", "onmessageerror", "onoffline", "ononline",
+  "onpagehide", "onpagereveal", "onpageshow", "onpageswap", "onpopstate",
+  "onrejectionhandled", "onresize", "onstorage", "onunhandledrejection",
+  "onunload",
+];
+
+// Installs the window's event handler attributes on `target`, a realm's
+// global standing in for the window: those the realm defines itself, on
+// the global or its prototype (Deno's onload, onerror,
+// onunhandledrejection, a worker's onmessage), stay the realm's.
+export function installWindowEventHandlers(target) {
+  const names = new Set(WINDOW_EVENT_HANDLERS);
+  for (const name of Reflect.ownKeys(SDHTMLElement.prototype)) {
+    if (typeof name === "string" && name.startsWith("on")) names.add(name);
+  }
+  for (const name of names) {
+    if (name in target) continue;
+    const type = name.slice(2);
+    Object.defineProperty(target, name, {
+      configurable: true,
+      enumerable: true,
+      get: () => getEventHandler(target, type),
+      set: (candidate) => setEventHandler(target, type, candidate),
+    });
+  }
+}
+
+// Removes the handlers set on `target` through its event handler
+// attributes, as the window they belong to goes.
+export function releaseEventHandlers(target) {
+  const records = eventHandlerRecords.get(target);
+  if (!records) return;
+  for (const [type, record] of records) removeListener(target, type, record.listener);
+  eventHandlerRecords.delete(target);
 }
 
 // A live collection over `items()`; `count` and `at` answer length and index

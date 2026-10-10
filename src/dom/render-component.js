@@ -9,6 +9,7 @@ import {
   normalizeComponentEnvironmentOptions,
 } from "./component-environment.js";
 import { createSandomDOM } from "./sandom-dom.js";
+import { releaseEventHandlers } from "./node.js";
 import { normalizeInputBatch } from "./interaction.js";
 import { createPreparedDocument } from "./prepared-document.js";
 import { SandomViewport } from "./viewport.js";
@@ -938,8 +939,13 @@ export async function renderComponent(
           }
           if (globalsInstalled) {
             // The session's window is the realm's global, which outlives
-            // it: its listeners go with the session, as a page's window's
-            // go with the page.
+            // it: its listeners and event handlers go with the session, as
+            // a page's window's go with the page.
+            try {
+              releaseEventHandlers(globalThis);
+            } catch (error) {
+              collectCleanupError(cleanupErrors, error);
+            }
             try {
               releaseEventTarget(globalThis, preparedDocument.document._domCore);
             } catch (error) {
@@ -1019,6 +1025,11 @@ export async function renderComponent(
       }
     }
     if (globalsInstalled) {
+      try {
+        releaseEventHandlers(globalThis);
+      } catch (error) {
+        collectCleanupError(cleanupErrors, error);
+      }
       try {
         releaseEventTarget(globalThis, preparedDocument.document._domCore);
       } catch (error) {
