@@ -88,6 +88,7 @@ const COMPONENT_OPTION_NAMES = new Set([
   "reportException",
   "environment",
   "resolveResource",
+  "background",
 ]);
 
 export async function renderComponent(
@@ -113,6 +114,11 @@ export async function renderComponent(
   if (presentFrame !== null && typeof presentFrame !== "function") {
     throw new TypeError("renderComponent presentFrame must be a function");
   }
+  // The backdrop behind a page whose root and body paint nothing, as the
+  // render surface takes it ({ r, g, b, a } in 0-1, checked there): a host
+  // that composites the frame over its own surface asks for { a: 0 }.
+  // Unset, the renderer's opaque white, as a browser's default canvas.
+  const background = options.background;
   // The host's declaration of the real display: the session's media
   // queries answer (color-gamut) and (dynamic-range) from these, and a
   // high dynamic range switches the render pipeline to its HDR working
@@ -311,6 +317,7 @@ export async function renderComponent(
       });
     surface = backend.createRenderSurface(document.documentElement, {
       capturePaintArtifact: true,
+      ...(background === undefined ? {} : { background }),
       graphicsBackend,
       resolveResource: preparedDocument.resolveResource,
       viewport: componentViewport,
@@ -341,6 +348,7 @@ export async function renderComponent(
           deviceScale: surface.viewport.deviceScale,
         }),
         initializePersistentRenderer: false,
+        ...(background === undefined ? {} : { background }),
         ...(displayDynamicRange === "high"
           ? { renderMode: "high-dynamic-range" }
           : {}),
